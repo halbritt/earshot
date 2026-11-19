@@ -47,9 +47,10 @@ Both modes use the same core. They differ in the policy that decides which strea
    optional reference channel come from a description file. No geometry in code.
 5. **Every change is scored by replay.** The same recordings, the same recogniser, word
    error rate against a reference text, CPU time, and words leaked from playback.
-6. **The core is a portable C library.** Fixed block size, no allocation after start, no
-   operating-system calls in the processing path, single-precision arithmetic. This is what
-   makes a later move to a small chip possible.
+6. **Rust for everything, and the core is `no_std`.** The processing core is a library
+   with a fixed block size, no allocation after start, no operating-system calls and
+   single-precision arithmetic. This is what makes a later move to a small chip possible.
+   C is used only where a chip's toolchain has no Rust support.
 
 ## Stages
 
@@ -160,7 +161,8 @@ how many dB a recogniser needs. Only recordings answer those.
 
 ## Later: a low-power chip
 
-Not decided now. The plan keeps the door open by rule 6 and by measuring the cost of each
+Not decided now. Some candidate chips have no Rust toolchain; on those the core would be
+linked from C or ported. The plan keeps the door open by rule 6 and by measuring the cost of each
 stage in operations per second, not only as a share of this board's CPU. The gate is the
 part that must run always, so it decides standby power; it should run on one microphone at
 a few milliwatts. Capture chips of the kind used on 16-microphone USB arrays have signal
@@ -169,7 +171,7 @@ chip, the rest on a host that sleeps.
 
 ## Order of work
 
-1. **Replay bench** (done: `bench/`). Recording, variant and reference text in; word error
+1. **Replay bench** (done: `crates/earshot-bench`). Recording, variant and reference text in; word error
    rate, CPU time and leaked playback words out.
 2. **One-microphone detection in the ReSpeaker service**, in that project, as an option, replayed against all
    takes. It is the fix for the lost quarter and the first measured piece of the new design.

@@ -9,10 +9,15 @@ Status: the replay bench exists; the front end itself is not built yet.
 See [docs/plan.md](docs/plan.md).
 
 - `docs/plan.md`: why, the design rules, the stages, the interfaces and the order of work.
-- `bench/`: the replay bench, which scores any front-end variant on a recorded take by word
-  error rate and CPU time. See [bench/README.md](bench/README.md).
+- `crates/earshot-bench/`: the replay bench, which scores any front-end variant on a recorded
+  take by word error rate and CPU time. See its [README](crates/earshot-bench/README.md).
 - `sim/arrays.py`: calculated directivity for candidate array geometries
-  (`python3 sim/arrays.py`, needs NumPy; takes a few minutes).
+  (`python3 sim/arrays.py`, needs NumPy; takes a few minutes). It is a one-off calculation
+  that the front end's own beam design code will replace.
+
+## Languages
+
+Rust for everything. C only where a target chip's toolchain leaves no other choice.
 
 ## Licence
 

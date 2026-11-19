@@ -1,11 +1,10 @@
 [tasks.test]
-description = "Bench tests (scoring, variant runner, command line)"
+description = "All tests (cargo test: scoring, variant runner, command line end to end)"
 run = '''sh -eu -c '
 # host:exec is an optional private wrapper task (resource-limited runner). Use it when this
 # machine defines it; every other clone runs pytest directly.
-[ "$#" -gt 0 ] || set -- tests
 if mise tasks info host:exec >/dev/null 2>&1; then
-  exec mise run host:exec --timeout 5m --weight 1 -- python3 -B -m pytest -q -p no:cacheprovider "$@"
+  exec mise run host:exec --timeout 15m --weight 1 -- cargo test -q "$@"
 fi
-exec python3 -B -m pytest -q -p no:cacheprovider "$@"
+exec cargo test -q "$@"
 ' sh'''

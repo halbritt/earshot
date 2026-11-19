@@ -4,7 +4,7 @@ Scores audio front-end variants on a recorded take. A variant is any command tha
 recording into one channel of audio. The bench runs it, measures its CPU time, sends the
 audio to a speech recogniser, and compares the words with what was really said.
 
-Needs Python 3.11 or later and nothing else. The recogniser is a server with an OpenAI-style
+Build with `cargo build --release`; the binary is `target/release/earshot-bench`. The recogniser is a server with an OpenAI-style
 transcription endpoint (multipart upload with a `file` field, JSON answer with a `text`
 field); whisper.cpp's server is one.
 
@@ -39,18 +39,18 @@ Recordings of people are private. Keep takes out of the repository; `takes/` is 
 
 ```sh
 export EARSHOT_STT_URL=http://recogniser.example:8080/inference
-PYTHONPATH=bench python3 -m earshot_bench takes/kitchen-1/take.toml \
-  --variant 'mic0=PYTHONPATH=bench python3 -m earshot_bench.pick --channels 8 --channel 0 {in} {out}' \
+earshot-bench run takes/kitchen-1/take.toml \
+  --variant 'mic0=earshot-bench pick --channels 8 --channel 0 {in} {out}' \
   --variant 'beam=./my-beamformer --array respeaker.toml {in} {out}' \
   --transcript live=takes/kitchen-1/live.json \
   --json results.json
 ```
 
-- `--variant NAME=COMMAND`: `{in}` is the recording, `{out}` is where the command must write
-  16-bit, one-channel WAV. The CPU time is that of the command and its children.
+- `--variant NAME=COMMAND`: the command is run by `sh`. `{in}` is the recording, `{out}` is
+  where it must write 16-bit, one-channel WAV. The CPU time is that of the command and its children.
 - `--transcript NAME=FILE.json`: score text that already exists, for example from a running
   service. The file is a JSON object of chunk name to text.
-- `earshot_bench.pick` is the simplest variant: one channel of a raw interleaved recording.
+- `earshot-bench pick` is the simplest variant: one channel of a raw interleaved recording.
 - Transcripts are cached in `.earshot-cache` by the hash of the audio, so an unchanged
   variant is not sent to the recogniser again.
 
@@ -80,4 +80,5 @@ result on more than one take.
 
 ## Tests
 
-`mise run test`, or `python3 -m pytest tests`.
+`mise run test`, or `cargo test`. The end-to-end tests run the real binary against a stand-in
+recogniser on the loopback interface.
