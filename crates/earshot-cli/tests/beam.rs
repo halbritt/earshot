@@ -153,3 +153,34 @@ fn the_respeaker_description_in_the_repository_loads() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(hound::WavReader::open(dir.path().join("out.wav")).unwrap().len(), 1600);
 }
+
+#[test]
+fn direction_reports_where_a_tone_comes_from_twice_a_second() {
+    // two microphones on the x axis cannot tell front from back, but they can tell the axis
+    // from the side: a tone along the axis is found at 0 or 180 degrees
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("array.toml"), ARRAY).unwrap();
+    std::fs::write(dir.path().join("in.raw"), tone_recording(2.0, 90.0, 1000.0)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_earshot"))
+        .current_dir(dir.path())
+        .args(["direction", "--array", "array.toml", "--elevation", "0", "in.raw"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    for line in &lines[1..] {
+        let az: f64 = line
+            .split("\"azimuth\": ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((az - 90.0).abs() <= 3.0 || (az - 270.0).abs() <= 3.0, "{line}");
+    }
+    assert!(lines[0].starts_with("{\"t\": 0.50,"), "{}", lines[0]);
+}

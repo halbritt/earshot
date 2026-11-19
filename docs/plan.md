@@ -182,7 +182,12 @@ chip, the rest on a host that sleeps.
    (`crates/earshot-core`, `earshot beam`): array description, STFT and beam design, which
    gives the simulation's directivity to 0.05 dB. On the 459-word reading, with the beam
    steered by hand: one microphone 5.4%, delay-and-sum 5.2%, superdirective 5.4%, and a
-   superdirective beam pointed 180 degrees away from the talker 8.3%. Not done: direction.
+   superdirective beam pointed 180 degrees away from the talker 8.3%. Direction
+   (`earshot direction`), on the same recording, half-second intervals, louder half of each
+   part: a reader at about 100 degrees is placed at 103, and after moving to about 305 at
+   299 to 300, with every interval within 15 degrees while the board is silent and 76 to
+   97% of them while it talks. The board talking alone reads 176 degrees, its own speaker.
+   Not done: steering the beam by the direction found.
 5. **Agent mode end to end** on the ReSpeaker, replacing ODAS; then the Wyoming adapter.
 6. **Room mode:** talker tracking and one stream per talker.
 7. **A second array** to prove that the array really is data.

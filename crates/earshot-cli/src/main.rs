@@ -3,6 +3,7 @@ mod layout;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use earshot_core::beam::{Beam, Kind};
+use earshot_core::direction::Finder;
 use earshot_core::stft::{Analysis, Synthesis, BINS, HOP};
 use earshot_core::Complex32;
 use layout::Layout;
@@ -42,6 +43,21 @@ enum Command {
         input: PathBuf,
         /// WAV file to write
         output: PathBuf,
+    },
+    /// Where the sound in a raw multichannel recording comes from, as one line of JSON per
+    /// interval: time in seconds, azimuth in degrees, contrast and level.
+    Direction {
+        /// Array description (TOML)
+        #[arg(long)]
+        array: PathBuf,
+        /// Seconds of sound for each answer
+        #[arg(long, default_value_t = 0.5)]
+        every: f64,
+        /// Degrees above the plane of the array at which to look
+        #[arg(long, default_value_t = 20.0)]
+        elevation: f64,
+        /// Raw interleaved recording
+        input: PathBuf,
     },
 }
 
@@ -145,6 +161,49 @@ fn beam(
     wav.finalize().map_err(|e| e.to_string())
 }
 
+fn direction(array: PathBuf, every: f64, elevation: f64, input: PathBuf) -> Result<(), String> {
+    let layout = Layout::load(&array)?;
+    let mics = layout.array();
+    let mut raw = Vec::new();
+    std::fs::File::open(&input)
+        .and_then(|mut f| f.read_to_end(&mut raw))
+        .map_err(|e| format!("{}: {e}", input.display()))?;
+    let step = layout.frame_bytes();
+    let n = mics.len();
+    let mut finder = Finder::new(&mics, layout.rate, elevation, 72, 300.0, 3500.0);
+    let mut analysis: Vec<Analysis> = (0..n).map(|_| Analysis::default()).collect();
+    let mut spectra = vec![[Complex32::new(0.0, 0.0); BINS]; n];
+    let mut hop = [0.0f32; HOP];
+    let per = ((every * layout.rate as f64 / HOP as f64).round() as usize).max(1);
+    let mut energy = 0.0f64;
+    for k in 0..raw.len() / step / HOP {
+        for (m, a) in analysis.iter_mut().enumerate() {
+            for (i, v) in hop.iter_mut().enumerate() {
+                let f = k * HOP + i;
+                *v = layout.sample(&raw[f * step..(f + 1) * step], m);
+            }
+            if m == 0 {
+                energy += hop.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+            }
+            a.push(&hop, &mut spectra[m]);
+        }
+        finder.add(&spectra);
+        if (k + 1) % per == 0 {
+            let t = ((k + 1) * HOP) as f64 / layout.rate as f64;
+            let level = 10.0 * (energy / (per * HOP) as f64).max(1e-12).log10();
+            if let Some(found) = finder.found() {
+                println!(
+                    "{{\"t\": {t:.2}, \"azimuth\": {:.1}, \"contrast\": {:.2}, \"level_db\": {level:.1}}}",
+                    found.azimuth, found.contrast
+                );
+            }
+            finder.clear();
+            energy = 0.0;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let done = match Cli::parse().command {
         Command::Beam {
@@ -157,6 +216,12 @@ fn main() -> ExitCode {
             input,
             output,
         } => beam(array, &steer, elevation, kind, white_noise_gain, gain, input, output),
+        Command::Direction {
+            array,
+            every,
+            elevation,
+            input,
+        } => direction(array, every, elevation, input),
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,

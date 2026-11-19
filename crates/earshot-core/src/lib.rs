@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod array;
 pub mod beam;
+pub mod direction;
 pub mod stft;
 
 pub use num_complex::{Complex32, Complex64};
