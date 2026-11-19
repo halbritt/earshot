@@ -169,8 +169,8 @@ chip, the rest on a host that sleeps.
 
 ## Order of work
 
-1. **Replay bench in this repository.** Recording, variant, reference text in; word error
-   rate, CPU time and leaked playback words out. It exists as scratch scripts today.
+1. **Replay bench** (done: `bench/`). Recording, variant and reference text in; word error
+   rate, CPU time and leaked playback words out.
 2. **One-microphone detection in the ReSpeaker service**, in that project, as an option, replayed against all
    takes. It is the fix for the lost quarter and the first measured piece of the new design.
 3. **Harder recordings:** two talkers, a noise source, more distance, no playback. These
