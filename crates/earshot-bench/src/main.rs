@@ -79,7 +79,15 @@ fn pairs(items: &[String], what: &str) -> Result<Vec<(String, String)>, String> 
 
 fn run(cmd: Cmd) -> Result<(), String> {
     match cmd {
-        Cmd::Pick { channels, width, channel, rate, no_normalise, input, output } => {
+        Cmd::Pick {
+            channels,
+            width,
+            channel,
+            rate,
+            no_normalise,
+            input,
+            output,
+        } => {
             if channel >= channels {
                 return Err("--channel must be less than --channels".into());
             }
@@ -88,9 +96,19 @@ fn run(cmd: Cmd) -> Result<(), String> {
             }
             let raw = std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
             let samples = earshot_bench::pick::pick(&raw, channels, width, channel, !no_normalise);
-            std::fs::write(&output, earshot_bench::run::wav_bytes(rate, &samples)).map_err(|e| format!("{}: {e}", output.display()))
+            std::fs::write(&output, earshot_bench::run::wav_bytes(rate, &samples))
+                .map_err(|e| format!("{}: {e}", output.display()))
         }
-        Cmd::Run { take, variant, transcript, stt_url, language, cache, keep, json } => {
+        Cmd::Run {
+            take,
+            variant,
+            transcript,
+            stt_url,
+            language,
+            cache,
+            keep,
+            json,
+        } => {
             let variants = pairs(&variant, "variant")?;
             let files = pairs(&transcript, "transcript")?;
             if variants.is_empty() && files.is_empty() {
@@ -101,7 +119,11 @@ fn run(cmd: Cmd) -> Result<(), String> {
             }
             let recogniser = match (variants.is_empty(), stt_url) {
                 (true, _) => None,
-                (false, Some(url)) => Some(Recogniser { url, language, cache: (!cache.is_empty()).then(|| cache.into()) }),
+                (false, Some(url)) => Some(Recogniser {
+                    url,
+                    language,
+                    cache: (!cache.is_empty()).then(|| cache.into()),
+                }),
                 (false, None) => return Err("no recogniser: give --stt-url or set EARSHOT_STT_URL".into()),
             };
             let take = Take::load(&take)?;
@@ -120,7 +142,12 @@ fn run(cmd: Cmd) -> Result<(), String> {
             let mut results: Vec<(String, Outcome)> = Vec::new();
             let mut failure = None;
             for (name, command) in &variants {
-                match bench_variant(&take, command, &out_dir.join(format!("{name}.wav")), recogniser.as_ref().unwrap()) {
+                match bench_variant(
+                    &take,
+                    command,
+                    &out_dir.join(format!("{name}.wav")),
+                    recogniser.as_ref().unwrap(),
+                ) {
                     Ok(o) => results.push((name.clone(), o)),
                     Err(e) => {
                         failure = Some(e);
@@ -136,19 +163,28 @@ fn run(cmd: Cmd) -> Result<(), String> {
             }
             for (name, path) in &files {
                 let data = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-                let texts: Texts = serde_json::from_str(&data).map_err(|_| format!("{path}: expected a JSON object of chunk name to text"))?;
+                let texts: Texts =
+                    serde_json::from_str(&data).map_err(|_| format!("{path}: expected a JSON object of chunk name to text"))?;
                 if !texts.values().all(|v| v.is_string()) {
                     return Err(format!("{path}: expected a JSON object of chunk name to text"));
                 }
                 results.push((name.clone(), outcome(&take, texts, None)));
             }
-            println!("take {}: {} reference words, {} playback words", take.name, take.reference_words(), take.playback.len());
+            println!(
+                "take {}: {} reference words, {} playback words",
+                take.name,
+                take.reference_words(),
+                take.playback.len()
+            );
             println!("{}", table(&results));
             if let Some(path) = json {
-                let map: serde_json::Map<String, serde_json::Value> =
-                    results.iter().map(|(n, o)| (n.clone(), serde_json::to_value(o).expect("results are plain data"))).collect();
+                let map: serde_json::Map<String, serde_json::Value> = results
+                    .iter()
+                    .map(|(n, o)| (n.clone(), serde_json::to_value(o).expect("results are plain data")))
+                    .collect();
                 let doc = serde_json::json!({ "take": take.name, "results": map });
-                std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
+                std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap())
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
             }
             Ok(())
         }

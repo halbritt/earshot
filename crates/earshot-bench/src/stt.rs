@@ -29,7 +29,11 @@ impl Recogniser {
         }
         let boundary = format!("earshot{}", &key[..24]);
         let mut body = Vec::with_capacity(wav.len() + 600);
-        for (name, value) in [("response_format", "json"), ("temperature", "0.0"), ("language", self.language.as_str())] {
+        for (name, value) in [
+            ("response_format", "json"),
+            ("temperature", "0.0"),
+            ("language", self.language.as_str()),
+        ] {
             body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").bytes());
         }
         body.extend(
@@ -53,7 +57,9 @@ impl Recogniser {
             serde_json::from_reader(reply.into_reader()).map_err(|e| format!("the recogniser's answer is not JSON: {e}"))?;
         let text = json.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
         if let Some(dir) = &self.cache {
-            std::fs::create_dir_all(dir).and_then(|_| std::fs::write(dir.join(&key), &text)).map_err(|e| format!("{}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .and_then(|_| std::fs::write(dir.join(&key), &text))
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         Ok(text)
     }

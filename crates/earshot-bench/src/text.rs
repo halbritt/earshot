@@ -80,8 +80,8 @@ pub fn align(reference: &[String], heard: &[String]) -> Vec<Op> {
     for i in 0..=n {
         cost[i * w] = i as i64 * big;
     }
-    for j in 0..=m {
-        cost[j] = j as i64 * big;
+    for (j, c) in cost.iter_mut().enumerate().take(m + 1) {
+        *c = j as i64 * big;
     }
     let step = |i: usize, j: usize| if reference[i - 1] == heard[j - 1] { -1 } else { big };
     for i in 1..=n {
@@ -93,7 +93,11 @@ pub fn align(reference: &[String], heard: &[String]) -> Vec<Op> {
     let (mut ops, mut i, mut j) = (Vec::with_capacity(n.max(m)), n, m);
     while i > 0 || j > 0 {
         if i > 0 && j > 0 && cost[i * w + j] == cost[(i - 1) * w + j - 1] + step(i, j) {
-            ops.push(if reference[i - 1] == heard[j - 1] { Op::Same(i - 1, j - 1) } else { Op::Substituted(i - 1, j - 1) });
+            ops.push(if reference[i - 1] == heard[j - 1] {
+                Op::Same(i - 1, j - 1)
+            } else {
+                Op::Substituted(i - 1, j - 1)
+            });
             i -= 1;
             j -= 1;
         } else if i > 0 && cost[i * w + j] == cost[(i - 1) * w + j] + big {
@@ -169,10 +173,10 @@ pub fn leaked_words(unmatched: &[String], playback: &[String], run: usize) -> us
     // len[j]: length of the common run ending at unmatched[i], playback[j].
     let mut covered = vec![false; n];
     let mut prev = vec![0usize; m + 1];
-    for i in 0..n {
+    for (i, word) in unmatched.iter().enumerate() {
         let mut cur = vec![0usize; m + 1];
         for j in 0..m {
-            if unmatched[i] == playback[j] {
+            if *word == playback[j] {
                 cur[j + 1] = prev[j] + 1;
                 if cur[j + 1] >= run {
                     for c in covered.iter_mut().take(i + 1).skip(i + 1 - cur[j + 1]) {
@@ -209,7 +213,7 @@ pub fn score(reference: &[Section], heard: &[String], playback: &[String]) -> Sc
         };
         sections[k].1.reference_words += sec.len();
         all.extend(sec.iter().cloned());
-        owner.extend(std::iter::repeat(k).take(sec.len()));
+        owner.extend(std::iter::repeat_n(k, sec.len()));
     }
     let ops = align(&all, heard);
     // Section of each operation: extra words take the section of the next reference word.
@@ -222,14 +226,21 @@ pub fn score(reference: &[Section], heard: &[String], playback: &[String]) -> Sc
         }
         op_section[k] = next;
     }
-    let mut total = Counts { reference_words: all.len(), ..Counts::default() };
+    let mut total = Counts {
+        reference_words: all.len(),
+        ..Counts::default()
+    };
     let mut unmatched = Vec::new();
     let mut missing_runs = Vec::new();
     let mut run: Option<(usize, usize)> = None;
     let close = |run: &mut Option<(usize, usize)>, runs: &mut Vec<MissingRun>| {
         if let Some((first, len)) = run.take() {
             if len >= MISSING_RUN {
-                runs.push(MissingRun { section: sections_name(reference, &owner, first), first_word: first, words: len });
+                runs.push(MissingRun {
+                    section: sections_name(reference, &owner, first),
+                    first_word: first,
+                    words: len,
+                });
             }
         }
     };
@@ -264,7 +275,14 @@ pub fn score(reference: &[Section], heard: &[String], playback: &[String]) -> Sc
     Score {
         wer: total.wer(),
         leaked: leaked_words(&unmatched, playback, LEAK_RUN),
-        sections: sections.into_iter().map(|(name, counts)| SectionScore { name, wer: counts.wer(), counts }).collect(),
+        sections: sections
+            .into_iter()
+            .map(|(name, counts)| SectionScore {
+                name,
+                wer: counts.wer(),
+                counts,
+            })
+            .collect(),
         missing_runs,
         counts: total,
     }
@@ -293,7 +311,10 @@ mod tests {
 
     #[test]
     fn words_ignore_case_and_punctuation_and_split_hyphens() {
-        assert_eq!(words("Clank-clank, they came; it's 3 o'clock\u{2014}now."), w("clank clank they came it's 3 o'clock now"));
+        assert_eq!(
+            words("Clank-clank, they came; it's 3 o'clock\u{2014}now."),
+            w("clank clank they came it's 3 o'clock now")
+        );
     }
 
     #[test]
@@ -318,13 +339,19 @@ mod tests {
         // reference: the cat sat on the mat (6 words)
         // heard:     the cat sit on mat today -> sat->sit, "the" missing, "today" extra
         let s = score(&one("the cat sat on the mat"), &w("the cat sit on mat today"), &[]);
-        assert_eq!((s.counts.correct, s.counts.substituted, s.counts.missing, s.counts.extra), (4, 1, 1, 1));
+        assert_eq!(
+            (s.counts.correct, s.counts.substituted, s.counts.missing, s.counts.extra),
+            (4, 1, 1, 1)
+        );
         assert_eq!(s.wer, 0.5);
     }
 
     #[test]
     fn errors_are_charged_to_the_section_of_the_reference_word() {
-        let r = vec![("quiet".to_string(), w("one two three")), ("over".to_string(), w("four five six"))];
+        let r = vec![
+            ("quiet".to_string(), w("one two three")),
+            ("over".to_string(), w("four five six")),
+        ];
         let s = score(&r, &w("one two three four six"), &[]);
         assert_eq!(s.section("quiet").unwrap().counts.missing, 0);
         assert_eq!(s.section("over").unwrap().counts.missing, 1);
@@ -342,14 +369,24 @@ mod tests {
     fn an_extra_word_is_charged_to_the_section_that_follows_it() {
         let r = vec![("a".to_string(), w("one two")), ("b".to_string(), w("three four"))];
         let s = score(&r, &w("one two um three four"), &[]);
-        assert_eq!((s.section("a").unwrap().counts.extra, s.section("b").unwrap().counts.extra), (0, 1));
+        assert_eq!(
+            (s.section("a").unwrap().counts.extra, s.section("b").unwrap().counts.extra),
+            (0, 1)
+        );
     }
 
     #[test]
     fn a_long_run_of_missing_words_is_reported_with_its_place() {
         let r = vec![("a".to_string(), w("w0 w1 w2 w3 w4 w5 w6 w7 w8 w9"))];
         let s = score(&r, &w("w0 w1 w7 w8 w9"), &[]);
-        assert_eq!(s.missing_runs, vec![MissingRun { section: "a".into(), first_word: 2, words: 5 }]);
+        assert_eq!(
+            s.missing_runs,
+            vec![MissingRun {
+                section: "a".into(),
+                first_word: 2,
+                words: 5
+            }]
+        );
     }
 
     #[test]
@@ -362,13 +399,21 @@ mod tests {
     #[test]
     fn playback_words_in_the_transcript_are_counted_as_leaked() {
         let played = w("the weather today is sunny with light wind");
-        let s = score(&one("please open the door"), &w("please open today is sunny the door"), &played);
+        let s = score(
+            &one("please open the door"),
+            &w("please open today is sunny the door"),
+            &played,
+        );
         assert_eq!((s.leaked, s.counts.extra), (3, 3));
     }
 
     #[test]
     fn reference_words_that_also_occur_in_the_playback_are_not_leaks() {
-        let s = score(&one("today is sunny outside"), &w("today is sunny outside"), &w("today is sunny"));
+        let s = score(
+            &one("today is sunny outside"),
+            &w("today is sunny outside"),
+            &w("today is sunny"),
+        );
         assert_eq!(s.leaked, 0);
     }
 

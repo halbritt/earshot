@@ -58,7 +58,7 @@ impl Take {
             }
         }
         let chunk_seconds = m.chunk_seconds.unwrap_or(25.0);
-        if !(chunk_seconds > 0.0) {
+        if chunk_seconds.is_nan() || chunk_seconds <= 0.0 {
             return Err(format!("{}: chunk_seconds must be greater than 0", path.display()));
         }
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -97,7 +97,11 @@ pub fn run_variant(command: &str, recording: &Path, out: &Path) -> Result<(f64, 
     }
     let cmd = command.replace("{in}", &quote(recording)).replace("{out}", &quote(out));
     let (before, t0) = (children_cpu(), Instant::now());
-    let done = Command::new("sh").arg("-c").arg(&cmd).output().map_err(|e| format!("could not start sh: {e}"))?;
+    let done = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .output()
+        .map_err(|e| format!("could not start sh: {e}"))?;
     let (cpu, wall) = (children_cpu() - before, t0.elapsed().as_secs_f64());
     if !done.status.success() {
         let err = String::from_utf8_lossy(&done.stderr);
@@ -123,12 +127,20 @@ pub fn read_wav(path: &Path) -> Result<(u32, Vec<i16>), String> {
             spec.bits_per_sample
         ));
     }
-    let samples = r.samples::<i16>().collect::<Result<Vec<_>, _>>().map_err(|e| format!("{}: {e}", path.display()))?;
+    let samples = r
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((spec.sample_rate, samples))
 }
 
 pub fn wav_bytes(rate: u32, samples: &[i16]) -> Vec<u8> {
-    let spec = hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
     let mut buf = Cursor::new(Vec::new());
     {
         let mut w = hound::WavWriter::new(&mut buf, spec).expect("WAV header");
@@ -155,7 +167,10 @@ pub fn chunks<'a>(take: &Take, rate: u32, samples: &'a [i16]) -> Vec<(String, &'
         take.regions.iter().map(|r| (r.name.clone(), r.start, r.end)).collect()
     };
     let at = |t: f64| ((t * rate as f64) as usize).min(samples.len());
-    spans.into_iter().map(|(name, a, b)| (name, &samples[at(a)..at(b).max(at(a))])).collect()
+    spans
+        .into_iter()
+        .map(|(name, a, b)| (name, &samples[at(a)..at(b).max(at(a))]))
+        .collect()
 }
 
 /// Chunk name to text, in order.
@@ -202,7 +217,11 @@ pub fn bench_variant(take: &Take, command: &str, out: &Path, recogniser: &Recogn
     let (rate, samples) = read_wav(out)?;
     let mut texts = Texts::new();
     for (name, piece) in chunks(take, rate, &samples) {
-        let text = if piece.is_empty() { String::new() } else { recogniser.transcribe(&wav_bytes(rate, piece))? };
+        let text = if piece.is_empty() {
+            String::new()
+        } else {
+            recogniser.transcribe(&wav_bytes(rate, piece))?
+        };
         texts.insert(name, text.into());
     }
     Ok(outcome(take, texts, Some((cpu, wall, samples.len() as f64 / rate as f64))))
@@ -219,8 +238,18 @@ pub fn table(results: &[(String, Outcome)]) -> String {
     }
     let by_section = names != ["all"];
     let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut head: Vec<String> =
-        ["variant", "WER %", "correct", "subst", "missing", "extra", "leaked", "CPU % of real time"].map(String::from).to_vec();
+    let mut head: Vec<String> = [
+        "variant",
+        "WER %",
+        "correct",
+        "subst",
+        "missing",
+        "extra",
+        "leaked",
+        "CPU % of real time",
+    ]
+    .map(String::from)
+    .to_vec();
     if by_section {
         head.extend(names.iter().map(|n| format!("WER % {n}")));
     }
@@ -238,18 +267,30 @@ pub fn table(results: &[(String, Outcome)]) -> String {
             r.cpu_percent_of_real_time.map_or("-".into(), |p| format!("{p:.1}")),
         ];
         if by_section {
-            row.extend(names.iter().map(|n| r.score.section(n).map_or("-".into(), |s| format!("{:.1}", 100.0 * s.wer))));
+            row.extend(
+                names
+                    .iter()
+                    .map(|n| r.score.section(n).map_or("-".into(), |s| format!("{:.1}", 100.0 * s.wer))),
+            );
         }
         rows.push(row);
     }
-    let widths: Vec<usize> = (0..rows[0].len()).map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..rows[0].len())
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
     let mut lines: Vec<String> = rows
         .iter()
         .map(|r| {
             let cells: Vec<String> = r
                 .iter()
                 .enumerate()
-                .map(|(i, c)| if i == 0 { format!("{c:<w$}", w = widths[i]) } else { format!("{c:>w$}", w = widths[i]) })
+                .map(|(i, c)| {
+                    if i == 0 {
+                        format!("{c:<w$}", w = widths[i])
+                    } else {
+                        format!("{c:>w$}", w = widths[i])
+                    }
+                })
                 .collect();
             cells.join("  ")
         })

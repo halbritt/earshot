@@ -47,7 +47,13 @@ fn recogniser() -> Stand {
                 if head_end.is_none() {
                     if let Some(p) = find(&buf, b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
-                        let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).unwrap().trim().parse::<usize>().unwrap();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
                         head_end = Some(p + 4);
                         need = p + 4 + len;
                     }
@@ -62,7 +68,13 @@ fn recogniser() -> Stand {
             let first = i16::from_le_bytes([body[data], body[data + 1]]);
             log.lock().unwrap().push(first);
             let reply = format!("{{\"text\": \"{}\"}}", heard(first));
-            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+            write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            )
+            .unwrap();
         }
     });
     Stand { url, seen }
@@ -86,8 +98,15 @@ fn raw_recording(path: &Path, per_second: [&[i32]; 2]) {
 /// channel 1 carries a worse first half.
 fn take() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
-    raw_recording(&d.path().join("rec.raw"), [&[1000, 1000, 2000, 2000], &[3000, 3000, 2000, 2000]]);
-    std::fs::write(d.path().join("ref.txt"), "# region: first\nThe quick brown fox\n# region: second\njumps over the lazy dog.\n").unwrap();
+    raw_recording(
+        &d.path().join("rec.raw"),
+        [&[1000, 1000, 2000, 2000], &[3000, 3000, 2000, 2000]],
+    );
+    std::fs::write(
+        d.path().join("ref.txt"),
+        "# region: first\nThe quick brown fox\n# region: second\njumps over the lazy dog.\n",
+    )
+    .unwrap();
     std::fs::write(
         d.path().join("take.toml"),
         "name = \"t\"\nrecording = \"rec.raw\"\nreference = \"ref.txt\"\n\
@@ -112,14 +131,27 @@ fn run(dir: &Path, url: Option<&str>, args: &[String]) -> Ran {
     let json: PathBuf = dir.join("r.json");
     let _ = std::fs::remove_file(&json);
     let mut c = Command::new(BIN);
-    c.arg("run").arg(dir.join("take.toml")).arg("--cache").arg(dir.join("cache")).arg("--json").arg(&json).args(args);
+    c.arg("run")
+        .arg(dir.join("take.toml"))
+        .arg("--cache")
+        .arg(dir.join("cache"))
+        .arg("--json")
+        .arg(&json)
+        .args(args);
     c.env_remove("EARSHOT_STT_URL").env_remove("EARSHOT_CACHE");
     if let Some(u) = url {
         c.arg("--stt-url").arg(u);
     }
     let o = c.output().unwrap();
-    let results = std::fs::read_to_string(&json).ok().map(|s| serde_json::from_str::<serde_json::Value>(&s).unwrap()["results"].clone());
-    Ran { code: o.status.code().unwrap(), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into(), results }
+    let results = std::fs::read_to_string(&json)
+        .ok()
+        .map(|s| serde_json::from_str::<serde_json::Value>(&s).unwrap()["results"].clone());
+    Ran {
+        code: o.status.code().unwrap(),
+        out: String::from_utf8_lossy(&o.stdout).into(),
+        err: String::from_utf8_lossy(&o.stderr).into(),
+        results,
+    }
 }
 
 fn variant(name: &str, cmd: &str) -> Vec<String> {
@@ -133,10 +165,17 @@ fn section<'a>(r: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
 #[test]
 fn a_variant_is_run_transcribed_per_region_and_scored() {
     let (d, s) = (take(), recogniser());
-    let r = run(d.path(), Some(&s.url), &[variant("mic0", &pick(0)), variant("mic1", &pick(1))].concat());
+    let r = run(
+        d.path(),
+        Some(&s.url),
+        &[variant("mic0", &pick(0)), variant("mic1", &pick(1))].concat(),
+    );
     assert_eq!(r.code, 0, "{}", r.err);
     let res = r.results.unwrap();
-    assert_eq!((res["mic0"]["wer"].as_f64(), res["mic0"]["correct"].as_u64()), (Some(0.0), Some(9)));
+    assert_eq!(
+        (res["mic0"]["wer"].as_f64(), res["mic0"]["correct"].as_u64()),
+        (Some(0.0), Some(9))
+    );
     // mic1 heard "the quick fox" for "the quick brown fox": one of nine words missing
     assert_eq!(res["mic1"]["missing"], 1);
     assert!((res["mic1"]["wer"].as_f64().unwrap() - 1.0 / 9.0).abs() < 1e-9);
@@ -181,11 +220,21 @@ fn unchanged_audio_is_not_sent_to_the_recogniser_twice() {
 fn the_cpu_time_of_the_variant_command_is_measured() {
     let (d, s) = (take(), recogniser());
     // Spin for 0.4 s of wall time, then do the same work as the fast variant.
-    let burn = format!("end=$(( $(date +%s%N) + 400000000 )); while [ $(date +%s%N) -lt $end ]; do :; done; {}", pick(0));
-    let r = run(d.path(), Some(&s.url), &[variant("slow", &burn), variant("fast", &pick(0))].concat());
+    let burn = format!(
+        "end=$(( $(date +%s%N) + 400000000 )); while [ $(date +%s%N) -lt $end ]; do :; done; {}",
+        pick(0)
+    );
+    let r = run(
+        d.path(),
+        Some(&s.url),
+        &[variant("slow", &burn), variant("fast", &pick(0))].concat(),
+    );
     assert_eq!(r.code, 0, "{}", r.err);
     let res = r.results.unwrap();
-    let (slow, fast) = (res["slow"]["cpu_seconds"].as_f64().unwrap(), res["fast"]["cpu_seconds"].as_f64().unwrap());
+    let (slow, fast) = (
+        res["slow"]["cpu_seconds"].as_f64().unwrap(),
+        res["fast"]["cpu_seconds"].as_f64().unwrap(),
+    );
     assert!(slow - fast >= 0.15, "slow {slow} fast {fast}");
     assert!(fast < 0.1, "fast {fast}");
     assert!(res["slow"]["cpu_percent_of_real_time"].as_f64().unwrap() >= 100.0 * 0.15 / 4.0);
@@ -204,13 +253,22 @@ fn a_failing_variant_stops_the_run_with_its_error() {
 fn a_variant_that_writes_stereo_is_rejected() {
     let (d, s) = (take(), recogniser());
     let stereo = d.path().join("stereo.wav");
-    let spec = hound::WavSpec { channels: 2, sample_rate: 100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 100,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
     let mut w = hound::WavWriter::create(&stereo, spec).unwrap();
     for _ in 0..200 {
         w.write_sample(0i16).unwrap();
     }
     w.finalize().unwrap();
-    let r = run(d.path(), Some(&s.url), &variant("st", &format!("cp {} {{out}}", stereo.display())));
+    let r = run(
+        d.path(),
+        Some(&s.url),
+        &variant("st", &format!("cp {} {{out}}", stereo.display())),
+    );
     assert_eq!(r.code, 2);
     assert!(r.err.contains("one channel"), "{}", r.err);
 }
@@ -218,7 +276,11 @@ fn a_variant_that_writes_stereo_is_rejected() {
 #[test]
 fn without_regions_the_audio_is_cut_into_fixed_pieces() {
     let (d, s) = (take(), recogniser());
-    std::fs::write(d.path().join("take.toml"), "recording = \"rec.raw\"\nreference = \"ref.txt\"\nchunk_seconds = 2\n").unwrap();
+    std::fs::write(
+        d.path().join("take.toml"),
+        "recording = \"rec.raw\"\nreference = \"ref.txt\"\nchunk_seconds = 2\n",
+    )
+    .unwrap();
     let r = run(d.path(), Some(&s.url), &variant("mic0", &pick(0)));
     let res = r.results.unwrap();
     let names: Vec<&String> = res["mic0"]["texts"].as_object().unwrap().keys().collect();

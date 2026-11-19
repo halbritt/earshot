@@ -8,3 +8,7 @@ if mise tasks info host:exec >/dev/null 2>&1; then
 fi
 exec cargo test -q "$@"
 ' sh'''
+
+[tasks.lint]
+description = "Formatting and clippy, warnings as errors"
+run = "cargo fmt --check && cargo clippy -q --all-targets -- -D warnings"

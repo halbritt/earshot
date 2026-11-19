@@ -12,14 +12,20 @@ pub fn pick(raw: &[u8], channels: usize, width: usize, channel: usize, normalise
         .chunks_exact(frame)
         .map(|f| {
             let s = &f[channel * width..(channel + 1) * width];
-            if width == 2 { i16::from_le_bytes([s[0], s[1]]) as i64 } else { i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as i64 }
+            if width == 2 {
+                i16::from_le_bytes([s[0], s[1]]) as i64
+            } else {
+                i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as i64
+            }
         })
         .collect();
     let shift = 8 * (width - 2);
     let peak = one.iter().map(|v| v.abs()).max().unwrap_or(0).max(1);
     let full = 1i64 << (8 * width - 1);
     let gain = if normalise { 0.9 * full as f64 / peak as f64 } else { 1.0 };
-    one.iter().map(|&v| (((v as f64 * gain) as i64) >> shift).clamp(-32768, 32767) as i16).collect()
+    one.iter()
+        .map(|&v| (((v as f64 * gain) as i64) >> shift).clamp(-32768, 32767) as i16)
+        .collect()
 }
 
 #[cfg(test)]
@@ -39,7 +45,10 @@ mod tests {
 
     #[test]
     fn without_normalising_keeps_the_top_sixteen_bits() {
-        assert_eq!(pick(&raw32(&[1000 << 16, 0, -2000 << 16, 0]), 2, 4, 0, false), vec![1000, -2000]);
+        assert_eq!(
+            pick(&raw32(&[1000 << 16, 0, -2000 << 16, 0]), 2, 4, 0, false),
+            vec![1000, -2000]
+        );
     }
 
     #[test]
