@@ -2,7 +2,7 @@
 description = "All tests (cargo test: scoring, variant runner, command line end to end)"
 run = '''sh -eu -c '
 # host:exec is an optional private wrapper task (resource-limited runner). Use it when this
-# machine defines it; every other clone runs pytest directly.
+# machine defines it; every other clone runs cargo directly.
 if mise tasks info host:exec >/dev/null 2>&1; then
   exec mise run host:exec --timeout 15m --weight 1 -- cargo test -q "$@"
 fi
