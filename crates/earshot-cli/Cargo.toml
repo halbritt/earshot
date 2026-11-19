@@ -1,0 +1,22 @@
+[package]
+name = "earshot-cli"
+version = "0.1.0"
+description = "Command-line front end for the earshot microphone-array core"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "earshot"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+earshot-core = { path = "../earshot-core" }
+hound = "3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+hound = "3"

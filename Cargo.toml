@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/earshot-bench"]
+members = ["crates/earshot-bench", "crates/earshot-cli", "crates/earshot-core"]
 
 [workspace.package]
 edition = "2021"

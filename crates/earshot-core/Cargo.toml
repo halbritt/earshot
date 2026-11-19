@@ -1,0 +1,15 @@
+[package]
+name = "earshot-core"
+version = "0.1.0"
+description = "Microphone-array processing core: array description, STFT, fixed beams. no_std."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libm = "0.2"
+microfft = { version = "0.6", default-features = false, features = ["size-512"] }
+num-complex = { version = "0.4", default-features = false, features = ["libm"] }
+
+[dev-dependencies]
+serde_json = "1"

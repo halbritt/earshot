@@ -1,6 +1,6 @@
 # A general-purpose microphone-array front end: plan
 
-Status: planning. Nothing here is built yet. The measurements come from the
+Status: the bench and the first part of the core are built (see "Order of work"). The measurements come from the
 [ReSpeaker Core v2 revival](https://github.com/halbritt/respeaker-core-v2-revival) project,
 whose running service is the first array this tool will be tested on.
 
@@ -178,7 +178,11 @@ chip, the rest on a host that sleeps.
 3. **Harder recordings:** two talkers, a noise source, more distance, no playback. These
    decide how much beamforming the room mode needs.
 4. **Core library:** array description, STFT, superdirective beam set, azimuth direction.
-   Checked against the simulation and replayed on the bench.
+   Checked against the simulation and replayed on the bench. Done so far
+   (`crates/earshot-core`, `earshot beam`): array description, STFT and beam design, which
+   gives the simulation's directivity to 0.05 dB. On the 459-word reading, with the beam
+   steered by hand: one microphone 5.4%, delay-and-sum 5.2%, superdirective 5.4%, and a
+   superdirective beam pointed 180 degrees away from the talker 8.3%. Not done: direction.
 5. **Agent mode end to end** on the ReSpeaker, replacing ODAS; then the Wyoming adapter.
 6. **Room mode:** talker tracking and one stream per talker.
 7. **A second array** to prove that the array really is data.

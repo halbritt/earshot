@@ -1,0 +1,32 @@
+# ReSpeaker Core v2: six microphones on a 93 mm circle, two loopback channels of what the
+# speaker plays. Azimuth 0 is the middle of the USB-A side, counted counter-clockwise seen
+# from above. Order and orientation were measured on the board (see the ReSpeaker Core v2
+# revival project, board/odas-respeaker-core-v2.cfg).
+rate = 16000
+channels = 8
+width = 32                         # bits per sample, signed little-endian
+reference = [6, 7]
+
+[[mic]]
+channel = 0
+position = [0.0401, 0.0231, 0.0]
+
+[[mic]]
+channel = 1
+position = [0.0401, -0.0231, 0.0]
+
+[[mic]]
+channel = 2
+position = [0.0000, -0.0463, 0.0]
+
+[[mic]]
+channel = 3
+position = [-0.0401, -0.0231, 0.0]
+
+[[mic]]
+channel = 4
+position = [-0.0401, 0.0232, 0.0]
+
+[[mic]]
+channel = 5
+position = [-0.0000, 0.0463, 0.0]
