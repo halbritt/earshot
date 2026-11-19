@@ -10,3 +10,7 @@ Status: planning. See [docs/plan.md](docs/plan.md).
 - `docs/plan.md`: why, the design rules, the stages, the interfaces and the order of work.
 - `sim/arrays.py`: calculated directivity for candidate array geometries
   (`python3 sim/arrays.py`, needs NumPy; takes a few minutes).
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
