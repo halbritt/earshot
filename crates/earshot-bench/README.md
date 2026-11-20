@@ -73,10 +73,18 @@ live: 25 consecutive words missing in 'over' from reference word 139
 
 ## How much difference is real
 
-The recogniser is not stable against small changes of its input. On a 459-word reading, the
-same microphone written with two different rounding methods scored 5.5% and 7.2%. Treat a
-difference of less than about 2 points on a take of that length as nothing, and confirm any
-result on more than one take.
+The recogniser is not stable against changes of its input that nobody can hear. One
+microphone of a 459-word reading was scored sixteen times: as it was, with gain changes from
+-6 to +3 dB, delayed by 1 to 400 samples, and with one step of added noise.
+
+- Word error rate: 5.0 to 7.4% (mean 6.6, standard deviation 0.9).
+- Correct words: 436 to 438. Missing words: 2 or 3. Substituted: 19 to 21.
+- Extra words: 1 to 12. Almost all of the spread is one run of about ten inserted words
+  that the recogniser adds in some versions and not in others.
+
+So on a take of that length a difference of less than about 2.5 points in word error rate
+is nothing, while a difference of five or more correct or missing words is real. Look at
+`correct` and `missing` first, and confirm any result on more than one take.
 
 ## Tests
 
