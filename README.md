@@ -15,10 +15,11 @@ detection and live capture are not built yet. See [docs/plan.md](docs/plan.md).
 - `crates/earshot-core/`: the processing core, `no_std`: the array as data, delay-and-sum and
   superdirective beam design, direction finding (SRP-PHAT over azimuth), and the transform. Its beam design is tested against the
   simulation below.
-- `crates/earshot-cli/`: the `earshot` command. `earshot beam --array arrays/respeaker-core-v2.toml
-  --steer 100 in.raw out.wav` puts one fixed beam over a raw recording; `--steer 0:100,113.5:305`
-  turns it at given times, and `--steer auto` follows the talker. `earshot direction --array ... in.raw` prints where the sound
-  comes from, twice a second. These work on recordings; there is no service yet.
+- `crates/earshot-cli/`: the `earshot` command, for recordings; there is no service yet.
+  - `earshot beam --array arrays/respeaker-core-v2.toml --steer 100 in.raw out.wav` puts one
+    fixed beam over a raw recording. `--steer 0:100,113.5:305` turns it at given times and
+    `--steer auto` follows the talker. This is what the bench runs as a variant.
+  - `earshot direction --array ... in.raw` prints where the sound comes from, twice a second.
 - `arrays/`: array description files.
 - `sim/arrays.py`: calculated directivity for candidate array geometries
   (`python3 sim/arrays.py`, needs NumPy; takes a few minutes). It is a one-off calculation;
