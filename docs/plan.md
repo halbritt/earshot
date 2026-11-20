@@ -169,6 +169,35 @@ a few milliwatts. Capture chips of the kind used on 16-microphone USB arrays hav
 processing capacity of their own, so a split is possible: gate and capture on the small
 chip, the rest on a host that sleeps.
 
+## What the board's own voice taught us
+
+Measured on the ReSpeaker with its speaker a few centimetres from the microphones, while
+fixing a leak of the board's voice into the transcript. These decide the echo stage here.
+
+- **The echo path hardly changes.** A fixed 96 ms filter fitted to one 5 s prompt removed 17
+  to 19 dB of another prompt 90 s later, after the listener had moved. Fitted and tested on
+  the same prompt it removed 20 to 21 dB; a longer filter added nothing. The adaptive
+  filter in use (Speex) removed 13 to 16 dB. A filter that learns slowly from long averages
+  should do better than one that follows every block, above all while someone talks over
+  the playback.
+- **The limit is the speaker, then the room's noise.** With the speaker inside its clean
+  range a fixed filter removed everything down to the noise of the room (21 to 26 dB). Driven
+  5 dB harder it removed 19 to 21 dB. Polynomial models of the speaker fitted well and
+  predicted nothing on the next half of the same prompt.
+- **What is left is still transcribed.** The leftover of a 6 s prompt came out as 17 wrong
+  words with high confidence. The recogniser's own confidence did not tell it from a person
+  (-0.03 average log probability, better than the real reader).
+- **Masking the leftover makes it worse.** Attenuating time-frequency cells where the
+  canceller's output was far below its input turned the leftover into different wrong
+  sentences. This is design rule 1 again.
+- **A spatial null on the speaker did not help**: 17 dB with one complex weight per
+  frequency, with or without a person talking.
+- **What worked is a decision, not a filter.** Block by block (30 ms), the canceller's
+  output is compared with its input. Within 9 dB: something else is there. The speech
+  detector ignores the other blocks while the device plays. On a 459-word reading this
+  removed the leaked prompt and lost four of the reader's words; on an older take the error
+  rate fell from 50% to 27%.
+
 ## Order of work
 
 1. **Replay bench** (done: `crates/earshot-bench`). Recording, variant and reference text in; word error
