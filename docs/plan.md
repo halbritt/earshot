@@ -216,7 +216,14 @@ fixing a leak of the board's voice into the transcript. These decide the echo st
    part: a reader at about 100 degrees is placed at 103, and after moving to about 305 at
    299 to 300, with every interval within 15 degrees while the board is silent and 76 to
    97% of them while it talks. The board talking alone reads 176 degrees, its own speaker.
-   Not done: steering the beam by the direction found.
+   Steered by that direction (`earshot beam --steer auto`: the beam turns when three
+   measurements in a row, 0.77 s, agree on a new direction, and ignores sound while the
+   device plays), the beam made the two right turns in the 222 s and no other, and scored
+   434 correct words against 436 steered by hand.
+   CPU on the ReSpeaker (one Cortex-A7 core, statically linked build, whole recording):
+   transform and one beam 3.3% of the core, direction finding another 5.6%, measured all the
+   time and not only during speech. ODAS takes 46% on the same board.
+   Not done: speech gate, echo stage, live capture.
 5. **Agent mode end to end** on the ReSpeaker, replacing ODAS; then the Wyoming adapter.
 6. **Room mode:** talker tracking and one stream per talker.
 7. **A second array** to prove that the array really is data.

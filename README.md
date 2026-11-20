@@ -17,7 +17,7 @@ detection and live capture are not built yet. See [docs/plan.md](docs/plan.md).
   simulation below.
 - `crates/earshot-cli/`: the `earshot` command. `earshot beam --array arrays/respeaker-core-v2.toml
   --steer 100 in.raw out.wav` puts one fixed beam over a raw recording; `--steer 0:100,113.5:305`
-  turns it at given times. `earshot direction --array ... in.raw` prints where the sound
+  turns it at given times, and `--steer auto` follows the talker. `earshot direction --array ... in.raw` prints where the sound
   comes from, twice a second. These work on recordings; there is no service yet.
 - `arrays/`: array description files.
 - `sim/arrays.py`: calculated directivity for candidate array geometries

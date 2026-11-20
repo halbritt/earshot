@@ -17,6 +17,8 @@ pub struct Finder {
     high: usize,           // bins low..high are used
     align: Vec<Complex32>, // direction-major, then bin, then microphone: conj of the steering vector
     power: Vec<f32>,       // per direction, summed over the frames added
+    phase: Vec<Complex32>, // scratch: unit-size spectra of the bins in use, bin-major
+    which: Vec<usize>,     // scratch: the bins in use
     frames: usize,
 }
 
@@ -50,6 +52,8 @@ impl Finder {
             high,
             align,
             power: vec![0.0; directions],
+            phase: vec![Complex32::new(0.0, 0.0); (high - low) * array.len()],
+            which: vec![0; high - low],
             frames: 0,
         }
     }
@@ -62,19 +66,28 @@ impl Finder {
         // leaked from the others, with their phase and not their own: leave them out.
         let power = |b: usize| spectra[0][self.low + b].norm_sqr();
         let least = (0..bins).map(power).fold(0.0, f32::max) * 1e-4;
+        // every microphone's phase, once, for the bins that count
+        let mut used = 0;
+        for b in (0..bins).filter(|&b| power(b) > least) {
+            self.which[used] = b;
+            for (m, x) in spectra.iter().enumerate() {
+                let x = x[self.low + b];
+                let size = x.norm();
+                self.phase[used * mics + m] = if size > 0.0 { x / size } else { Complex32::new(0.0, 0.0) };
+            }
+            used += 1;
+        }
         for d in 0..self.directions {
             let mut sum = 0.0;
-            for b in (0..bins).filter(|&b| power(b) > least) {
+            for (u, &b) in self.which[..used].iter().enumerate() {
                 let w = &self.align[(d * bins + b) * mics..(d * bins + b + 1) * mics];
-                let mut s = Complex32::new(0.0, 0.0);
-                for (w, x) in w.iter().zip(spectra) {
-                    let x = x[self.low + b];
-                    let size = x.norm();
-                    if size > 0.0 {
-                        s += w * x / size;
-                    }
+                let x = &self.phase[u * mics..(u + 1) * mics];
+                let (mut re, mut im) = (0.0f32, 0.0f32);
+                for (w, x) in w.iter().zip(x) {
+                    re += w.re * x.re - w.im * x.im;
+                    im += w.re * x.im + w.im * x.re;
                 }
-                sum += s.norm_sqr();
+                sum += re * re + im * im;
             }
             self.power[d] += sum;
         }
