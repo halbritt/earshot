@@ -1,4 +1,5 @@
 //! earshot: command-line front end for the microphone-array core.
+mod follow;
 mod layout;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -25,7 +26,8 @@ enum Command {
         /// Array description (TOML)
         #[arg(long)]
         array: PathBuf,
-        /// Where the beam looks: degrees, or TIME:DEGREES,... to turn it at given seconds
+        /// Where the beam looks: degrees, TIME:DEGREES,... to turn it at given seconds, or
+        /// `auto` to follow the talker
         #[arg(long, default_value = "0")]
         steer: String,
         /// Degrees above the plane of the array
@@ -39,6 +41,9 @@ enum Command {
         /// Gain applied to the output, dB
         #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
         gain: f64,
+        /// Say on standard error where the beam looks
+        #[arg(long)]
+        verbose: bool,
         /// Raw interleaved recording
         input: PathBuf,
         /// WAV file to write
@@ -94,11 +99,25 @@ fn beam(
     kind: BeamKind,
     wng: f64,
     gain: f64,
+    verbose: bool,
     input: PathBuf,
     output: PathBuf,
 ) -> Result<(), String> {
     let layout = Layout::load(&array)?;
-    let plan = steering(steer)?;
+    let mut raw = Vec::new();
+    std::fs::File::open(&input)
+        .and_then(|mut f| f.read_to_end(&mut raw))
+        .map_err(|e| format!("{}: {e}", input.display()))?;
+    let plan = if steer == "auto" {
+        follow::follow(&layout, &raw, elevation)
+    } else {
+        steering(steer)?
+    };
+    if verbose {
+        for (t, az) in &plan {
+            eprintln!("from {t:.2} s the beam looks at {az:.0} degrees");
+        }
+    }
     let kind = match kind {
         BeamKind::DelaySum => Kind::DelaySum,
         BeamKind::Superdirective => Kind::Superdirective {
@@ -111,10 +130,6 @@ fn beam(
         .map(|&(_, az)| Beam::design(&mics, layout.rate, az, elevation, kind))
         .collect();
 
-    let mut raw = Vec::new();
-    std::fs::File::open(&input)
-        .and_then(|mut f| f.read_to_end(&mut raw))
-        .map_err(|e| format!("{}: {e}", input.display()))?;
     let step = layout.frame_bytes();
     let spec = hound::WavSpec {
         channels: 1,
@@ -213,9 +228,10 @@ fn main() -> ExitCode {
             kind,
             white_noise_gain,
             gain,
+            verbose,
             input,
             output,
-        } => beam(array, &steer, elevation, kind, white_noise_gain, gain, input, output),
+        } => beam(array, &steer, elevation, kind, white_noise_gain, gain, verbose, input, output),
         Command::Direction {
             array,
             every,

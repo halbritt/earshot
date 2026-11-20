@@ -64,9 +64,21 @@ impl Layout {
         self.channels * self.width as usize / 8
     }
 
+    /// The largest reference sample of an interleaved frame, as 0..1; 0 without a reference.
+    pub fn reference_peak(&self, frame: &[u8]) -> f32 {
+        self.reference
+            .iter()
+            .map(|&c| self.channel(frame, c).abs())
+            .fold(0.0, f32::max)
+    }
+
     /// One microphone's sample from an interleaved frame, as -1..1.
     pub fn sample(&self, frame: &[u8], mic: usize) -> f32 {
-        let at = self.mic[mic].channel * self.width as usize / 8;
+        self.channel(frame, self.mic[mic].channel)
+    }
+
+    fn channel(&self, frame: &[u8], channel: usize) -> f32 {
+        let at = channel * self.width as usize / 8;
         if self.width == 16 {
             i16::from_le_bytes([frame[at], frame[at + 1]]) as f32 / 32768.0
         } else {

@@ -2,7 +2,7 @@
 //! azimuth only.
 //!
 //! Every microphone's spectrum is reduced to its phase, so that loud low frequencies do not
-//! decide alone. For each candidate direction the phases are aligned and summed; the
+//! decide alone; frequencies with almost nothing in them are left out. For each candidate direction the phases are aligned and summed; the
 //! direction in which they agree best is where the sound came from.
 use crate::array::Array;
 use crate::stft::BINS;
@@ -58,9 +58,13 @@ impl Finder {
     pub fn add(&mut self, spectra: &[[Complex32; BINS]]) {
         debug_assert_eq!(spectra.len(), self.mics);
         let (bins, mics) = (self.high - self.low, self.mics);
+        // Bins with next to nothing in them (40 dB under the strongest) hold only what
+        // leaked from the others, with their phase and not their own: leave them out.
+        let power = |b: usize| spectra[0][self.low + b].norm_sqr();
+        let least = (0..bins).map(power).fold(0.0, f32::max) * 1e-4;
         for d in 0..self.directions {
             let mut sum = 0.0;
-            for b in 0..bins {
+            for b in (0..bins).filter(|&b| power(b) > least) {
                 let w = &self.align[(d * bins + b) * mics..(d * bins + b + 1) * mics];
                 let mut s = Complex32::new(0.0, 0.0);
                 for (w, x) in w.iter().zip(spectra) {

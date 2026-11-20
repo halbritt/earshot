@@ -184,3 +184,63 @@ fn direction_reports_where_a_tone_comes_from_twice_a_second() {
     }
     assert!(lines[0].starts_with("{\"t\": 0.50,"), "{}", lines[0]);
 }
+
+// half a second of silence, then a 1715 Hz tone along the axis, then the same tone from the
+// side; a fixed beam hears one of the two and cancels the other (see above)
+fn turning_recording() -> Vec<u8> {
+    let mut raw = vec![0u8; 8000 * 8];
+    raw.extend(tone_recording(2.0, 0.0, 1715.0));
+    raw.extend(tone_recording(2.0, 90.0, 1715.0));
+    raw
+}
+
+#[test]
+fn a_fixed_beam_loses_a_sound_that_moves_and_auto_follows_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, fixed, _) = run(dir.path(), &turning_recording(), &["--steer", "0", "--kind", "delay-sum"]);
+    assert!(rms(&fixed[12000..36000]) > 5000.0 && rms(&fixed[48000..70000]) < 400.0);
+    let (ok, auto, err) = run(
+        dir.path(),
+        &turning_recording(),
+        &["--steer", "auto", "--kind", "delay-sum", "--verbose"],
+    );
+    assert!(ok, "{err}");
+    assert!(
+        rms(&auto[12000..36000]) > 5000.0,
+        "the tone along the axis: {} ({err})",
+        rms(&auto[12000..36000])
+    );
+    assert!(
+        rms(&auto[48000..70000]) > 5000.0,
+        "the tone from the side: {} ({err})",
+        rms(&auto[48000..70000])
+    );
+    // it turned where the sound moved, at 2.5 s, not three measurements later
+    let turned: f64 = err
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((turned - 2.5).abs() <= 0.26, "{err}");
+}
+
+#[test]
+fn auto_does_not_turn_to_the_devices_own_speaker() {
+    // the same recording, but while the tone comes from the side the reference channel
+    // (channel 3) carries playback: that sound is the device's own
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = turning_recording();
+    for (i, frame) in raw.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        if i >= 8000 + 32000 {
+            frame[6..8].copy_from_slice(&((i % 200) as i16 * 100).to_le_bytes());
+        }
+    }
+    let (ok, auto, err) = run(dir.path(), &raw, &["--steer", "auto", "--kind", "delay-sum", "--verbose"]);
+    assert!(ok, "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(rms(&auto[48000..70000]) < 400.0, "{}", rms(&auto[48000..70000]));
+}
