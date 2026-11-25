@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import pytest
 from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 from coach.canonical_state import CanonicalState
 from coach.contracts import (
@@ -1572,3 +1573,184 @@ async def test_malformed_ws_json_and_startup_timeout_lease_set_no_transcript(
     with pytest.raises(PeeceeLeaseUnavailableError):
         await ad_75.connect()
     assert ad_75.health is HealthState.NO_TRANSCRIPT
+
+
+async def test_events_queue_task_does_not_steal_on_close_same_tick_and_drain() -> None:
+    class _StubWS:
+        def __init__(self, frames: list[Any]) -> None:
+            self._frames = list(frames)
+            self.recv_calls = 0
+            self.closed = False
+
+        async def send(self, _data: Any) -> None:
+            return None
+
+        async def recv(self) -> Any:
+            self.recv_calls += 1
+            nxt = self._frames.pop(0)
+            if isinstance(nxt, asyncio.Future):
+                return await nxt
+            if isinstance(nxt, BaseException):
+                raise nxt
+            return nxt
+
+        async def close(self) -> None:
+            self.closed = True
+
+    loop = asyncio.get_running_loop()
+
+    # 1. SAME_TICK: queue_task (E1) + recv_task (ConnectionClosed) finish together,
+    #    and concurrent E2 is enqueued while suspended at `yield E1`.
+    close_fut: asyncio.Future[Any] = loop.create_future()
+    ws1 = _StubWS([close_fut])
+    clock1 = ManualClock(100)
+    ad1 = PeeceeRealtimeAdapter(session_id="sess-same-tick", clock=clock1)
+    ad1._ws = ws1  # type: ignore[assignment]
+    await ad1.send_audio_pcm16(
+        b"\x01\x00" * 32, gate=EarshotGateSample(at_ms=100, speech_active=True)
+    )
+    collected1: list[CanonicalEvent] = []
+
+    async def _consume1() -> None:
+        async for ev in ad1.events():
+            collected1.append(ev)
+            if ev.kind is EventKind.BOUNDARY and ev.end_ms == 200:
+                await ad1.send_audio_pcm16(
+                    b"\x01\x00" * 32,
+                    gate=EarshotGateSample(at_ms=300, speech_active=True),
+                )
+                await ad1.send_audio_pcm16(
+                    b"", gate=EarshotGateSample(at_ms=400, speech_active=False)
+                )
+
+    t1 = asyncio.create_task(_consume1())
+    await asyncio.sleep(0)
+    # Trigger E1 and ConnectionClosed in the same tick
+    await ad1.send_audio_pcm16(b"", gate=EarshotGateSample(at_ms=200, speech_active=False))
+    close_fut.set_exception(ConnectionClosed(None, None))
+    await t1
+
+    bnds1 = [e for e in collected1 if e.kind is EventKind.BOUNDARY]
+    gaps1 = [
+        e for e in collected1 if e.kind is EventKind.CONTROL and e.subtype is ControlSubtype.GAP
+    ]
+    assert [b.end_ms for b in bnds1] == [200, 400]
+    assert len(gaps1) == 1 and gaps1[0].reason == "peecee_tunnel_lost"
+    assert ad1._pending_events.empty()
+
+    # 2. ConnectionClosed drain loop + health_callback: E1 queued before close,
+    #    E2 enqueued during `yield E1`, E3 enqueued during `_set_health`.
+    ad2: PeeceeRealtimeAdapter | None = None
+
+    def _on_health2(st: HealthState, _rsn: str, _det: Mapping[str, Any]) -> None:
+        if ad2 is not None and st is HealthState.NO_TRANSCRIPT:
+            for ev in ad2.segmenter.feed_gate(
+                EarshotGateSample(at_ms=500, speech_active=True), received_ms=500
+            ) + ad2.segmenter.feed_gate(
+                EarshotGateSample(at_ms=600, speech_active=False), received_ms=600
+            ):
+                ad2._pending_events.put_nowait(ev)
+
+    class _CloseDrainWS(_StubWS):
+        async def recv(self) -> Any:
+            self.recv_calls += 1
+            assert ad2 is not None
+            await ad2.send_audio_pcm16(b"", gate=EarshotGateSample(at_ms=200, speech_active=False))
+            raise ConnectionClosed(None, None)
+
+    ad2 = PeeceeRealtimeAdapter(session_id="sess-drain", health_callback=_on_health2)
+    ad2._ws = _CloseDrainWS([])  # type: ignore[assignment]
+    await ad2.send_audio_pcm16(
+        b"\x01\x00" * 32, gate=EarshotGateSample(at_ms=100, speech_active=True)
+    )
+    collected2: list[CanonicalEvent] = []
+    async for ev in ad2.events():
+        collected2.append(ev)
+        if ev.kind is EventKind.BOUNDARY and ev.end_ms == 200:
+            await ad2.send_audio_pcm16(
+                b"\x01\x00" * 32, gate=EarshotGateSample(at_ms=300, speech_active=True)
+            )
+            await ad2.send_audio_pcm16(b"", gate=EarshotGateSample(at_ms=400, speech_active=False))
+
+    bnds2 = [e for e in collected2 if e.kind is EventKind.BOUNDARY]
+    gaps2 = [
+        e for e in collected2 if e.kind is EventKind.CONTROL and e.subtype is ControlSubtype.GAP
+    ]
+    assert [b.end_ms for b in bnds2] == [200, 400, 600]
+    assert len(gaps2) == 1 and gaps2[0].reason == "peecee_tunnel_lost"
+    assert ad2._pending_events.empty()
+
+    # 3. JSONDecodeError drains _pending_events and does NOT schedule extra recv()
+    class _MalformedWS(_StubWS):
+        async def recv(self) -> Any:
+            self.recv_calls += 1
+            if self.recv_calls > 1:
+                raise AssertionError("recv() scheduled after malformed JSON")
+            assert ad3 is not None
+            await ad3.send_audio_pcm16(b"", gate=EarshotGateSample(at_ms=200, speech_active=False))
+            return "<html>502 Bad Gateway</html>"
+
+    ws3 = _MalformedWS([])
+    ad3 = PeeceeRealtimeAdapter(session_id="sess-bad-drain")
+    ad3._ws = ws3  # type: ignore[assignment]
+    await ad3.send_audio_pcm16(
+        b"\x01\x00" * 32, gate=EarshotGateSample(at_ms=100, speech_active=True)
+    )
+    collected3: list[CanonicalEvent] = []
+    async for ev in ad3.events():
+        collected3.append(ev)
+        if ev.kind is EventKind.BOUNDARY and ev.end_ms == 200:
+            await ad3.send_audio_pcm16(
+                b"\x01\x00" * 32, gate=EarshotGateSample(at_ms=300, speech_active=True)
+            )
+            await ad3.send_audio_pcm16(b"", gate=EarshotGateSample(at_ms=400, speech_active=False))
+
+    bnds3 = [e for e in collected3 if e.kind is EventKind.BOUNDARY]
+    gaps3 = [
+        e for e in collected3 if e.kind is EventKind.CONTROL and e.subtype is ControlSubtype.GAP
+    ]
+    assert [b.end_ms for b in bnds3] == [200, 400]
+    assert len(gaps3) == 1 and gaps3[0].reason == "peecee_malformed_message"
+    assert ad3.health is HealthState.NO_TRANSCRIPT
+    assert ws3.recv_calls == 1
+    assert ad3._pending_events.empty()
+
+
+async def test_send_audio_pcm16_truncates_odd_trailing_byte() -> None:
+    sent_frames: list[bytes] = []
+
+    class _RecordWS:
+        async def send(self, data: Any) -> None:
+            if isinstance(data, bytes):
+                sent_frames.append(data)
+
+        async def recv(self) -> Any:
+            raise ConnectionClosed(None, None)
+
+        async def close(self) -> None:
+            return None
+
+    adapter = PeeceeRealtimeAdapter(
+        session_id="sess-odd",
+        config=PeeceeConfig(auto_commit_silence_ms=None),
+    )
+    adapter._ws = _RecordWS()  # type: ignore[assignment]
+
+    odd_payload = (b"\x01\x02" * 3200) + b"\xff"  # 6401 bytes
+    sent1 = await adapter.send_audio_pcm16(odd_payload)
+    assert sent1 == 6400
+    assert [len(f) for f in sent_frames] == [5120, 1280]
+    assert all(len(f) % 2 == 0 for f in sent_frames)
+    assert b"".join(sent_frames) == odd_payload[:6400]
+    assert len(adapter._utterance_audio) == 6400
+    assert bytes(adapter._utterance_audio) == odd_payload[:6400]
+
+    sent2 = await adapter.send_audio_pcm16(b"\x03\x04\xee")
+    assert sent2 == 2
+    assert len(adapter._utterance_audio) == 6402
+    assert bytes(adapter._utterance_audio[-2:]) == b"\x03\x04"
+
+    # Single odd byte yields 0 sent and leaves alignment intact
+    sent3 = await adapter.send_audio_pcm16(b"\xaa")
+    assert sent3 == 0
+    assert len(adapter._utterance_audio) == 6402

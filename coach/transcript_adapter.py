@@ -1668,7 +1668,6 @@ class PeeceeRealtimeAdapter:
         self._had_speech_since_commit = False
         self._tel_counter = 0
         self._ctrl_counter = 0
-        self._last_seq_seen = 0
 
     @property
     def health(self) -> HealthState:
@@ -1736,7 +1735,6 @@ class PeeceeRealtimeAdapter:
         self._ctrl_counter += 1
         now_ms = self._clock.now_ms()
         seq = self._segmenter._next_sequence()
-        self._last_seq_seen = max(self._last_seq_seen, seq)
         return CanonicalEvent(
             schema_version=SCHEMA_VERSION,
             session_id=self._session_id,
@@ -1923,10 +1921,11 @@ class PeeceeRealtimeAdapter:
 
         frame_bytes = self._config.frame_bytes
         usable = len(pcm16_bytes) - (len(pcm16_bytes) % 2)
+        pcm16_even = pcm16_bytes[:usable]
         sent = 0
         idx = 0
         while idx < usable:
-            chunk = pcm16_bytes[idx : idx + frame_bytes]
+            chunk = pcm16_even[idx : idx + frame_bytes]
             await self._ws.send(chunk)
             sent += len(chunk)
             self._utterance_audio.extend(chunk)
@@ -2079,46 +2078,68 @@ class PeeceeRealtimeAdapter:
 
     async def events(self) -> AsyncIterator[CanonicalEvent]:
         """Yield CanonicalEvents from the WebSocket until clean close or tunnel loss."""
-        if self._ws is None:
+        ws = self._ws
+        if ws is None:
             raise AdapterError("WebSocket is not connected")
-        while not self._pending_events.empty():
-            queued = self._pending_events.get_nowait()
-            self._last_seq_seen = max(self._last_seq_seen, queued.source_sequence)
-            yield queued
 
-        recv_task: asyncio.Task[Any] | None = asyncio.create_task(self._ws.recv())
-        queue_task: asyncio.Task[CanonicalEvent] | None = asyncio.create_task(
-            self._pending_events.get()
-        )
+        recv_task: asyncio.Task[Any] | None = None
+        queue_task: asyncio.Task[CanonicalEvent] | None = None
         try:
             while True:
-                assert recv_task is not None and queue_task is not None
-                wait_set: set[asyncio.Task[Any]] = {recv_task, queue_task}
-                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                while not self._pending_events.empty():
+                    yield self._pending_events.get_nowait()
+
+                cur_ws = self._ws
+                if cur_ws is None or self._closed_cleanly:
+                    break
+
+                if recv_task is None:
+                    recv_task = asyncio.create_task(cur_ws.recv())
+                queue_task = asyncio.create_task(self._pending_events.get())
+                done, _ = await asyncio.wait(
+                    {recv_task, queue_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                q_item: CanonicalEvent | None = None
                 if queue_task in done:
-                    ev = queue_task.result()
-                    queue_task = asyncio.create_task(self._pending_events.get())
-                    self._last_seq_seen = max(self._last_seq_seen, ev.source_sequence)
-                    yield ev
+                    q_item = queue_task.result()
+                else:
+                    if not queue_task.done():
+                        queue_task.cancel()
+                    try:
+                        await queue_task
+                    except asyncio.CancelledError:
+                        cur = asyncio.current_task()
+                        if (cur is not None and cur.cancelling() > 0) or not queue_task.cancelled():
+                            raise
+                    if (
+                        queue_task.done()
+                        and not queue_task.cancelled()
+                        and queue_task.exception() is None
+                    ):
+                        q_item = queue_task.result()
+                queue_task = None
+
+                if q_item is not None:
+                    yield q_item
                     while not self._pending_events.empty():
-                        extra = self._pending_events.get_nowait()
-                        self._last_seq_seen = max(self._last_seq_seen, extra.source_sequence)
-                        yield extra
+                        yield self._pending_events.get_nowait()
+
                 if recv_task in done:
                     try:
                         raw_frame = recv_task.result()
                     except (ConnectionClosed, OSError) as exc:
                         recv_task = None
                         while not self._pending_events.empty():
-                            extra = self._pending_events.get_nowait()
-                            self._last_seq_seen = max(self._last_seq_seen, extra.source_sequence)
-                            yield extra
+                            yield self._pending_events.get_nowait()
                         if not self._closed_cleanly:
                             await self._set_health(
                                 HealthState.NO_TRANSCRIPT,
                                 "peecee_tunnel_lost",
                                 {"err": str(exc)},
                             )
+                            while not self._pending_events.empty():
+                                yield self._pending_events.get_nowait()
                             yield self._next_ctrl_event(
                                 ControlSubtype.GAP,
                                 reason="peecee_tunnel_lost",
@@ -2129,18 +2150,22 @@ class PeeceeRealtimeAdapter:
                                 ),
                             )
                         break
-                    recv_task = asyncio.create_task(self._ws.recv())
+                    recv_task = None
                     if isinstance(raw_frame, bytes):
                         continue
                     try:
                         msg = json.loads(raw_frame)
                     except json.JSONDecodeError as exc:
+                        while not self._pending_events.empty():
+                            yield self._pending_events.get_nowait()
                         if not self._closed_cleanly:
                             await self._set_health(
                                 HealthState.NO_TRANSCRIPT,
                                 "peecee_malformed_message",
                                 {"err": str(exc)},
                             )
+                            while not self._pending_events.empty():
+                                yield self._pending_events.get_nowait()
                             yield self._next_ctrl_event(
                                 ControlSubtype.GAP,
                                 reason="peecee_malformed_message",
@@ -2155,7 +2180,6 @@ class PeeceeRealtimeAdapter:
                         continue
                     rx_ms = self._clock.now_ms()
                     for ev in self.process_server_message(msg, rx_ms):
-                        self._last_seq_seen = max(self._last_seq_seen, ev.source_sequence)
                         yield ev
         finally:
             for task in (recv_task, queue_task):
