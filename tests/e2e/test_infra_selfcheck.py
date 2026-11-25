@@ -45,6 +45,8 @@ from tests.e2e.helpers.db_assertions import (
     assert_session_text_deleted,
     assert_six_conservation_invariants,
     assert_wal_mode,
+    fetch_normalized_rows,
+    open_db,
 )
 from tests.e2e.helpers.fixtures import (
     REASON_CODES,
@@ -867,11 +869,9 @@ def test_cli_runner_earshot_beam_and_direction(repo_root: Path, tmp_path: Path) 
         assert proc.pid is not None
         assert "READY" in proc.stdout_text
 
-    # Verify earshot direction & beam against arrays/respeaker-core-v2.toml if binary exists
-    try:
-        resolve_earshot_cmd(repo_root)
-    except FileNotFoundError:
-        pytest.skip("earshot binary not built in target/ or PATH")
+    # Verify earshot direction & beam against arrays/respeaker-core-v2.toml (fail fast if missing)
+    earshot_cmd = resolve_earshot_cmd(repo_root)
+    assert earshot_cmd
 
     array_toml = repo_root / "arrays" / "respeaker-core-v2.toml"
     raw_pcm = tmp_path / "array_8ch_32b.raw"
@@ -1544,3 +1544,193 @@ def test_e2_helper_extensions(tmp_path: Path) -> None:
         assert short_tok == "tok_short_1"
         with pytest.raises(RuntimeError, match="exited with code 0"):
             short_proc.wait_for_output("missing-after-exit", timeout=1.0)
+
+
+def _create_m1_e3_regression_db(db_path: Path) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                session_id TEXT, run_id TEXT, brief_json TEXT, health_timeline_json TEXT,
+                reducer_counters_json TEXT, revision_history_json TEXT
+            );
+            CREATE TABLE raw_events (session_id TEXT, run_id TEXT, payload_json TEXT);
+            CREATE TABLE events (
+                session_id TEXT, run_id TEXT, event_id TEXT, kind TEXT, segment_id TEXT,
+                source_revision INTEGER, canonical_revision INTEGER, speaker_id TEXT,
+                received_ms INTEGER, source_sequence INTEGER, stability TEXT,
+                text TEXT, payload_json TEXT
+            );
+            CREATE TABLE decisions (
+                session_id TEXT, run_id TEXT, candidate_id TEXT, origin TEXT,
+                anchor_refs_json TEXT, token_counts_json TEXT, omitted_json TEXT,
+                flags_json TEXT, raw_scores_json TEXT, calibrated_scores_json TEXT,
+                outcome TEXT, route TEXT, reason_codes_json TEXT,
+                terminal_state TEXT, terminal_reason TEXT
+            );
+            CREATE TABLE suggestions (
+                session_id TEXT, run_id TEXT, suggestion_id TEXT, candidate_id TEXT,
+                route TEXT, current_state TEXT, terminal_reason TEXT, transitions_json TEXT,
+                evidence_refs_json TEXT, invalidate_on_json TEXT, text TEXT,
+                grounded_slots TEXT
+            );
+            CREATE TABLE feedback (session_id TEXT, run_id TEXT, label_json TEXT);
+            CREATE TABLE model_cache (
+                serialized_sha256 TEXT, model_version TEXT, output_json TEXT
+            );
+            CREATE TABLE egress_log (
+                egress_id TEXT, session_id TEXT, run_id TEXT, candidate_id TEXT,
+                lane TEXT, provider TEXT, model_id TEXT, segment_ids_json TEXT,
+                sent_at_ms INTEGER, usage_json TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                json.dumps({"objective": "Confirm rollback owner"}),
+                json.dumps([{"at_ms": 0, "state": "ok"}]),
+                json.dumps({"duplicate": 2}),
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "ev-seg-1",
+                "segment",
+                "seg-1",
+                1,
+                1,
+                "S1",
+                1000,
+                1,
+                "committed",
+                "Someone should own it.",
+                json.dumps({"overlap": True, "segment_id": "seg-1"}),
+            ),
+        )
+        dec_sql = "INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        conn.execute(
+            dec_sql,
+            (
+                "s1",
+                "r1",
+                "cand-1",
+                "proactive",
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+                json.dumps({"total": 128, "limit": 512}),
+                json.dumps({"turns": 1}),
+                json.dumps({"overlap": True}),
+                json.dumps({"opportunity": 0.9}),
+                json.dumps({"opportunity": 0.88}),
+                "ROUTE",
+                "template",
+                json.dumps(["above_t_display"]),
+                "routed",
+                None,
+            ),
+        )
+        conn.execute(
+            dec_sql,
+            (
+                "s1",
+                "r1",
+                "cand-manual",
+                "manual",
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+                json.dumps({"total": 64, "limit": 512}),
+                json.dumps({"turns": 0}),
+                json.dumps({"overlap": False}),
+                json.dumps({"opportunity": 0.2}),
+                json.dumps({"opportunity": 0.2}),
+                "NONE",
+                "none",
+                json.dumps(["below_t_low"]),
+                "NONE",
+                "below_t_low",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO suggestions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "sug-1",
+                "cand-1",
+                "template",
+                "dismissed",
+                "user_action",
+                json.dumps(
+                    [
+                        {"event_id": "l1", "transition": "displayed", "at_ms": 2000},
+                        {"event_id": "l2", "transition": "dismissed", "at_ms": 3000},
+                    ]
+                ),
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+                json.dumps(["seg-1"]),
+                "Who owns the rollback plan?",
+                None,
+            ),
+        )
+        conn.commit()
+
+
+def test_db_assertions_e3_regression_checks(tmp_path: Path) -> None:
+    db_path = tmp_path / "m1_e3_regression.db"
+    _create_m1_e3_regression_db(db_path)
+
+    with open_db(db_path, readonly=True) as conn:
+        sess_rows = fetch_normalized_rows(conn, "sessions", "s1", run_id="r1")
+        ev_rows = fetch_normalized_rows(conn, "events", "s1", run_id="r1")
+        dec_rows = fetch_normalized_rows(conn, "decisions", "s1", run_id="r1")
+        sug_rows = fetch_normalized_rows(conn, "suggestions", "s1", run_id="r1")
+
+    assert len(sess_rows) == 1
+    assert sess_rows[0]["brief"]["objective"] == "Confirm rollback owner"
+    assert isinstance(sess_rows[0]["health_timeline"], list)
+    assert isinstance(sess_rows[0]["revision_history"], list)
+    assert sess_rows[0]["reducer_counters"]["duplicate"] == 2
+    assert isinstance(sess_rows[0]["reducer_counters_json"], str)
+    assert json.loads(str(sess_rows[0]["reducer_counters_json"]))["duplicate"] == 2
+
+    assert len(ev_rows) == 1
+    assert ev_rows[0]["overlap"] is True
+    assert ev_rows[0]["payload"]["overlap"] is True
+
+    by_cid = {row["candidate_id"]: row for row in dec_rows}
+    assert by_cid["cand-1"]["flags"]["overlap"] is True
+    assert by_cid["cand-1"]["omitted"]["turns"] == 1
+    assert by_cid["cand-1"]["token_counts"]["total"] == 128
+
+    assert len(sug_rows) == 1
+    assert isinstance(sug_rows[0]["evidence_refs_json"], list)
+    assert isinstance(sug_rows[0]["invalidate_on"], list)
+
+    # Inv 1: 1 proactive + 1 manual decision citing seg-1 passes
+    summary = assert_six_conservation_invariants(db_path, "s1", run_id="r1")
+    assert summary["candidates"] == 2
+
+    # Inv 1: manual-only without proactive fails
+    manual_only_db = tmp_path / "manual_only.db"
+    _create_m1_e3_regression_db(manual_only_db)
+    with sqlite3.connect(str(manual_only_db)) as conn:
+        conn.execute("DELETE FROM suggestions WHERE candidate_id = 'cand-1'")
+        conn.execute("DELETE FROM decisions WHERE candidate_id = 'cand-1'")
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 1"):
+        assert_six_conservation_invariants(manual_only_db, "s1", run_id="r1")
+
+    # Inv 1: two proactive decisions citing seg-1 fails
+    two_proactive_db = tmp_path / "two_proactive.db"
+    _create_m1_e3_regression_db(two_proactive_db)
+    with sqlite3.connect(str(two_proactive_db)) as conn:
+        conn.execute("UPDATE decisions SET origin = 'proactive' WHERE candidate_id = 'cand-manual'")
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 1"):
+        assert_six_conservation_invariants(two_proactive_db, "s1", run_id="r1")

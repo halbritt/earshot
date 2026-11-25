@@ -18,6 +18,13 @@ _JSON_COLUMNS: frozenset[str] = frozenset(
         "data_json",
         "data",
         "metadata_json",
+        "brief_json",
+        "health_timeline_json",
+        "reducer_counters_json",
+        "revision_history_json",
+        "token_counts_json",
+        "omitted_json",
+        "flags_json",
         "raw_scores_json",
         "calibrated_scores_json",
         "evidence_refs_json",
@@ -31,11 +38,13 @@ _JSON_COLUMNS: frozenset[str] = frozenset(
         "usage_json",
         "grounded_slots_json",
         "grounded_slots",
+        "invalidate_on_json",
         "transitions_json",
         "label_json",
         "output_json",
     }
 )
+_RAW_JSON_STRING_COLUMNS: frozenset[str] = frozenset({"reducer_counters_json"})
 
 _CLOSING_TRANSITIONS: frozenset[str] = frozenset(
     {"used", "dismissed", "resolved", "withdrawn", "expired", "outdated"}
@@ -128,10 +137,13 @@ def _unpack_row(row: sqlite3.Row) -> dict[str, Any]:
             } and isinstance(parsed, dict):
                 for k, v in parsed.items():
                     merged.setdefault(k, v)
-            else:
                 base_name = col[:-5] if col.endswith("_json") else col
                 merged[base_name] = parsed
                 merged[col] = parsed
+            else:
+                base_name = col[:-5] if col.endswith("_json") else col
+                merged[base_name] = parsed
+                merged[col] = val if col in _RAW_JSON_STRING_COLUMNS else parsed
         else:
             merged[col] = val
     for k, v in raw_dict.items():
@@ -466,6 +478,7 @@ def assert_six_conservation_invariants(
         if not isinstance(cid, str) or not cid.strip():
             raise AssertionError(f"Inv 1 violated: decision row missing candidate_id: {dec}")
         by_candidate.setdefault(cid, []).append(dec)
+        origin = str(dec.get("origin") or "proactive")
         seen_in_row: set[str] = set()
         for seg_id, _rev in _iter_ref_pairs(dec.get("anchor_refs")):
             if seg_id in seen_in_row:
@@ -473,7 +486,8 @@ def assert_six_conservation_invariants(
                     f"Inv 1 violated: segment {seg_id} repeated in anchor_refs for {cid}"
                 )
             seen_in_row.add(seg_id)
-            anchor_cids_by_seg.setdefault(seg_id, set()).add(cid)
+            if origin != "manual":
+                anchor_cids_by_seg.setdefault(seg_id, set()).add(cid)
 
     # Inv 1: Every committed non-recipient segment in exactly 1 anchor; every candidate in 1 part.
     for seg_id in sorted(non_recip_segments):

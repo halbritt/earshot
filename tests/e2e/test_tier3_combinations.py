@@ -97,6 +97,8 @@ def _make_words(
     start_s: float,
     speaker: int,
     confidence: float = 1.0,
+    step_s: float = 0.20,
+    word_dur_s: float = 0.16,
 ) -> list[MockWord]:
     tokens = text.split()
     words: list[MockWord] = []
@@ -106,12 +108,12 @@ def _make_words(
             MockWord(
                 tok,
                 round(cursor, 3),
-                round(cursor + 0.16, 3),
+                round(cursor + word_dur_s, 3),
                 confidence=confidence,
                 speaker=speaker,
             )
         )
-        cursor += 0.20
+        cursor += step_s
     return words
 
 
@@ -1146,12 +1148,14 @@ def test_t3_08_earshot_direction_sortformer_binder_abstentions_and_report_delay(
                 ),
                 ScriptedTurn(
                     trigger_after_frames=8,
-                    transcript="Wait should we check",
+                    transcript="Confirm rollback owner checklist today",
                     words=_make_words(
-                        "Wait should we check",
+                        "Confirm rollback owner checklist today",
                         start_s=2.0,
                         speaker=3,
                         confidence=0.95,
+                        step_s=0.12,
+                        word_dur_s=0.10,
                     ),
                 ),
                 ScriptedTurn(
@@ -1195,10 +1199,13 @@ def test_t3_08_earshot_direction_sortformer_binder_abstentions_and_report_delay(
             async with ui.ws_session() as ws:
                 await ws.wait_for_card(timeout=5.0)
                 deadline = asyncio.get_running_loop().time() + 8.0
-                while len(mock_nemo_ws.received_frames) < 18:
+                while len(mock_nemo_ws.received_frames) < 20 or not any(
+                    e.get("type") == "input_audio_buffer.commit"
+                    for e in mock_nemo_ws.received_events
+                ):
                     assert asyncio.get_running_loop().time() < deadline
                     await asyncio.sleep(0.05)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.6)
 
         asyncio.run(_observe())
 
@@ -1470,6 +1477,7 @@ def test_t3_10_local_only_template_only_zero_egress_and_manual_local_model(
                     "t_compute": 0.45,
                     "t_display": 0.70,
                     "route": "generator",
+                    "template": "clarify_scope_v1",
                     "required_lookback_s": 120,
                 },
                 "CONFIRM_OWNER": {
@@ -1480,8 +1488,21 @@ def test_t3_10_local_only_template_only_zero_egress_and_manual_local_model(
                     "template": "confirm_owner_v1",
                     "required_lookback_s": 300,
                 },
+                "CONFIRM_TIME": {
+                    "t_low": 0.20,
+                    "t_compute": 0.50,
+                    "t_display": 0.75,
+                    "route": "template",
+                    "template": "confirm_time_v1",
+                    "required_lookback_s": 300,
+                },
             },
-            "display": {"settle_ms": 100, "cooldown_ms": 100, "max_cards_per_10_min": 6},
+            "display": {
+                "settle_ms": 100,
+                "cooldown_ms": 5000,
+                "max_cards_per_10_min": 6,
+                "max_candidate_age_ms": 8000,
+            },
             "manual": {"lookback_s": 30, "score_floor": 0.30, "budget_ms": 2000},
         },
     )
@@ -1490,7 +1511,7 @@ def test_t3_10_local_only_template_only_zero_egress_and_manual_local_model(
             session_id=sid,
             event_id="ev-t310-1",
             segment_id="seg-t310-1",
-            text="We should clarify the migration scope boundary today.",
+            text="We propose rolling out canary routing except for legacy tenants.",
             speaker_id="participant-b",
             start_ms=100,
             end_ms=400,
@@ -1512,12 +1533,23 @@ def test_t3_10_local_only_template_only_zero_egress_and_manual_local_model(
             session_id=sid,
             event_id="ev-t310-3",
             segment_id="seg-t310-3",
+            text="We need a deadline to finish the staging cutover soon.",
+            speaker_id="participant-c",
+            start_ms=1300,
+            end_ms=1600,
+            received_ms=1650,
+            source_sequence=3,
+        ),
+        build_segment_event(
+            session_id=sid,
+            event_id="ev-t310-4",
+            segment_id="seg-t310-4",
             text="The chassis fans spin quietly at idle.",
             speaker_id="participant-b",
             start_ms=1900,
             end_ms=2300,
             received_ms=2350,
-            source_sequence=3,
+            source_sequence=4,
         ),
     ]
     sess_jsonl = write_events_jsonl(e2e_workspace["sessions_dir"] / "t310.jsonl", events)

@@ -114,6 +114,17 @@ def _make_words(text: str, *, start_s: float, speaker: int) -> list[MockWord]:
     return words
 
 
+def _json_field(row: Mapping[str, Any], name: str) -> Any:
+    """Read an unpacked JSON field or parse its `<name>_json` fallback defensively."""
+    val = row.get(name)
+    if val is not None:
+        return val
+    raw = row.get(f"{name}_json")
+    if isinstance(raw, str) and raw.strip():
+        return json.loads(raw)
+    return raw
+
+
 def _reason_set(row: Mapping[str, Any]) -> set[str]:
     out: set[str] = set()
     for key in ("terminal_reason", "reason_code", "reason", "cause"):
@@ -121,10 +132,10 @@ def _reason_set(row: Mapping[str, Any]) -> set[str]:
         if isinstance(val, str) and val:
             out.add(val)
     for key in ("reason_codes", "abstain_reasons"):
-        vals = row.get(key)
+        vals = _json_field(row, key)
         if isinstance(vals, list):
             out.update(str(v) for v in vals if v)
-    transitions = row.get("transitions")
+    transitions = _json_field(row, "transitions")
     if isinstance(transitions, list):
         for tr in transitions:
             if isinstance(tr, dict):
@@ -375,7 +386,7 @@ def test_scenario_2_incident_postmortem_cutover(
             delay_s=0.05,
         )
     )
-    ov2_text = "Let us verify the replica lag metrics after cutover."
+    ov2_text = "The primary database replica lag stayed below five milliseconds."
     ov1_text = "Someone should own the hotfix rollback."
     events_stream: list[dict[str, Any]] = [
         build_segment_event(
@@ -508,7 +519,11 @@ def test_scenario_2_incident_postmortem_cutover(
     )
     assert any(e.get("kind") == "brief_update" for e in events)
     assert any(
-        bool((r.get("flags") or {}).get("overlap") or (r.get("payload") or {}).get("overlap"))
+        bool(
+            r.get("overlap")
+            or (_json_field(r, "flags") or {}).get("overlap")
+            or (_json_field(r, "payload") or {}).get("overlap")
+        )
         for r in [*segs, *decisions]
     )
 
@@ -654,6 +669,7 @@ def test_scenario_3_noisy_room_earshot_outage_recovery(
         e2e_workspace["policy_path"],
         generator_enabled=True,
         overrides={
+            "classifier": {"max_candidates_per_job": 1},
             "categories": {
                 "CLARIFY_SCOPE": {
                     "t_low": 0.20,
@@ -671,10 +687,10 @@ def test_scenario_3_noisy_room_earshot_outage_recovery(
         },
     )
     mock_openai.clear_requests()
-    mock_openai.enqueue(
+    mock_openai.set_default(
         MockCompletionSpec.valid_question(
             "What noisy room scope boundary needs clarification?",
-            ["segment-0001"],
+            ["segment-0001", "segment-0002", "segment-0003"],
             delay_s=1.5,
         )
     )
@@ -687,10 +703,25 @@ def test_scenario_3_noisy_room_earshot_outage_recovery(
                     words=_make_words(
                         "We should clarify the noisy room scope", start_s=0.1, speaker=2
                     ),
-                )
+                ),
+                ScriptedTurn(
+                    trigger_after_frames=3,
+                    transcript="We should clarify the backup failover scope",
+                    words=_make_words(
+                        "We should clarify the backup failover scope", start_s=1.8, speaker=2
+                    ),
+                ),
+                ScriptedTurn(
+                    trigger_after_frames=4,
+                    transcript="We should clarify the canary threshold scope",
+                    words=_make_words(
+                        "We should clarify the canary threshold scope", start_s=3.5, speaker=2
+                    ),
+                ),
             ]
         )
     )
+    part_c_dir_rows = [{**row, "azimuth": 90.0, "contrast": 8.5} for row in dir_rows]
     port_out = free_port_factory()
     env_out = build_coach_test_env(
         openai_base_url=mock_openai.base_url,
@@ -698,7 +729,7 @@ def test_scenario_3_noisy_room_earshot_outage_recovery(
         peecee_bin=mock_peecee_bin,
         extra_env={
             "COACH_SEAT_AZIMUTHS": json.dumps({"me": 0.0, "S1": 90.0}),
-            "COACH_EARSHOT_DIRECTION_JSON": json.dumps(dir_rows),
+            "COACH_EARSHOT_DIRECTION_JSON": json.dumps(part_c_dir_rows),
         },
     )
     with _start_serve(
@@ -715,7 +746,7 @@ def test_scenario_3_noisy_room_earshot_outage_recovery(
             async with ui_out.ws_session() as ws:
                 await ws.wait_for_health("ok", timeout=5.0)
                 deadline = asyncio.get_running_loop().time() + 6.0
-                while not mock_openai.requests:
+                while not mock_openai.requests or len(mock_nemo_ws.received_frames) < 4:
                     assert asyncio.get_running_loop().time() < deadline
                     await asyncio.sleep(0.05)
                 mock_nemo_ws.drop_active_clients(abrupt=True)
@@ -961,7 +992,8 @@ def test_scenario_4_prompt_injection_adversarial_meeting(
         sessions = fetch_normalized_rows(conn, "sessions", sid)
         decisions = fetch_normalized_rows(conn, "decisions", sid)
         suggestions = fetch_normalized_rows(conn, "suggestions", sid)
-    assert sessions and sessions[0]["brief"]["objective"] == brief["objective"]
+    brief_row = _json_field(sessions[0], "brief") if sessions else None
+    assert isinstance(brief_row, dict) and brief_row["objective"] == brief["objective"]
     assert mock_openai.requests
     assert any(
         any(
@@ -1123,7 +1155,12 @@ def test_scenario_5_annotation_train_calibrate_replay_diff_report(
         assert c_p2.unlock_step2(cand_id).get("continuation_events")
         c_p2.assert_step1_locked(
             cand_id,
-            {"worthwhile": False, "categories": ["CONFIRM_TIME"], "none_reason": "no_gap"},
+            {
+                "worthwhile": False,
+                "categories": ["CONFIRM_TIME"],
+                "example_questions": [],
+                "none_reason": "no_gap",
+            },
         )
         c_p2.submit_step2(cand_id, close_ms=14000, closed_by="answered", ideal_ms=4800)
     p2_rows = read_jsonl(pass2_out)
