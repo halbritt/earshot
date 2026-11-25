@@ -52,12 +52,14 @@ from coach.transcript_adapter import (
     AsrWord,
     BinderConfig,
     DeepgramNormalizer,
+    DirectionSample,
     EarshotGateSample,
     ManualClock,
     NemotronSegmenter,
     NumpySpectralVerifier,
     PeeceeConfig,
     PeeceeLeaseUnavailableError,
+    PeeceeProcessError,
     PeeceeProtocolError,
     PeeceeRealtimeAdapter,
     PeeceeSpeechProcess,
@@ -1051,3 +1053,522 @@ def test_adapter_events_satisfy_canonical_state_invalidation_and_conservation_in
     assert p50 is not None and p50 >= 250.0
     assert s2_audio != s1_audio
     store.close()
+
+
+def test_off_record_suppresses_raw_events_preserves_commit_bookkeeping_and_sets_gap_bounds(
+    tmp_path: Path,
+) -> None:
+    brief = _make_brief("sess-otr")
+    store = SQLiteStore(tmp_path / "otr.db")
+    store.upsert_session(brief=brief, run_id="run-otr", started_ms=0)
+    clock = ManualClock(500)
+    adapter = PeeceeRealtimeAdapter(
+        session_id="sess-otr",
+        clock=clock,
+        raw_sink=_StoreRawAdapter(store, "run-otr", brief.retention),
+    )
+    # Pre-off-record partial + delta arrives
+    pre = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.delta",
+            "delta": "partial secret",
+            "audio_processed": 0.4,
+        },
+        received_ms=600,
+    )
+    assert len(pre) == 1
+    assert len(store.get_raw_events("sess-otr", "run-otr")) == 1
+
+    clock.advance(500)
+    start_ctrls = adapter.set_off_record(True)
+    assert len(start_ctrls) == 1
+    assert start_ctrls[0].subtype is ControlSubtype.OFF_RECORD_START
+    assert adapter.segmenter._partial_buffer == ""
+    assert adapter.segmenter._active_interim_seg_id is None
+
+    # Off-the-record server payloads must NOT hit raw_events or emit canonical events
+    assert (
+        adapter.process_server_message(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "secret_off_record_text",
+                "audio_processed": 0.9,
+                "words": [
+                    {"word": "secret_off_record_text", "start": 0.2, "end": 0.9, "speaker": 1}
+                ],
+            },
+            received_ms=1100,
+        )
+        == []
+    )
+    # In-flight commit still advances commit_base_ms and diarizer epoch silently
+    assert (
+        adapter.process_server_message({"type": "input_audio_buffer.committed"}, received_ms=1150)
+        == []
+    )
+    assert adapter.commit_base_ms >= 900
+    assert adapter.segmenter.binder.epoch == 1
+    raw_rows = store.get_raw_events("sess-otr", "run-otr")
+    assert len(raw_rows) == 1
+
+    clock.advance(1000)
+    end_ctrls = adapter.set_off_record(False)
+    assert len(end_ctrls) == 1
+    assert end_ctrls[0].subtype is ControlSubtype.OFF_RECORD_END
+    assert end_ctrls[0].start_ms == 1000
+    assert end_ctrls[0].end_ms == 2000
+    store.close()
+
+
+async def test_async_commit_pipelining_and_max_uncommitted_no_spam() -> None:
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.sent: list[bytes | str] = []
+
+        async def send(self, data: bytes | str) -> None:
+            self.sent.append(data)
+
+    clock = ManualClock(0)
+    adapter = PeeceeRealtimeAdapter(session_id="sess-pipe", clock=clock)
+    adapter._ws = _FakeWS()  # type: ignore[assignment]
+
+    utt1_pcm = _make_harmonic_pcm16(130.0, 160)
+    utt2_pcm = _make_harmonic_pcm16(260.0, 160)
+    for _ in range(4):
+        clock.advance(160)
+        await adapter.send_audio_pcm16(utt1_pcm)
+    await adapter.commit_audio()
+
+    # Send 3 frames of Utt 2 BEFORE Utt 1's input_audio_buffer.committed arrives
+    for _ in range(3):
+        clock.advance(160)
+        await adapter.send_audio_pcm16(utt2_pcm)
+
+    adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "audio_processed": 0.64,
+            "words": [{"word": "utt1", "start": 0.1, "end": 0.5, "speaker": 1}],
+        },
+        received_ms=700,
+    )
+    adapter.process_server_message({"type": "input_audio_buffer.committed"}, received_ms=720)
+    assert adapter.commit_base_ms == 640
+    assert len(adapter._utterance_audio) == 3 * 5120
+    assert adapter._slice_utterance_audio(740, 1040) == (utt2_pcm * 3)[3200:12800]
+
+    # Mode B max_uncommitted_audio_ms must fire once per window, not per frame
+    async with MockNeMoSpeechServer(eou_mode=True) as srv:
+        ad2 = PeeceeRealtimeAdapter(
+            session_id="sess-nospam",
+            config=PeeceeConfig(
+                ws_url=srv.url,
+                auto_commit_silence_ms=None,
+                max_uncommitted_audio_ms=480,
+            ),
+        )
+        await ad2.connect()
+        for _ in range(8):
+            await ad2.send_audio_pcm16(utt1_pcm)
+        await asyncio.sleep(0.03)
+        await ad2.close()
+    assert srv.commit_count == 2
+
+
+async def test_cross_commit_monotonic_timestamps_and_upstream_delay_origin() -> None:
+    telemetry = BoundedRecorderBuffer(maxsize=32)
+    clock = ManualClock(0)
+    adapter = PeeceeRealtimeAdapter(
+        session_id="sess-mono",
+        clock=clock,
+        telemetry_sink=telemetry,
+    )
+    # Simulate 15s slow startup before first audio frame + 5s pause
+    clock.advance(15_000)
+
+    class _NoopWS:
+        async def send(self, _data: bytes | str) -> None:
+            return None
+
+    adapter._ws = _NoopWS()  # type: ignore[assignment]
+    frame = _make_harmonic_pcm16(140.0, 160)
+    for _ in range(5):
+        clock.advance(160)
+        await adapter.send_audio_pcm16(frame)
+    await adapter.pause()
+    clock.advance(5_000)
+    await adapter.resume()
+    for _ in range(5):
+        clock.advance(160)
+        await adapter.send_audio_pcm16(frame)
+
+    evs0 = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "audio_processed": 1.0,
+            "words": [{"word": "first", "start": 0.8, "end": 1.4, "speaker": 1}],
+        },
+        received_ms=clock.now_ms(),
+    )
+    adapter.process_server_message(
+        {"type": "input_audio_buffer.committed"}, received_ms=clock.now_ms()
+    )
+    evs1 = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "audio_processed": 0.5,
+            "words": [{"word": "second", "start": 0.1, "end": 0.4, "speaker": 2}],
+        },
+        received_ms=clock.now_ms() + 100,
+    )
+    seg0 = next(e for e in evs0 if e.kind is EventKind.SEGMENT)
+    seg1 = next(e for e in evs1 if e.kind is EventKind.SEGMENT)
+    assert seg0.end_ms == 1400
+    assert seg1.start_ms is not None and seg1.start_ms >= seg0.end_ms
+
+    delays = [r for r in telemetry.drain() if r.kind == "upstream_delay"]
+    assert len(delays) == 2
+    assert delays[0].payload["lag_ms"] < 1000
+    assert delays[0].payload["raw_lag_ms"] > 15_000
+
+
+async def test_realtime_ws_send_audio_emits_gate_close_boundary_immediately() -> None:
+    clock = ManualClock(0)
+    async with MockNeMoSpeechServer(utterances=[], eou_mode=True) as srv:
+        adapter = PeeceeRealtimeAdapter(
+            session_id="sess-gate",
+            config=PeeceeConfig(ws_url=srv.url, auto_commit_silence_ms=None),
+            clock=clock,
+        )
+        await adapter.connect()
+        emitted: list[CanonicalEvent] = []
+
+        async def _consume() -> None:
+            async for ev in adapter.events():
+                emitted.append(ev)
+
+        consumer = asyncio.create_task(_consume())
+        clock.advance(160)
+        await adapter.send_audio_pcm16(
+            b"\x01\x00" * 2560,
+            gate=EarshotGateSample(at_ms=clock.now_ms(), speech_active=True),
+        )
+        clock.advance(160)
+        await adapter.send_audio_pcm16(
+            b"\x00" * 5120,
+            gate=EarshotGateSample(at_ms=clock.now_ms(), speech_active=False),
+        )
+        for _ in range(25):
+            if any(e.kind is EventKind.BOUNDARY and e.boundary == "gate_close" for e in emitted):
+                break
+            await asyncio.sleep(0.01)
+        assert any(e.kind is EventKind.BOUNDARY and e.boundary == "gate_close" for e in emitted)
+        await adapter.close()
+        await consumer
+
+
+def test_cross_epoch_anon_label_isolation_shared_trackers_uncertain_and_spectral_contrast() -> None:
+    # 1. Cross-epoch anonymous speaker label isolation (Challenger #1)
+    voice_a = _make_harmonic_pcm16(125.0, 1400, tilt=0.75)
+    voice_b = _make_harmonic_pcm16(245.0, 1400, tilt=0.45)
+    voice_c = _make_harmonic_pcm16(480.0, 1400, tilt=0.35)
+    verifier = NumpySpectralVerifier()
+    binder = RecipientBinder(
+        session_id="sess-ep",
+        config=BinderConfig(min_confident_duration_ms=1000, auto_enroll_unknown=True),
+        verifier=verifier,
+    )
+    b0_a = binder.bind_segment("s0a", "1", 0, 1400, audio_pcm16=voice_a)
+    b0_b = binder.bind_segment("s0b", "2", 1500, 2900, audio_pcm16=voice_b)
+    assert (b0_a.speaker_id, b0_b.speaker_id) == ("S1", "S2")
+
+    binder.reset_diarizer_epoch()
+    b1_b = binder.bind_segment("s1b", "1", 3000, 4400, audio_pcm16=voice_b)
+    b1_c = binder.bind_segment("s1c", "2", 4500, 5900, audio_pcm16=voice_c)
+    assert b1_b.speaker_id == "S2"
+    assert b1_c.speaker_id == "S3"
+
+    # 2. Single-speaker NumpySpectralVerifier avoids false-confident 0.85+ on unrelated tones (Challenger #10)
+    single_v = NumpySpectralVerifier()
+    single_v.enroll("ME", _make_harmonic_pcm16(120.0, 1400))
+    scores = single_v.score(_make_harmonic_pcm16(240.0, 1400))
+    assert scores["ME"] < 0.65
+
+    # 3. Explicit binder shares sequence/revision trackers + emits SPEAKER_UPDATE on speaker_uncertain True -> False
+    ext_binder = RecipientBinder(
+        session_id="sess-share",
+        config=BinderConfig(recipient_azimuth_deg=0.0, min_confident_duration_ms=1000),
+    )
+    ext_binder.feed_direction(
+        DirectionSample(t_ms=300, azimuth_deg=0.0, contrast=4.0, level_db=-20.0)
+    )
+    ext_binder.feed_direction(
+        DirectionSample(t_ms=1800, azimuth_deg=0.0, contrast=4.0, level_db=-20.0)
+    )
+    seg = NemotronSegmenter(session_id="sess-share", binder=ext_binder)
+    evs1 = seg.feed_words([AsrWord("hi", 200, 500, "1")], received_ms=600, flush_end=True)
+    seg_ev1 = next(e for e in evs1 if e.kind is EventKind.SEGMENT)
+    assert seg_ev1.speaker_id == "ME" and seg_ev1.speaker_uncertain is True
+
+    evs2 = seg.feed_words(
+        [AsrWord("confirming", 1500, 2800, "1")], received_ms=2900, flush_end=True
+    )
+    upd = next(e for e in evs2 if e.kind is EventKind.SPEAKER_UPDATE)
+    assert upd.segment_id == seg_ev1.segment_id
+    assert upd.speaker_id == "ME"
+    assert upd.speaker_uncertain is False
+    assert upd.source_revision == 2
+    seqs = [e.source_sequence for e in (*evs1, *evs2)]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+
+async def test_nemotron_split_across_unlabeled_word_idempotent_delta_and_bounded_interim() -> None:
+    # 1. MockNeMoSpeechServer(omit_speaker_on_short_word=True) splits speaker 1 -> None -> speaker 2
+    utt = MockUtteranceScript(
+        deltas=["Alice uh Bob"],
+        words=[
+            {"word": "Alice", "start": 0.10, "end": 1.15, "confidence": 1.0, "speaker": 1},
+            {"word": "uh", "start": 1.17, "end": 1.25, "confidence": 1.0, "speaker": 1},
+            {"word": "Bob", "start": 1.27, "end": 2.40, "confidence": 1.0, "speaker": 2},
+        ],
+    )
+    async with MockNeMoSpeechServer(utterances=[utt], omit_speaker_on_short_word=True) as srv:
+        adapter = PeeceeRealtimeAdapter(
+            session_id="sess-split", config=PeeceeConfig(ws_url=srv.url)
+        )
+        await adapter.connect()
+        collected: list[CanonicalEvent] = []
+
+        async def _consume() -> None:
+            async for ev in adapter.events():
+                collected.append(ev)
+
+        task = asyncio.create_task(_consume())
+        await adapter.send_audio_pcm16(b"\x01\x00" * 2560)
+        await adapter.commit_audio()
+        await asyncio.sleep(0.05)
+        await adapter.close()
+        await task
+
+    segs = [
+        e for e in collected if e.kind is EventKind.SEGMENT and e.stability is Stability.COMMITTED
+    ]
+    assert [(s.text, s.speaker_id) for s in segs] == [("Alice uh", "S1"), ("Bob", "S2")]
+
+    # 2. Repeated identical cumulative delta is idempotent & interim buffer stays O(channels)
+    seg = NemotronSegmenter(session_id="sess-int")
+    state = CanonicalState(_make_brief("sess-int"))
+    d1 = seg.feed_partial("hel", audio_processed_ms=200, received_ms=250)
+    d2 = seg.feed_partial("hel", audio_processed_ms=250, received_ms=300)
+    assert len(d1) == 1 and d1[0].text == "hel"
+    assert d2 == []
+    for ev in d1:
+        assert state.apply(ev).accepted
+
+    for idx in range(5):
+        t0 = idx * 2000 + 100
+        for ev in [
+            *seg.feed_partial(f"word{idx}", audio_processed_ms=t0, received_ms=t0 + 20),
+            *seg.feed_words(
+                [AsrWord(f"word{idx}", t0, t0 + 1200, speaker="1")],
+                received_ms=t0 + 1250,
+                flush_end=True,
+            ),
+        ]:
+            assert state.apply(ev).accepted
+    assert len(state.snapshot().interim_segments) <= 1
+
+
+def test_replay_from_raw_messages_offline_speaker_update_rx_and_deepgram_edge_cases() -> None:
+    # 1. ReplayPlayer.from_raw_messages works with BOTH DeepgramNormalizer and PeeceeRealtimeAdapter
+    dg = DeepgramNormalizer(session_id="sess-raw-dg")
+    dg_raw: list[tuple[int, Mapping[str, Any]]] = [
+        (
+            1200,
+            {
+                "type": "Results",
+                "channel_index": [0],
+                "start": 0.5,
+                "duration": 0.5,
+                "is_final": True,
+                "speech_final": True,
+                "channel": {"alternatives": [{"transcript": "Hello there", "words": []}]},
+            },
+        )
+    ]
+    dg_player = ReplayPlayer.from_raw_messages(dg_raw, normalizer=dg.normalize)
+    assert len(dg_player.events) == 2 and dg_player.events[0].text == "Hello there"
+
+    peecee = PeeceeRealtimeAdapter(session_id="sess-raw-pc")
+    pc_raw: list[tuple[int, Mapping[str, Any]]] = [
+        (
+            1500,
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "audio_processed": 1.2,
+                "words": [{"word": "Done", "start": 0.2, "end": 1.2, "speaker": 1}],
+            },
+        )
+    ]
+    pc_player = ReplayPlayer.from_raw_messages(pc_raw, normalizer=peecee.process_server_message)
+    assert len(pc_player.events) == 2 and pc_player.events[0].text == "Done"
+
+    # 2. parse_nemo_offline_json(..., start_received_ms=0) assigns monotonic received_ms to SPEAKER_UPDATE
+    off_evs = parse_nemo_offline_json(
+        {
+            "words": [
+                {"word": "short", "start": 0.5, "end": 0.8, "speaker": 1},
+                {"word": "confirming", "start": 1.5, "end": 2.8, "speaker": 1},
+            ]
+        },
+        session_id="sess-off-rx",
+        binder=RecipientBinder(
+            session_id="sess-off-rx",
+            config=BinderConfig(recipient_azimuth_deg=0.0, min_confident_duration_ms=1000),
+        ),
+    )
+    # Force an azimuth match on the second segment via a direct binder test with DirectionSample
+    dir_binder = RecipientBinder(
+        session_id="sess-off-rx2",
+        config=BinderConfig(recipient_azimuth_deg=0.0, min_confident_duration_ms=1000),
+    )
+    dir_binder.feed_direction(
+        DirectionSample(t_ms=1800, azimuth_deg=0.0, contrast=4.0, level_db=-20.0)
+    )
+    off_evs2 = parse_nemo_offline_json(
+        {
+            "words": [
+                {"word": "short", "start": 0.5, "end": 0.8, "speaker": 1},
+                {"word": "confirming", "start": 1.5, "end": 2.8, "speaker": 1},
+            ]
+        },
+        session_id="sess-off-rx2",
+        binder=dir_binder,
+    )
+    assert len(off_evs) >= 4
+    upd = next(e for e in off_evs2 if e.kind is EventKind.SPEAKER_UPDATE)
+    assert upd.received_ms >= 2800
+
+    # 3. DeepgramNormalizer empty interim does not poison _active_utt_start_ms & omitted start is monotonic
+    dg2 = DeepgramNormalizer(session_id="sess-dg-edge")
+    assert (
+        dg2.normalize(
+            {
+                "type": "Results",
+                "channel_index": [0],
+                "start": 1.0,
+                "duration": 0.2,
+                "is_final": False,
+                "channel": {"alternatives": [{"transcript": ""}]},
+            },
+            1100,
+        )
+        == []
+    )
+    real = dg2.normalize(
+        {
+            "type": "Results",
+            "channel_index": [0],
+            "start": 5.0,
+            "duration": 0.8,
+            "is_final": True,
+            "channel": {"alternatives": [{"transcript": "Real speech"}]},
+        },
+        5900,
+    )
+    assert real[0].segment_id == "dg-ch0-00005000"
+
+    dg3 = DeepgramNormalizer(session_id="sess-dg-nostart")
+    f1 = dg3.normalize(
+        {
+            "type": "Results",
+            "channel_index": [0],
+            "is_final": True,
+            "channel": {"alternatives": [{"transcript": "First"}]},
+        },
+        1000,
+    )
+    f2 = dg3.normalize(
+        {
+            "type": "Results",
+            "channel_index": [0],
+            "is_final": True,
+            "channel": {"alternatives": [{"transcript": "Second"}]},
+        },
+        2000,
+    )
+    assert f1[0].segment_id != f2[0].segment_id
+
+
+async def test_malformed_ws_json_and_startup_timeout_lease_set_no_transcript(
+    tmp_path: Path,
+) -> None:
+    # 1. Malformed WS text frame -> NO_TRANSCRIPT + GAP + LIFECYCLE telemetry, no unhandled crash
+    async def _bad_ws_handler(ws: ServerConnection) -> None:
+        await ws.send(json.dumps({"type": "session.created"}))
+        await ws.recv()
+        await ws.send(json.dumps({"type": "session.updated"}))
+        await ws.send("<html>502 Bad Gateway</html>")
+        await ws.close()
+
+    telemetry = BoundedRecorderBuffer(maxsize=32)
+    async with serve(_bad_ws_handler, "127.0.0.1", 0) as srv:
+        port = int(next(iter(srv.sockets)).getsockname()[1])
+        adapter = PeeceeRealtimeAdapter(
+            session_id="sess-bad-json",
+            config=PeeceeConfig(ws_url=f"ws://127.0.0.1:{port}/ws"),
+            telemetry_sink=telemetry,
+        )
+        await adapter.connect()
+        evs = [ev async for ev in adapter.events()]
+
+    assert adapter.health is HealthState.NO_TRANSCRIPT
+    assert len(evs) == 1
+    assert evs[0].kind is EventKind.CONTROL and evs[0].subtype is ControlSubtype.GAP
+    assert evs[0].reason == "peecee_malformed_message"
+    assert any(
+        r.level is TelemetryLevel.LIFECYCLE
+        and r.kind == "adapter_health"
+        and r.payload.get("reason") == "peecee_malformed_message"
+        for r in telemetry.drain()
+    )
+
+    # 2. PeeceeSpeechProcess.wait_ready() timeout sets NO_TRANSCRIPT + telemetry + health_callback
+    hang_script = tmp_path / "peecee-hang"
+    hang_script.write_text("#!/usr/bin/env bash\nsleep 10\n", encoding="utf-8")
+    hang_script.chmod(0o755)
+    proc_tel = BoundedRecorderBuffer(maxsize=16)
+    proc_health: list[tuple[HealthState, str]] = []
+    proc = PeeceeSpeechProcess(
+        session_id="sess-to",
+        config=PeeceeConfig(
+            executable=hang_script,
+            ws_url="ws://127.0.0.1:19976/ws",
+            ready_timeout_s=0.2,
+            kill_stop_grace_s=0.2,
+        ),
+        telemetry_sink=proc_tel,
+        health_callback=lambda st, rsn, _det: proc_health.append((st, rsn)),
+    )
+    with pytest.raises(PeeceeProcessError):
+        await proc.start(wait_for_ready=True)
+    assert proc.health is HealthState.NO_TRANSCRIPT
+    assert proc_health[-1] == (HealthState.NO_TRANSCRIPT, "peecee_ready_timeout")
+    assert any(r.kind == "adapter_health" for r in proc_tel.drain())
+
+    # 3. PeeceeRealtimeAdapter.connect() sets NO_TRANSCRIPT when process fails (exit 75)
+    exit75 = tmp_path / "peecee-75"
+    exit75.write_text("#!/usr/bin/env bash\nexit 75\n", encoding="utf-8")
+    exit75.chmod(0o755)
+    proc75 = PeeceeSpeechProcess(
+        session_id="sess-conn-75",
+        config=PeeceeConfig(executable=exit75, ws_url="ws://127.0.0.1:19977/ws"),
+    )
+    ad_75 = PeeceeRealtimeAdapter(
+        session_id="sess-conn-75",
+        config=PeeceeConfig(ws_url="ws://127.0.0.1:19977/ws"),
+        process=proc75,
+    )
+    with pytest.raises(PeeceeLeaseUnavailableError):
+        await ad_75.connect()
+    assert ad_75.health is HealthState.NO_TRANSCRIPT

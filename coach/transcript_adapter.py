@@ -368,7 +368,7 @@ class NumpySpectralVerifier:
         out: dict[str, float] = {}
         for spk_id, ref in self._profiles.items():
             cos = float(np.clip(np.dot(vec, ref), -1.0, 1.0))
-            out[spk_id] = 0.5 * (cos + 1.0)
+            out[spk_id] = max(0.0, cos) ** 2
         return out
 
 
@@ -395,14 +395,31 @@ class RecipientBinder:
         self._config = config or BinderConfig()
         self._verifier = verifier
         self._seq_counter = 0
+        self._has_custom_sequence_fn = sequence_fn is not None
+        self._has_custom_revisions = revision_tracker is not None
         self._sequence_fn = sequence_fn
         self._revisions = revision_tracker if revision_tracker is not None else {}
         self._epoch = 0
-        self._next_anon_idx_by_epoch: dict[int, int] = {}
+        self._next_anon_idx = 1
+        self._allocated_anon_labels: set[str] = set()
         self._cluster_bindings: dict[tuple[int, str], SpeakerBinding] = {}
         self._cluster_segments: dict[tuple[int, str], list[str]] = {}
         self._directions: list[DirectionSample] = []
         self._event_counter = 0
+
+    def attach_trackers(
+        self,
+        *,
+        sequence_fn: Callable[[], int],
+        revision_tracker: dict[str, int],
+    ) -> None:
+        """Share sequence and revision trackers with a parent segmenter."""
+        if not self._has_custom_sequence_fn:
+            self._sequence_fn = sequence_fn
+        if not self._has_custom_revisions:
+            for seg_id, rev in self._revisions.items():
+                revision_tracker[seg_id] = max(revision_tracker.get(seg_id, 0), rev)
+            self._revisions = revision_tracker
 
     @property
     def epoch(self) -> int:
@@ -468,16 +485,19 @@ class RecipientBinder:
         return math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
 
     def _allocate_anon_label(self, epoch: int) -> str:
+        del epoch
         used = {
             b.speaker_id
-            for (ep, _), b in self._cluster_bindings.items()
-            if ep == epoch and b.speaker_id not in ("S?", self._config.recipient_id)
-        }
-        idx = self._next_anon_idx_by_epoch.get(epoch, 1)
+            for b in self._cluster_bindings.values()
+            if b.speaker_id not in ("S?", self._config.recipient_id)
+        } | self._allocated_anon_labels
+        idx = self._next_anon_idx
         while f"S{idx}" in used:
             idx += 1
-        self._next_anon_idx_by_epoch[epoch] = idx + 1
-        return f"S{idx}"
+        label = f"S{idx}"
+        self._allocated_anon_labels.add(label)
+        self._next_anon_idx = idx + 1
+        return label
 
     def _infer_binding(
         self,
@@ -631,7 +651,7 @@ class RecipientBinder:
                 and prior_segs
                 and (
                     binding.speaker_id != prior.speaker_id
-                    or (prior.speaker_id == "S?" and not binding.speaker_uncertain)
+                    or binding.speaker_uncertain != prior.speaker_uncertain
                 )
             ):
                 for prev_seg_id in prior_segs:
@@ -746,12 +766,19 @@ class NemotronSegmenter:
         self._revisions = revision_tracker if revision_tracker is not None else {}
         self._seq_counter = 0
         self._sequence_fn = sequence_fn
-        self._binder = binder or RecipientBinder(
-            session_id=session_id,
-            source_id=source_id,
-            sequence_fn=self._next_sequence,
-            revision_tracker=self._revisions,
-        )
+        if binder is not None:
+            binder.attach_trackers(
+                sequence_fn=self._next_sequence,
+                revision_tracker=self._revisions,
+            )
+            self._binder = binder
+        else:
+            self._binder = RecipientBinder(
+                session_id=session_id,
+                source_id=source_id,
+                sequence_fn=self._next_sequence,
+                revision_tracker=self._revisions,
+            )
         self._event_counter = 0
         self._interim_epoch = 0
         self._partial_buffer = ""
@@ -820,6 +847,12 @@ class NemotronSegmenter:
         self._used_seg_ids.add(seg_id)
         return seg_id
 
+    def reset_pending(self) -> None:
+        """Clear buffered interim and pending words without emitting events."""
+        self._partial_buffer = ""
+        self._active_interim_seg_id = None
+        self._pending_words.clear()
+
     def feed_partial(
         self,
         delta_text: str,
@@ -831,6 +864,8 @@ class NemotronSegmenter:
     ) -> list[CanonicalEvent]:
         """Emit an INTERIM segment event for the trailing partial word in `.delta`."""
         if not delta_text:
+            return []
+        if not is_replacement and delta_text == self._partial_buffer:
             return []
         if is_replacement or (
             self._partial_buffer
@@ -849,9 +884,7 @@ class NemotronSegmenter:
         if self._active_interim_seg_id is None:
             self._interim_epoch += 1
             self._active_interim_start_ms = max(self._last_committed_end_ms, audio_processed_ms)
-            self._active_interim_seg_id = (
-                f"seg-ch{self._config.channel}-interim-{self._interim_epoch:06d}"
-            )
+            self._active_interim_seg_id = f"seg-ch{self._config.channel}-interim"
 
         seg_id = self._active_interim_seg_id
         start_ms = self._active_interim_start_ms
@@ -969,6 +1002,7 @@ class NemotronSegmenter:
         text = " ".join(parts)
 
         seg_id = self._make_segment_id(start_ms)
+        seg_seq = self._next_sequence()
         speaker_counts = Counter(
             w.speaker for w in words if w.speaker is not None and w.speaker.strip() not in ("", "0")
         )
@@ -1001,7 +1035,7 @@ class NemotronSegmenter:
                 event_id=self._next_event_id("evt-seg"),
                 kind=EventKind.SEGMENT,
                 received_ms=received_ms,
-                source_sequence=self._next_sequence(),
+                source_sequence=seg_seq,
                 source_id=self._source_id,
                 segment_id=seg_id,
                 source_revision=self._next_revision(seg_id),
@@ -1071,7 +1105,11 @@ class NemotronSegmenter:
 
             if self._pending_words:
                 prev = self._pending_words[-1]
-                prev_spk = prev.speaker if prev.speaker not in (None, "", "0") else None
+                prev_spk: str | None = None
+                for pw in reversed(self._pending_words):
+                    if pw.speaker not in (None, "", "0"):
+                        prev_spk = pw.speaker
+                        break
                 curr_spk = word.speaker if word.speaker not in (None, "", "0") else None
                 gap_ms = word.start_ms - prev.end_ms
                 dur_ms = word.end_ms - self._pending_words[0].start_ms
@@ -1229,8 +1267,11 @@ def parse_nemo_offline_json(
     # Set realistic monotonic received_ms >= end_ms on offline events if start_received_ms == 0.
     if start_received_ms == 0:
         adjusted: list[CanonicalEvent] = []
+        last_rx = 0
         for ev in events:
-            rx = ev.end_ms if ev.end_ms is not None else ev.received_ms
+            if ev.end_ms is not None:
+                last_rx = max(last_rx, ev.end_ms)
+            rx = max(last_rx, ev.end_ms) if ev.end_ms is not None else last_rx
             if rx != ev.received_ms:
                 d = ev.to_dict()
                 d["received_ms"] = rx
@@ -1512,6 +1553,21 @@ class PeeceeSpeechProcess:
 
             if time.monotonic() >= deadline:
                 await self.stop()
+                self._health = HealthState.NO_TRANSCRIPT
+                reason = "peecee_ready_timeout"
+                detail = {
+                    "health": HealthState.NO_TRANSCRIPT.value,
+                    "reason": reason,
+                    "timeout_s": timeout_s,
+                    "host": host,
+                    "port": port,
+                }
+                self._emit_telemetry(
+                    level=TelemetryLevel.LIFECYCLE,
+                    kind="adapter_health",
+                    payload=detail,
+                )
+                await _invoke_health_cb(self._health_cb, HealthState.NO_TRANSCRIPT, reason, detail)
                 raise PeeceeProcessError(
                     f"Timed out waiting {timeout_s:.1f}s for peecee-speech at {host}:{port}"
                 )
@@ -1595,10 +1651,19 @@ class PeeceeRealtimeAdapter:
         self._closed_cleanly = False
         self._commit_base_ms = 0
         self._last_utterance_audio_ms = 0
+        self._last_epoch_word_end_ms = 0
+        self._last_committed_end_ms = 0
         self._utterance_sent_ms = 0
+        self._uncommitted_bytes = 0
         self._total_sent_ms = 0
         self._utterance_audio = bytearray()
         self._utterance_audio_base_ms = 0
+        self._pending_commits: deque[tuple[int, int]] = deque()
+        self._pending_events: asyncio.Queue[CanonicalEvent] = asyncio.Queue()
+        self._audio_origin_ms: int | None = None
+        self._halted_since_ms: int | None = None
+        self._total_halted_ms = 0
+        self._off_record_start_ms: int | None = None
         self._silence_accum_ms = 0
         self._had_speech_since_commit = False
         self._tel_counter = 0
@@ -1689,7 +1754,20 @@ class PeeceeRealtimeAdapter:
     async def connect(self) -> None:
         """Optionally start subprocess, open WS, and complete session.update handshake."""
         if self._process is not None and self._process.pid is None:
-            await self._process.start(wait_for_ready=True)
+            try:
+                await self._process.start(wait_for_ready=True)
+            except (PeeceeLeaseUnavailableError, PeeceeProcessError, OSError) as exc:
+                reason = (
+                    "peecee_lease_unavailable"
+                    if isinstance(exc, PeeceeLeaseUnavailableError)
+                    else "peecee_process_failed"
+                )
+                await self._set_health(
+                    HealthState.NO_TRANSCRIPT,
+                    reason,
+                    {"err": str(exc)},
+                )
+                raise
         headers: dict[str, str] = {}
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
@@ -1760,12 +1838,23 @@ class PeeceeRealtimeAdapter:
         if self._process is not None:
             await self._process.stop()
 
+    def _update_halt_clock(self) -> None:
+        halted = self._paused or self._off_record
+        if halted and self._halted_since_ms is None:
+            if self._audio_origin_ms is not None:
+                self._halted_since_ms = self._clock.now_ms()
+        elif not halted and self._halted_since_ms is not None:
+            self._total_halted_ms += max(0, self._clock.now_ms() - self._halted_since_ms)
+            self._halted_since_ms = None
+
     async def pause(self) -> None:
         self._paused = True
+        self._update_halt_clock()
         await self._set_health(HealthState.PAUSED, "user_paused", {})
 
     async def resume(self) -> None:
         self._paused = False
+        self._update_halt_clock()
         if not self._off_record:
             await self._set_health(HealthState.OK, "resumed", {})
 
@@ -1773,18 +1862,48 @@ class PeeceeRealtimeAdapter:
         """Toggle off-the-record ingestion halt and emit OFF_RECORD_START/END (B18)."""
         if enabled == self._off_record:
             return []
+        now_ms = self._clock.now_ms()
         self._off_record = enabled
+        self._update_halt_clock()
         if enabled:
-            return [self._next_ctrl_event(ControlSubtype.OFF_RECORD_START, reason="off_record")]
-        return [self._next_ctrl_event(ControlSubtype.OFF_RECORD_END, reason="off_record")]
+            self._off_record_start_ms = now_ms
+            self._silence_accum_ms = 0
+            self._had_speech_since_commit = False
+            self._segmenter.reset_pending()
+            return [
+                self._next_ctrl_event(
+                    ControlSubtype.OFF_RECORD_START,
+                    reason="off_record",
+                    start_ms=now_ms,
+                )
+            ]
+        start_ms = self._off_record_start_ms if self._off_record_start_ms is not None else now_ms
+        self._off_record_start_ms = None
+        return [
+            self._next_ctrl_event(
+                ControlSubtype.OFF_RECORD_END,
+                reason="off_record",
+                start_ms=start_ms,
+                end_ms=max(start_ms, now_ms),
+            )
+        ]
 
     async def commit_audio(self) -> None:
         """Send `input_audio_buffer.commit` to flush `.completed` words + speaker tags."""
         if self._ws is None:
             raise AdapterError("WebSocket is not connected")
-        await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        entry = (self._uncommitted_bytes, self._utterance_sent_ms)
+        self._pending_commits.append(entry)
+        self._uncommitted_bytes = 0
+        self._utterance_sent_ms = 0
         self._silence_accum_ms = 0
         self._had_speech_since_commit = False
+        try:
+            await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        except BaseException:
+            if self._pending_commits and self._pending_commits[-1] == entry:
+                self._pending_commits.pop()
+            raise
 
     async def send_audio_pcm16(
         self,
@@ -1799,7 +1918,8 @@ class PeeceeRealtimeAdapter:
         if self._ws is None:
             raise AdapterError("WebSocket is not connected")
         if gate is not None:
-            self._segmenter.feed_gate(gate, received_ms=self._clock.now_ms())
+            for ev in self._segmenter.feed_gate(gate, received_ms=self._clock.now_ms()):
+                self._pending_events.put_nowait(ev)
 
         frame_bytes = self._config.frame_bytes
         usable = len(pcm16_bytes) - (len(pcm16_bytes) % 2)
@@ -1810,7 +1930,10 @@ class PeeceeRealtimeAdapter:
             await self._ws.send(chunk)
             sent += len(chunk)
             self._utterance_audio.extend(chunk)
+            self._uncommitted_bytes += len(chunk)
             chunk_ms = max(1, round(len(chunk) * 1000.0 / (2 * self._config.sample_rate)))
+            if self._audio_origin_ms is None:
+                self._audio_origin_ms = max(0, self._clock.now_ms() - chunk_ms)
             self._utterance_sent_ms += chunk_ms
             self._total_sent_ms += chunk_ms
             idx += frame_bytes
@@ -1835,13 +1958,44 @@ class PeeceeRealtimeAdapter:
                 await asyncio.sleep(chunk_ms / 1000.0)
         return sent
 
+    def _handle_buffer_committed(self) -> None:
+        if self._pending_commits:
+            committed_bytes_len, committed_audio_ms = self._pending_commits.popleft()
+        else:
+            committed_bytes_len = self._uncommitted_bytes
+            committed_audio_ms = self._utterance_sent_ms
+            self._uncommitted_bytes = 0
+            self._utterance_sent_ms = 0
+        if committed_bytes_len > 0:
+            del self._utterance_audio[:committed_bytes_len]
+        advance_ms = max(
+            committed_audio_ms,
+            self._last_utterance_audio_ms,
+            self._last_epoch_word_end_ms,
+        )
+        self._commit_base_ms = max(
+            self._commit_base_ms + advance_ms,
+            self._last_committed_end_ms,
+        )
+        self._last_utterance_audio_ms = 0
+        self._last_epoch_word_end_ms = 0
+        self._utterance_audio_base_ms = self._commit_base_ms
+        self._segmenter.binder.reset_diarizer_epoch()
+
     def process_server_message(
         self,
         payload: Mapping[str, Any],
-        *,
         received_ms: int,
     ) -> list[CanonicalEvent]:
         """Normalize one JSON frame from NeMo-Speech.cpp v0.3.0 into CanonicalEvents."""
+        msg_type = str(payload.get("type", ""))
+        if self._off_record:
+            if msg_type.endswith(("transcription.delta", "transcription.completed")):
+                rel_ms = max(0, round(float(payload.get("audio_processed", 0.0)) * 1000.0))
+                self._last_utterance_audio_ms = max(self._last_utterance_audio_ms, rel_ms)
+            elif msg_type == "input_audio_buffer.committed":
+                self._handle_buffer_committed()
+            return []
         if self._raw_sink is not None:
             self._raw_sink.record_raw(
                 session_id=self._session_id,
@@ -1849,10 +2003,6 @@ class PeeceeRealtimeAdapter:
                 received_ms=received_ms,
                 payload=payload,
             )
-        if self._off_record:
-            return []
-
-        msg_type = str(payload.get("type", ""))
         if msg_type.endswith("transcription.delta"):
             rel_ms = max(0, round(float(payload.get("audio_processed", 0.0)) * 1000.0))
             self._last_utterance_audio_ms = max(self._last_utterance_audio_ms, rel_ms)
@@ -1875,6 +2025,12 @@ class PeeceeRealtimeAdapter:
                 start_ms = self._commit_base_ms
                 end_ms = max(start_ms, self._commit_base_ms + rel_ms)
                 words = [AsrWord(word=transcript, start_ms=start_ms, end_ms=end_ms)]
+            for w in words:
+                self._last_epoch_word_end_ms = max(
+                    self._last_epoch_word_end_ms,
+                    w.end_ms - self._commit_base_ms,
+                )
+                self._last_committed_end_ms = max(self._last_committed_end_ms, w.end_ms)
             events = self._segmenter.feed_words(
                 words,
                 received_ms=received_ms,
@@ -1888,11 +2044,20 @@ class PeeceeRealtimeAdapter:
                     and ev.stability is Stability.COMMITTED
                     and ev.end_ms is not None
                 ):
+                    self._last_committed_end_ms = max(self._last_committed_end_ms, ev.end_ms)
+                    origin = self._audio_origin_ms or 0
+                    halted = self._total_halted_ms
+                    if self._halted_since_ms is not None:
+                        halted += max(0, received_ms - self._halted_since_ms)
+                    audio_clock_ms = max(0, received_ms - origin - halted)
                     self._emit_tel(
                         level=TelemetryLevel.DEBUG,
                         kind="upstream_delay",
                         payload={
-                            "lag_ms": received_ms - ev.end_ms,
+                            "lag_ms": audio_clock_ms - ev.end_ms,
+                            "raw_lag_ms": received_ms - ev.end_ms,
+                            "audio_origin_ms": origin,
+                            "halted_ms": halted,
                             "segment_id": ev.segment_id,
                             "end_ms": ev.end_ms,
                             "received_ms": received_ms,
@@ -1901,13 +2066,7 @@ class PeeceeRealtimeAdapter:
             return events
 
         if msg_type == "input_audio_buffer.committed":
-            advance_ms = max(self._last_utterance_audio_ms, self._utterance_sent_ms)
-            self._commit_base_ms += advance_ms
-            self._last_utterance_audio_ms = 0
-            self._utterance_sent_ms = 0
-            self._utterance_audio.clear()
-            self._utterance_audio_base_ms = self._commit_base_ms
-            self._segmenter.binder.reset_diarizer_epoch()
+            self._handle_buffer_committed()
             return []
 
         if msg_type == "error":
@@ -1922,35 +2081,89 @@ class PeeceeRealtimeAdapter:
         """Yield CanonicalEvents from the WebSocket until clean close or tunnel loss."""
         if self._ws is None:
             raise AdapterError("WebSocket is not connected")
-        while True:
-            try:
-                raw_frame = await self._ws.recv()
-            except (ConnectionClosed, OSError) as exc:
-                if not self._closed_cleanly:
-                    await self._set_health(
-                        HealthState.NO_TRANSCRIPT,
-                        "peecee_tunnel_lost",
-                        {"err": str(exc)},
-                    )
-                    yield self._next_ctrl_event(
-                        ControlSubtype.GAP,
-                        reason="peecee_tunnel_lost",
-                        start_ms=self._segmenter._last_committed_end_ms,
-                        end_ms=max(
-                            self._segmenter._last_committed_end_ms,
-                            self._commit_base_ms + self._last_utterance_audio_ms,
-                        ),
-                    )
-                break
-            if isinstance(raw_frame, bytes):
-                continue
-            msg = json.loads(raw_frame)
-            if not isinstance(msg, Mapping):
-                continue
-            rx_ms = self._clock.now_ms()
-            for ev in self.process_server_message(msg, received_ms=rx_ms):
-                self._last_seq_seen = max(self._last_seq_seen, ev.source_sequence)
-                yield ev
+        while not self._pending_events.empty():
+            queued = self._pending_events.get_nowait()
+            self._last_seq_seen = max(self._last_seq_seen, queued.source_sequence)
+            yield queued
+
+        recv_task: asyncio.Task[Any] | None = asyncio.create_task(self._ws.recv())
+        queue_task: asyncio.Task[CanonicalEvent] | None = asyncio.create_task(
+            self._pending_events.get()
+        )
+        try:
+            while True:
+                assert recv_task is not None and queue_task is not None
+                wait_set: set[asyncio.Task[Any]] = {recv_task, queue_task}
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                if queue_task in done:
+                    ev = queue_task.result()
+                    queue_task = asyncio.create_task(self._pending_events.get())
+                    self._last_seq_seen = max(self._last_seq_seen, ev.source_sequence)
+                    yield ev
+                    while not self._pending_events.empty():
+                        extra = self._pending_events.get_nowait()
+                        self._last_seq_seen = max(self._last_seq_seen, extra.source_sequence)
+                        yield extra
+                if recv_task in done:
+                    try:
+                        raw_frame = recv_task.result()
+                    except (ConnectionClosed, OSError) as exc:
+                        recv_task = None
+                        while not self._pending_events.empty():
+                            extra = self._pending_events.get_nowait()
+                            self._last_seq_seen = max(self._last_seq_seen, extra.source_sequence)
+                            yield extra
+                        if not self._closed_cleanly:
+                            await self._set_health(
+                                HealthState.NO_TRANSCRIPT,
+                                "peecee_tunnel_lost",
+                                {"err": str(exc)},
+                            )
+                            yield self._next_ctrl_event(
+                                ControlSubtype.GAP,
+                                reason="peecee_tunnel_lost",
+                                start_ms=self._segmenter._last_committed_end_ms,
+                                end_ms=max(
+                                    self._segmenter._last_committed_end_ms,
+                                    self._commit_base_ms + self._last_utterance_audio_ms,
+                                ),
+                            )
+                        break
+                    recv_task = asyncio.create_task(self._ws.recv())
+                    if isinstance(raw_frame, bytes):
+                        continue
+                    try:
+                        msg = json.loads(raw_frame)
+                    except json.JSONDecodeError as exc:
+                        if not self._closed_cleanly:
+                            await self._set_health(
+                                HealthState.NO_TRANSCRIPT,
+                                "peecee_malformed_message",
+                                {"err": str(exc)},
+                            )
+                            yield self._next_ctrl_event(
+                                ControlSubtype.GAP,
+                                reason="peecee_malformed_message",
+                                start_ms=self._segmenter._last_committed_end_ms,
+                                end_ms=max(
+                                    self._segmenter._last_committed_end_ms,
+                                    self._commit_base_ms + self._last_utterance_audio_ms,
+                                ),
+                            )
+                        break
+                    if not isinstance(msg, Mapping):
+                        continue
+                    rx_ms = self._clock.now_ms()
+                    for ev in self.process_server_message(msg, rx_ms):
+                        self._last_seq_seen = max(self._last_seq_seen, ev.source_sequence)
+                        yield ev
+        finally:
+            for task in (recv_task, queue_task):
+                if task is not None:
+                    if not task.done():
+                        task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
 
 
 class DeepgramNormalizer:
@@ -1975,6 +2188,7 @@ class DeepgramNormalizer:
         self._revisions: dict[str, int] = {}
         self._active_utt_start_ms: dict[int, int] = {}
         self._last_speaker_by_channel: dict[int, str] = {}
+        self._last_end_ms_by_channel: dict[int, int] = {}
 
     def _next_seq(self) -> int:
         self._seq_counter += 1
@@ -2006,7 +2220,6 @@ class DeepgramNormalizer:
     def normalize(
         self,
         payload: Mapping[str, Any] | str,
-        *,
         received_ms: int,
     ) -> list[CanonicalEvent]:
         """Normalize a Deepgram `Results` or `UtteranceEnd` JSON payload."""
@@ -2056,18 +2269,24 @@ class DeepgramNormalizer:
         is_final = bool(data.get("is_final", False))
         speech_final = bool(data.get("speech_final", False))
 
-        start_ms = max(0, round(float(data.get("start", 0.0)) * 1000.0))
+        has_explicit_start = ("start" in data) or bool(
+            words and isinstance(words[0], Mapping) and "start" in words[0]
+        )
         duration_ms = max(0, round(float(data.get("duration", 0.0)) * 1000.0))
+        if has_explicit_start:
+            start_ms = max(0, round(float(data.get("start", 0.0)) * 1000.0))
+            if words and isinstance(words[0], Mapping) and "start" in words[0]:
+                start_ms = max(0, round(float(words[0]["start"]) * 1000.0))
+        elif ch in self._active_utt_start_ms:
+            start_ms = self._active_utt_start_ms[ch]
+        else:
+            prev_end = self._last_end_ms_by_channel.get(ch)
+            start_ms = 0 if prev_end is None else prev_end + 1
         end_ms = start_ms + duration_ms
-        if words and isinstance(words[0], Mapping) and "start" in words[0]:
-            start_ms = max(0, round(float(words[0]["start"]) * 1000.0))
         if words and isinstance(words[-1], Mapping) and "end" in words[-1]:
             end_ms = max(start_ms, round(float(words[-1]["end"]) * 1000.0))
 
-        utt_start = self._active_utt_start_ms.setdefault(ch, start_ms)
-        seg_id = f"dg-ch{ch}-{utt_start:08d}"
         speaker_id, spk_uncertain = self._resolve_speaker(words)
-        self._last_speaker_by_channel[ch] = speaker_id
         conf_raw = alt.get("confidence")
         asr_conf = float(conf_raw) if conf_raw is not None else None
         low_conf = (
@@ -2078,6 +2297,13 @@ class DeepgramNormalizer:
 
         out: list[CanonicalEvent] = []
         if transcript:
+            utt_start = self._active_utt_start_ms.setdefault(ch, start_ms)
+            seg_id = f"dg-ch{ch}-{utt_start:08d}"
+            self._last_speaker_by_channel[ch] = speaker_id
+            self._last_end_ms_by_channel[ch] = max(
+                self._last_end_ms_by_channel.get(ch, 0),
+                end_ms,
+            )
             stability = Stability.COMMITTED if is_final else Stability.INTERIM
             out.append(
                 CanonicalEvent(
@@ -2107,6 +2333,7 @@ class DeepgramNormalizer:
             self._active_utt_start_ms.pop(ch, None)
         if speech_final:
             self._active_utt_start_ms.pop(ch, None)
+            bnd_speaker = speaker_id if words else self._last_speaker_by_channel.get(ch)
             out.append(
                 CanonicalEvent(
                     schema_version=SCHEMA_VERSION,
@@ -2117,7 +2344,7 @@ class DeepgramNormalizer:
                     source_sequence=self._next_seq(),
                     source_id=self._source_id,
                     channel=ch,
-                    speaker_id=speaker_id,
+                    speaker_id=bnd_speaker,
                     end_ms=end_ms,
                     boundary="speech_final",
                 )
