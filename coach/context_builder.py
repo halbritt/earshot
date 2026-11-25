@@ -79,12 +79,20 @@ def _p_map(val: Any, name: str) -> Mapping[str, Any]:
     return val
 
 
+def _p_opt_str(val: Any, name: str) -> str | None:
+    if val is None:
+        return None
+    return _p_str(val, name)
+
+
 @dataclass(frozen=True, slots=True)
 class ClassifierPolicy:
     version: str
     calibration: str
     input_limit_tokens: int
     max_candidates_per_job: int
+    model_path: str | None = None
+    calibration_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +143,11 @@ class GeneratorPolicy:
     max_words: int
     timeout_ms: int
     breaker: BreakerPolicy
+    provider: str | None = None
+    model_id: str | None = None
+    reasoning: str | None = None
+    api_key_env: str | None = None
+    base_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +239,8 @@ def load_policy(
         max_candidates_per_job=_p_int(
             cls_m.get("max_candidates_per_job"), "classifier.max_candidates_per_job", minimum=1
         ),
+        model_path=_p_opt_str(cls_m.get("model_path"), "classifier.model_path"),
+        calibration_path=_p_opt_str(cls_m.get("calibration_path"), "classifier.calibration_path"),
     )
     cats_m = _p_map(m.get("categories"), "policy.categories")
     categories: dict[Category, CategoryPolicy] = {}
@@ -278,6 +293,11 @@ def load_policy(
     )
 
     gen_m = _p_map(m.get("generator"), "policy.generator")
+    for bad_secret in ("api_key", "secret", "token", "password"):
+        if bad_secret in gen_m:
+            raise PolicyConfigError(
+                f"generator.{bad_secret} is forbidden in policy YAML (§14.6); use api_key_env"
+            )
     brk_m = _p_map(gen_m.get("breaker"), "generator.breaker")
     generator = GeneratorPolicy(
         enabled=_p_bool(gen_m.get("enabled"), "generator.enabled"),
@@ -289,6 +309,11 @@ def load_policy(
             ),
             open_ms=_p_int(brk_m.get("open_ms"), "breaker.open_ms", minimum=1),
         ),
+        provider=_p_opt_str(gen_m.get("provider"), "generator.provider"),
+        model_id=_p_opt_str(gen_m.get("model_id"), "generator.model_id"),
+        reasoning=_p_opt_str(gen_m.get("reasoning"), "generator.reasoning"),
+        api_key_env=_p_opt_str(gen_m.get("api_key_env"), "generator.api_key_env"),
+        base_url=_p_opt_str(gen_m.get("base_url"), "generator.base_url"),
     )
     abs_m = _p_map(m.get("abstain"), "policy.abstain")
     floor_raw = abs_m.get("asr_confidence_floor")
@@ -695,15 +720,18 @@ def assign_speaker_roles(snapshot: StateSnapshot) -> dict[str, str]:
         if p.participant_id not in mapping:
             mapping[p.participant_id] = _alloc()
 
+    has_declared_non_recipient = any(
+        p.participant_id not in recipient_ids for p in snapshot.brief.participants
+    )
     for seg in snapshot.segments:
         spk = seg.speaker_id
         if spk in recipient_ids or spk in {"S?", "unknown", ""}:
             continue
         if spk not in mapping:
-            if _ROLE_LABEL_RE.match(spk) and spk not in used_labels:
+            if _ROLE_LABEL_RE.match(spk):
                 mapping[spk] = spk
                 used_labels.add(spk)
-            else:
+            elif not has_declared_non_recipient:
                 mapping[spk] = _alloc()
     return mapping
 
@@ -806,6 +834,7 @@ def _render_context_lines(
     retained_turns: Sequence[SegmentRecord],
     relevant_gaps: Sequence[tuple[int, str]],
     role_map: Mapping[str, str],
+    anchor_received_ms: int | None = None,
 ) -> list[str]:
     if not retained_turns and not relevant_gaps:
         return []
@@ -816,7 +845,11 @@ def _render_context_lines(
             lines.append(relevant_gaps[gap_idx][1])
             gap_idx += 1
         lbl = _speaker_label_for_segment(turn, role_map)
-        lines.append(f"{lbl}: {turn.text.strip()}")
+        if anchor_received_ms is not None:
+            age_tag = bucket_age_ms(max(0, anchor_received_ms - turn.end_ms))
+            lines.append(f"{age_tag} {lbl}: {turn.text.strip()}")
+        else:
+            lines.append(f"{lbl}: {turn.text.strip()}")
     while gap_idx < len(relevant_gaps):
         lines.append(relevant_gaps[gap_idx][1])
         gap_idx += 1
@@ -1038,12 +1071,22 @@ def build_decision_context(
             break
     retained_sug_lines.reverse()
     omitted_suggestions = len(sug_entries) - len(retained_sug_lines)
+    if not retained_sug_lines and not sug_entries:
+        none_line = "[SUGGESTED] none"
+        base_parts = [obj_line, full_role_line]
+        if known_line:
+            base_parts.append(known_line)
+        base_parts.extend([none_line, anchor_line])
+        if tok.count_tokens("\n".join(base_parts)) <= limit:
+            retained_sug_lines.append(none_line)
 
     # Step 4: Fit [CONTEXT] whole turns oldest-first dropped (fill newest first)
     retained_rev: list[SegmentRecord] = []
     for turn in reversed(prior_turns):
         candidate_turns = list(reversed([*retained_rev, turn]))
-        ctx_lines = _render_context_lines(candidate_turns, relevant_gaps, role_map)
+        ctx_lines = _render_context_lines(
+            candidate_turns, relevant_gaps, role_map, anchor_span.anchor_received_ms
+        )
         parts = [obj_line, full_role_line]
         if known_line:
             parts.append(known_line)
@@ -1064,7 +1107,9 @@ def build_decision_context(
     def _assemble_parts() -> tuple[str, list[str], str]:
         used = anchor_roles | {_speaker_label_for_segment(t, role_map) for t in retained_turns}
         r_line = _build_role_line(snapshot, role_map, used)
-        c_lines = _render_context_lines(retained_turns, retained_gaps, role_map)
+        c_lines = _render_context_lines(
+            retained_turns, retained_gaps, role_map, anchor_span.anchor_received_ms
+        )
         parts_out = [obj_line, r_line]
         if known_line:
             parts_out.append(known_line)
@@ -1168,6 +1213,7 @@ def build_decision_contexts(
     suggestion_catalog: Mapping[str, SuggestionCandidate] | None = None,
     stock_phrases: frozenset[str] = DEFAULT_STOCK_PHRASES,
     input_limit_tokens: int | None = None,
+    initial_previous_anchor_norm_text: str | None = None,
 ) -> list[ContextBuildResult]:
     """Sole context-building pipeline across live, replay, and training (§5.2–§5.3, §15)."""
     tok = tokenizer or WhitespaceTokenizer()
@@ -1186,7 +1232,7 @@ def build_decision_contexts(
         segments_subset=anchor_segments,
     )
     results: list[ContextBuildResult] = []
-    prev_norm: str | None = None
+    prev_norm: str | None = initial_previous_anchor_norm_text
     for anchor in anchors:
         pf = run_prefilter(
             anchor,
@@ -1243,13 +1289,18 @@ _TRAILING_PUNCT = ".,!?;:"
 _OWNER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\b(?:will|should|needs?\s+to|has\s+to|have\s+to|going\s+to|gonna|can|could|must)?\s*"
-        r"(?:own|take\s+on|take\s+care\s+of|take|handle|follow\s+up\s+on|lead|drive|manage|pick\s+up|run)\s+"
+        r"(?:also\s+)?(?:own|take\s+on|take\s+care\s+of|take|handle|follow\s+up\s+on|lead|drive|manage|pick\s+up|run|verify)\s+"
         r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:before|by|until|after|because|so|and\s+then|if|when)\b|$)",
         flags=re.IGNORECASE,
     ),
 )
 
 _TIME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:deadline|target\s+date|timeline|eta)\s+(?:for|on)\s+"
+        r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:before|by|until|soon|later|eventually|when|if|so|because)\b|$)",
+        flags=re.IGNORECASE,
+    ),
     re.compile(
         r"\b(?:finish|ship|land|complete|deploy|cut\s+over|deliver|launch|wrap\s+up)\s+"
         r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:before|by|until|soon|later|eventually|when|if|so|because)\b|$)",
@@ -1265,7 +1316,12 @@ _TIME_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _PROPOSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"\b(?:propose|suggest|recommend|plan\s+to|try|use|roll\s+out|switch\s+to|cut\s+over\s+to|migrate\s+to|adopt|add|build|deploy)\s+"
+        r"\b(?:define|confirm|check|agree\s+on|set)\s+(?:a\s+)?(?:test\s+criteri(?:on|a)|success\s+criteri(?:on|a)|acceptance\s+criteri(?:on|a))\s+(?:for|on)\s+"
+        r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:except|excluding|including|only\s+for|up\s+to|within|outside\s+of|without|not\s+including|for\s+now|so|because|to\s+make|when|if)\b|$)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:propose|suggest|recommend|plan\s+to|try|use|roll\s+out|switch\s+to|cut\s+over\s+to|migrate\s+to|adopt|add|build|deploy|review)\s+"
         r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:except|excluding|including|only\s+for|up\s+to|within|outside\s+of|without|not\s+including|for\s+now|so|because|to\s+make|when|if)\b|$)",
         flags=re.IGNORECASE,
     ),

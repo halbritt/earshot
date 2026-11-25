@@ -480,6 +480,24 @@ class ProviderAdapter:
             self._cancel_recovery_task()
         self._set_health(HealthState.OK)
 
+    @staticmethod
+    def _parse_chat_json(data: Any) -> tuple[str, str | None, dict[str, int]]:
+        if not isinstance(data, Mapping):
+            raise ValueError("Provider JSON response must be an object")
+        choices = data.get("choices") or []
+        if not isinstance(choices, list):
+            raise ValueError("Provider JSON 'choices' must be a list")
+        c0 = choices[0] if choices else {}
+        if not isinstance(c0, Mapping):
+            raise ValueError("Provider JSON choice entry must be an object")
+        msg = c0.get("message") or {}
+        if not isinstance(msg, Mapping):
+            raise ValueError("Provider JSON 'message' must be an object")
+        text = str(msg.get("content") or "")
+        fr = c0.get("finish_reason")
+        finish_reason = str(fr) if fr is not None else None
+        return text, finish_reason, normalize_usage(data.get("usage"))
+
     async def _parse_sse(
         self,
         resp: httpx.Response,
@@ -609,11 +627,20 @@ class ProviderAdapter:
                             if first_byte_ms is None:
                                 first_byte_ms = self.clock_ms()
 
-                        text, finish_reason, raw_usage = await self._parse_sse(resp, _mark_first)
-                        complete_ms = self.clock_ms()
-                        if first_byte_ms is None:
-                            first_byte_ms = complete_ms
-                        usage = normalize_usage(raw_usage)
+                        ctype = resp.headers.get("content-type", "").lower()
+                        if "application/json" in ctype and "text/event-stream" not in ctype:
+                            await resp.aread()
+                            first_byte_ms = self.clock_ms()
+                            complete_ms = first_byte_ms
+                            text, finish_reason, usage = self._parse_chat_json(resp.json())
+                        else:
+                            text, finish_reason, raw_usage = await self._parse_sse(
+                                resp, _mark_first
+                            )
+                            complete_ms = self.clock_ms()
+                            if first_byte_ms is None:
+                                first_byte_ms = complete_ms
+                            usage = normalize_usage(raw_usage)
                 else:
                     resp = await client.post(url, json=payload, headers=headers, timeout=timeout_s)
                     first_byte_ms = self.clock_ms()
@@ -625,23 +652,8 @@ class ProviderAdapter:
                         else:
                             self._half_open_in_flight = False
                         raise ProviderError(f"Provider returned HTTP {resp.status_code}")
-                    data = resp.json()
-                    if not isinstance(data, Mapping):
-                        raise ValueError("Provider JSON response must be an object")
                     complete_ms = self.clock_ms()
-                    choices = data.get("choices") or []
-                    if not isinstance(choices, list):
-                        raise ValueError("Provider JSON 'choices' must be a list")
-                    c0 = choices[0] if choices else {}
-                    if not isinstance(c0, Mapping):
-                        raise ValueError("Provider JSON choice entry must be an object")
-                    msg = c0.get("message") or {}
-                    if not isinstance(msg, Mapping):
-                        raise ValueError("Provider JSON 'message' must be an object")
-                    text = str(msg.get("content") or "")
-                    fr = c0.get("finish_reason")
-                    finish_reason = str(fr) if fr is not None else None
-                    usage = normalize_usage(data.get("usage"))
+                    text, finish_reason, usage = self._parse_chat_json(resp.json())
             self._record_success()
             return GenerationResponse(
                 egress_id=egress_id,

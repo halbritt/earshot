@@ -541,7 +541,7 @@ def test_explain_silence_diff_runs_report_and_cli(
         report = build_session_report(store, "s-tel", "run-a")
         assert report.consent_basis == "stated"
         assert report.displayed_card_count == 1
-        assert report.budget_compliant is False  # 1 card in 1 min = 10 cards/10min > 3
+        assert report.budget_compliant is True  # 1 proactive card in 10-min window <= cap 3
         assert report.latency_by_route["template"]["time_to_ready_ms"]["p50"] == 30.0
         assert report.latency_by_route["template"]["time_to_display_ms"]["p50"] == 500.0
         assert report.upstream_delay_ms["p50"] == 100.0
@@ -713,3 +713,115 @@ def test_invariants_custom_recipient_manual_speaker_order_and_bucket_edge_cases(
         rep_pinned = check_conservation_invariants(store, "s-tel", "r-fail")
         assert not rep_pinned.passed
         assert not rep_pinned.checks["inv_4_displayed_has_closing"]
+
+
+def test_build_session_report_sliding_window_budget_compliance(tmp_path: Path) -> None:
+    def _run_case(run_id: str, display_times: list[int]) -> bool:
+        brief = _brief("s-budget")
+        with SQLiteStore(tmp_path / f"{run_id}.db") as store:
+            store.upsert_session(
+                brief=brief,
+                run_id=run_id,
+                runtime_mode=Mode.PROACTIVE,
+                effective_max_cards_per_10_min=2,
+                health_timeline=[{"at_ms": 0, "state": "ok"}],
+                reducer_counters={"duplicate": 0},
+                revision_history=[(f"seg-{idx}", 1) for idx in range(len(display_times))],
+                started_ms=0,
+                ended_ms=display_times[-1] + 10_000,
+            )
+            for idx, disp_ms in enumerate(display_times):
+                seg_id = f"seg-{idx}"
+                cid = f"c-{idx}"
+                sid = f"sug-{idx}"
+                rx_ms = disp_ms - 500
+                store.record_canonical_event(
+                    run_id=run_id,
+                    event=_seg_event(
+                        "s-budget",
+                        f"ev-{idx}",
+                        seg_id,
+                        start_ms=rx_ms - 1000,
+                        end_ms=rx_ms - 100,
+                        received_ms=rx_ms,
+                        seq=idx + 1,
+                    ),
+                    retention=brief.retention,
+                    canonical_revision=1,
+                )
+                store.record_decision(
+                    run_id=run_id,
+                    context=_ctx("s-budget", cid, seg_id, rx_ms),
+                    terminal_state="dismissed",
+                    terminal_reason=ReasonCode.USER_ACTION,
+                    classifier=ClassifierResult(
+                        1,
+                        cid,
+                        1,
+                        "rules-v0",
+                        ScoreSet(0.9, {"CONFIRM_OWNER": 0.9}),
+                        "cal-v0",
+                        ScoreSet(0.86, {"CONFIRM_OWNER": 0.86}),
+                        10,
+                        (SegmentRef(seg_id, 1),),
+                    ),
+                    routing=RoutingDecision(
+                        1,
+                        cid,
+                        "policy-v0-a",
+                        "psha",
+                        1,
+                        Outcome.ROUTE,
+                        Route.TEMPLATE,
+                        Category.CONFIRM_OWNER,
+                        (ReasonCode.ABOVE_T_DISPLAY,),
+                        (),
+                        {"t_low": 0.2, "t_compute": 0.5, "t_display": 0.75},
+                        rx_ms + 20,
+                    ),
+                )
+                store.record_suggestion(
+                    session_id="s-budget",
+                    run_id=run_id,
+                    suggestion=SuggestionCandidate(
+                        1,
+                        sid,
+                        cid,
+                        Origin.PROACTIVE,
+                        Category.CONFIRM_OWNER,
+                        Route.TEMPLATE,
+                        "Who owns rollback?",
+                        3,
+                        1,
+                        (SegmentRef(seg_id, 1),),
+                        "confirm_owner_v1",
+                        {},
+                        rx_ms + 30,
+                        rx_ms + 8000,
+                    ),
+                )
+                for le in (
+                    LedgerEvent(
+                        1,
+                        f"le-d-{idx}",
+                        sid,
+                        LedgerState.DISPLAYED,
+                        ReasonCode.BOUNDARY_AFTER_SETTLE,
+                        disp_ms,
+                    ),
+                    LedgerEvent(
+                        1,
+                        f"le-x-{idx}",
+                        sid,
+                        LedgerState.DISMISSED,
+                        ReasonCode.USER_ACTION,
+                        disp_ms + 500,
+                    ),
+                ):
+                    store.record_ledger_event(session_id="s-budget", run_id=run_id, event=le)
+            report = build_session_report(store, "s-budget", run_id)
+            assert report.displayed_card_count == len(display_times)
+            return report.budget_compliant
+
+    assert _run_case("over-cap", [10_000, 100_000, 610_000]) is False
+    assert _run_case("spaced-out", [10_000, 610_001, 1_210_002]) is True

@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
 
 from coach.context_builder import BUILDER_VERSION, PREFILTER_VERSION, ContextBuildResult
 from coach.contracts import (
@@ -336,6 +335,8 @@ def _fit_single_platt_head(
     x_arr = np.asarray(
         [_to_logit_input(s, input_space) for s in raw_scores], dtype=np.float64
     ).reshape(-1, 1)
+    from sklearn.linear_model import LogisticRegression
+
     # §5.5 / §12.5: natural prevalence only — never apply class_weight in calibration.
     lr = LogisticRegression(C=float(c_reg), class_weight=None, solver="lbfgs", max_iter=1000)
     lr.fit(x_arr, y_arr)
@@ -727,10 +728,55 @@ BUILTIN_CAL_V0_RULES = CalibrationModel(
     heads=_builtin_heads_v0(),
 )
 
+BUILTIN_CAL_V0_RULES_PLATT = CalibrationModel(
+    calibration_version="rules_v0-platt-v0-a",
+    classifier_version="rules_v0",
+    builder_version=BUILDER_VERSION,
+    prefilter_version=PREFILTER_VERSION,
+    mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+    heads=_builtin_heads_v0(),
+)
+
+BUILTIN_CAL_V0_READOUT_PLATT = CalibrationModel(
+    calibration_version="readout_v0-platt-v0-a",
+    classifier_version="readout_v0",
+    builder_version=BUILDER_VERSION,
+    prefilter_version=PREFILTER_VERSION,
+    mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+    heads=_builtin_heads_v0(),
+)
+
+BUILTIN_CAL_V0_LLM_PLATT_V0A = CalibrationModel(
+    calibration_version="llm_baseline_v0-platt-v0-a",
+    classifier_version="llm_baseline_v0",
+    builder_version=BUILDER_VERSION,
+    prefilter_version=PREFILTER_VERSION,
+    mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+    heads=_builtin_heads_v0(),
+)
+
+BUILTIN_CAL_V0_LLM_PLATT = CalibrationModel(
+    calibration_version="llm_baseline_v0-platt",
+    classifier_version="llm_baseline_v0",
+    builder_version=BUILDER_VERSION,
+    prefilter_version=PREFILTER_VERSION,
+    mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+    heads=_builtin_heads_v0(),
+)
+
 
 def default_calibration_registry() -> CalibrationRegistry:
     """Return built-in CalibrationRegistry matching shipped policy-v0-a.yaml."""
-    return CalibrationRegistry([BUILTIN_CAL_V0_TECHNICAL, BUILTIN_CAL_V0_RULES])
+    return CalibrationRegistry(
+        [
+            BUILTIN_CAL_V0_TECHNICAL,
+            BUILTIN_CAL_V0_RULES,
+            BUILTIN_CAL_V0_RULES_PLATT,
+            BUILTIN_CAL_V0_READOUT_PLATT,
+            BUILTIN_CAL_V0_LLM_PLATT_V0A,
+            BUILTIN_CAL_V0_LLM_PLATT,
+        ]
+    )
 
 
 def default_calibration_metadata() -> dict[str, dict[str, str]]:

@@ -26,6 +26,7 @@ from coach.context_builder import (
     _p_float,
     _p_int,
     _p_map,
+    _p_opt_str,
     _p_str,
     compute_policy_sha256,
     effective_max_cards_per_10_min,
@@ -124,8 +125,6 @@ _CONTENT_STOPWORDS: frozenset[str] = frozenset(
         "which",
         "and",
         "or",
-        "need",
-        "needs",
     }
 )
 
@@ -168,6 +167,8 @@ def _build_policy_with_null_calibration(
         max_candidates_per_job=_p_int(
             cls_m.get("max_candidates_per_job"), "classifier.max_candidates_per_job", minimum=1
         ),
+        model_path=_p_opt_str(cls_m.get("model_path"), "classifier.model_path"),
+        calibration_path=_p_opt_str(cls_m.get("calibration_path"), "classifier.calibration_path"),
     )
 
     cats_m = _p_map(m.get("categories"), "policy.categories")
@@ -221,6 +222,11 @@ def _build_policy_with_null_calibration(
     )
 
     gen_m = _p_map(m.get("generator"), "policy.generator")
+    for bad_secret in ("api_key", "secret", "token", "password"):
+        if bad_secret in gen_m:
+            raise PolicyConfigError(
+                f"generator.{bad_secret} is forbidden in policy YAML (§14.6); use api_key_env"
+            )
     brk_m = _p_map(gen_m.get("breaker"), "generator.breaker")
     generator = GeneratorPolicy(
         enabled=_p_bool(gen_m.get("enabled"), "generator.enabled"),
@@ -232,6 +238,11 @@ def _build_policy_with_null_calibration(
             ),
             open_ms=_p_int(brk_m.get("open_ms"), "breaker.open_ms", minimum=1),
         ),
+        provider=_p_opt_str(gen_m.get("provider"), "generator.provider"),
+        model_id=_p_opt_str(gen_m.get("model_id"), "generator.model_id"),
+        reasoning=_p_opt_str(gen_m.get("reasoning"), "generator.reasoning"),
+        api_key_env=_p_opt_str(gen_m.get("api_key_env"), "generator.api_key_env"),
+        base_url=_p_opt_str(gen_m.get("base_url"), "generator.base_url"),
     )
     abs_m = _p_map(m.get("abstain"), "policy.abstain")
     floor_raw = abs_m.get("asr_confidence_floor")

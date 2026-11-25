@@ -13,12 +13,15 @@ import time
 import uuid
 import wave
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from coach.annotation_tool import (
     AnnotationServer,
+    BlindRetestSession,
     Pass1Session,
     Pass2Session,
     build_pass2_items,
@@ -39,6 +42,8 @@ from coach.canonical_state import CanonicalState
 from coach.context_builder import PolicyConfig, build_decision_contexts
 from coach.contracts import (
     PREDICTABLE_CATEGORIES,
+    AnnotationPass,
+    AttentionConfig,
     CanonicalEvent,
     Category,
     ClassifierResult,
@@ -46,25 +51,30 @@ from coach.contracts import (
     HealthState,
     LabelRecord,
     Mode,
+    NoneReason,
     Origin,
+    RecipientConfig,
+    RetentionConfig,
     Route,
     SampleSource,
     SegmentRef,
     SessionBrief,
     SessionMode,
     Stability,
+    ValidityInterval,
 )
 from coach.opportunity_classifier import (
     ClassifierInput,
     HashedTfidfEmbedder,
     HuggingFaceEmbedder,
     OllamaEmbedder,
+    OpenAICompatibleConfig,
     TextEmbedder,
     create_classifier,
     fit_embed_logreg,
     train_modernbert,
 )
-from coach.provider_adapter import ProviderAdapter, ProviderConfig
+from coach.provider_adapter import ProviderAdapter, ProviderConfig, ProviderError
 from coach.replay_evaluator import (
     DisplayedCardEvent,
     EvalLookCounter,
@@ -132,11 +142,24 @@ def _load_brief_file(path: str | Path) -> SessionBrief:
     return SessionBrief.from_dict(raw)
 
 
+def _synthesize_default_brief(session_id: str) -> SessionBrief:
+    return SessionBrief(
+        schema_version=1,
+        session_id=session_id,
+        objective="Verify session objectives and open action items.",
+        recipient=RecipientConfig(participant_id="ME", role="participant"),
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        retention=RetentionConfig(),
+        attention=AttentionConfig(max_cards_per_10_min=3, proactive=True),
+    )
+
+
 def _load_session_source(
     session_path: str | Path,
     *,
     brief_path: str | Path | None = None,
     run_id: str | None = None,
+    allow_default_brief: bool = False,
 ) -> tuple[SessionBrief, list[CanonicalEvent]]:
     src = Path(session_path)
     brief_override = _load_brief_file(brief_path) if brief_path is not None else None
@@ -159,6 +182,8 @@ def _load_session_source(
             brief = brief_override
             if brief is None and sess_row is not None and sess_row.get("brief_json"):
                 brief = SessionBrief.from_dict(json.loads(str(sess_row["brief_json"])))
+            if brief is None and allow_default_brief:
+                brief = _synthesize_default_brief(sid)
             if brief is None:
                 raise SystemExit(f"Database session {sid!r} lacks brief_json; pass --brief")
             events: list[CanonicalEvent] = []
@@ -169,6 +194,9 @@ def _load_session_source(
 
     loaded_brief, events = import_events_jsonl(src)
     brief = brief_override or loaded_brief
+    if brief is None and allow_default_brief:
+        sid = events[0].session_id if events else "session-001"
+        brief = _synthesize_default_brief(sid)
     if brief is None:
         raise SystemExit(f"Session {src} has no SessionBrief header; pass --brief")
     return brief, events
@@ -179,8 +207,15 @@ def _load_policy_and_cal(
     *,
     calibration_path: str | Path | None = None,
 ) -> tuple[PolicyConfig, CalibrationModel | CalibrationRegistry | None]:
-    if calibration_path is not None:
-        cal_model = CalibrationModel.load(calibration_path)
+    effective_cal_path: str | Path | None = calibration_path
+    if effective_cal_path is None:
+        raw_yaml = yaml.safe_load(Path(policy_path).read_text(encoding="utf-8"))
+        if isinstance(raw_yaml, Mapping) and isinstance(raw_yaml.get("classifier"), Mapping):
+            cp = raw_yaml["classifier"].get("calibration_path")
+            if isinstance(cp, str) and cp.strip():
+                effective_cal_path = cp.strip()
+    if effective_cal_path is not None:
+        cal_model = CalibrationModel.load(effective_cal_path)
         policy = load_policy(
             policy_path,
             calibration_metadata=cal_model.to_metadata(),
@@ -219,7 +254,7 @@ def _make_binder_from_env(brief: SessionBrief) -> RecipientBinder:
     binder = RecipientBinder(session_id=brief.session_id, config=cfg)
     raw_dir = os.environ.get("COACH_EARSHOT_DIRECTION_JSON", "").strip()
     if raw_dir:
-        if raw_dir.startswith("{") or "\n" in raw_dir:
+        if raw_dir.startswith("{") or raw_dir.startswith("[") or "\n" in raw_dir:
             binder.feed_direction_jsonl(raw_dir)
         else:
             p = Path(raw_dir)
@@ -233,12 +268,34 @@ def _create_classifier_from_args(
     model_dir: str | None,
     *,
     clock_ms: Callable[[], int] | None = None,
+    local_only: bool = False,
 ) -> Any:
     kwargs: dict[str, Any] = {}
     if model_dir is not None:
         kwargs["model_dir"] = model_dir
     if clock_ms is not None:
         kwargs["clock_ms"] = clock_ms
+    key = clf_name.strip()
+    if (
+        key == "readout_v0"
+        or key.startswith("readout_v0:")
+        or key == "llm_baseline_v0"
+        or key.startswith("llm_baseline_v0:")
+    ):
+        base_url = (
+            os.environ.get("COACH_OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or "http://127.0.0.1:8080/v1"
+        )
+        model_id = key.split(":", 1)[1] if ":" in key else "mock-model"
+        api_key_env = "OPENAI_API_KEY" if os.environ.get("OPENAI_API_KEY") else None
+        kwargs["config"] = OpenAICompatibleConfig(
+            provider="openai-compat",
+            base_url=base_url,
+            model_id=model_id,
+            api_key_env=api_key_env,
+            local_only=bool(local_only),
+        )
     return create_classifier(clf_name, **kwargs)
 
 
@@ -248,20 +305,51 @@ def _make_provider_from_args(
     *,
     clock_ms: Callable[[], int] | None = None,
 ) -> ProviderAdapter | None:
-    if not args.provider_base_url or not args.provider_model:
+    env_base_url = (
+        os.environ.get("COACH_OPENAI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or None
+    )
+    base_url = args.provider_base_url or policy.generator.base_url or env_base_url
+    has_policy_gen_cfg = (
+        policy.generator.provider is not None or policy.generator.model_id is not None
+    )
+    if not (args.provider_base_url and args.provider_model) and not (
+        policy.generator.enabled and (base_url is not None or has_policy_gen_cfg)
+    ):
         return None
+    provider_name = policy.generator.provider or args.provider_name
+    model_id = (
+        args.provider_model
+        or policy.generator.model_id
+        or ("gpt-6-luna" if provider_name == "hosted" else "qwen3.8-27b")
+    )
+    api_key_env = (
+        args.provider_api_key_env
+        or policy.generator.api_key_env
+        or ("OPENAI_API_KEY" if os.environ.get("OPENAI_API_KEY") else None)
+    )
+    is_hosted: bool | None = None
+    if provider_name == "hosted":
+        is_hosted = True
+    elif provider_name in {"local", "llama_cpp", "ollama"}:
+        is_hosted = False
     p_cfg = ProviderConfig(
-        provider=args.provider_name,
-        base_url=args.provider_base_url,
-        model_id=args.provider_model,
-        api_key_env=args.provider_api_key_env,
+        provider=provider_name,
+        base_url=base_url or "https://api.openai.com/v1",
+        model_id=model_id,
+        api_key_env=api_key_env,
+        reasoning_setting=policy.generator.reasoning,
+        is_hosted=is_hosted,
         local_only=bool(args.local_only),
         breaker_consecutive_failures=policy.generator.breaker.consecutive_failures,
         breaker_open_ms=policy.generator.breaker.open_ms,
     )
-    if clock_ms is not None:
-        return ProviderAdapter(config=p_cfg, clock_ms=clock_ms)
-    return ProviderAdapter(config=p_cfg)
+    try:
+        if clock_ms is not None:
+            return ProviderAdapter(config=p_cfg, clock_ms=clock_ms)
+        return ProviderAdapter(config=p_cfg)
+    except (ProviderError, ValueError) as exc:
+        print(f"Provider startup capability validation failed: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 def _displayed_cards_from_store(
@@ -338,13 +426,44 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 
 def _cmd_diff(args: argparse.Namespace) -> int:
     with SQLiteStore(args.db) as store:
-        diff = diff_runs(store, args.run_a, args.run_b, session_id=args.session)
-        payload = diff.to_dict()
+        runs = store.list_runs()
+        common_sessions = sorted(
+            {str(r["session_id"]) for r in runs if r["run_id"] == args.run_a}
+            & {str(r["session_id"]) for r in runs if r["run_id"] == args.run_b}
+        )
+        if args.session is not None or len(common_sessions) <= 1:
+            diff = diff_runs(store, args.run_a, args.run_b, session_id=args.session)
+            payload = diff.to_dict()
+            target_sessions = [diff.session_id]
+            summary_label = diff.session_id
+            n_gained, n_lost, n_changed = len(diff.gained), len(diff.lost), len(diff.changed)
+        else:
+            diffs = [
+                diff_runs(store, args.run_a, args.run_b, session_id=sid) for sid in common_sessions
+            ]
+            diff_dicts = [d.to_dict() for d in diffs]
+            payload = {
+                "run_a": args.run_a,
+                "run_b": args.run_b,
+                "sessions": diff_dicts,
+                "gained": [e for dd in diff_dicts for e in dd["gained"]],
+                "lost": [e for dd in diff_dicts for e in dd["lost"]],
+                "changed": [e for dd in diff_dicts for e in dd["changed"]],
+            }
+            target_sessions = common_sessions
+            summary_label = f"{len(common_sessions)} sessions"
+            n_gained = len(payload["gained"])
+            n_lost = len(payload["lost"])
+            n_changed = len(payload["changed"])
+
         if args.labels or args.bootstrap:
             labels = load_labels_jsonl(args.labels) if args.labels else []
-            cards_a = _displayed_cards_from_store(store, diff.session_id, args.run_a)
-            cards_b = _displayed_cards_from_store(store, diff.session_id, args.run_b)
-            payload["bootstrap"] = paired_conversation_bootstrap(
+            cards_a: list[DisplayedCardEvent] = []
+            cards_b: list[DisplayedCardEvent] = []
+            for sid in target_sessions:
+                cards_a.extend(_displayed_cards_from_store(store, sid, args.run_a))
+                cards_b.extend(_displayed_cards_from_store(store, sid, args.run_b))
+            boot_res = paired_conversation_bootstrap(
                 cards_a,
                 cards_b,
                 labels,
@@ -352,9 +471,11 @@ def _cmd_diff(args: argparse.Namespace) -> int:
                 n_resamples=args.n_resamples,
                 seed=args.seed,
             )
+            payload["bootstrap"] = boot_res
+            payload["paired_bootstrap"] = boot_res
     lines = [
-        f"Diff for {diff.session_id}: {diff.run_a} -> {diff.run_b}",
-        f"Gained: {len(diff.gained)} | Lost: {len(diff.lost)} | Changed: {len(diff.changed)}",
+        f"Diff for {summary_label}: {args.run_a} -> {args.run_b}",
+        f"Gained: {n_gained} | Lost: {n_lost} | Changed: {n_changed}",
     ]
     _emit_output(payload, as_json=args.json, summary_lines=lines)
     return 0
@@ -448,11 +569,25 @@ async def _advance_replay_timers(controller: SuggestionController, clock: Manual
         await controller.drain()
 
 
+def _recorder_maxsize_from_env() -> int:
+    raw = (
+        os.environ.get("COACH_RECORDER_MAXSIZE")
+        or os.environ.get("COACH_RECORDER_BUFFER_SIZE")
+        or "1024"
+    )
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1024
+
+
 async def _serve_async(args: argparse.Namespace) -> int:
     brief = _load_brief_file(args.brief)
     policy, cal_obj = _load_policy_and_cal(args.policy, calibration_path=args.calibration)
+    stream_file = args.stream_file or getattr(args, "session", None)
+    args.stream_file = stream_file
     is_file_source = args.source in {"replay", "deepgram"} or (
-        args.source == "peecee" and bool(args.stream_file)
+        args.source == "peecee" and bool(stream_file)
     )
     clock: Clock
     if is_file_source:
@@ -460,17 +595,24 @@ async def _serve_async(args: argparse.Namespace) -> int:
     else:
         clock = MonotonicSessionClock(0)
     clf_name = args.classifier or policy.classifier.version
-    clf = _create_classifier_from_args(clf_name, args.classifier_model_dir, clock_ms=clock.now_ms)
+    model_dir = args.classifier_model_dir or policy.classifier.model_path
+    clf = _create_classifier_from_args(
+        clf_name,
+        model_dir,
+        clock_ms=clock.now_ms,
+        local_only=bool(args.local_only),
+    )
     provider = _make_provider_from_args(args, policy, clock_ms=clock.now_ms)
     mode = Mode(args.mode)
     run_id = args.run_id or f"serve-{uuid.uuid4().hex[:10]}"
 
     with SQLiteStore(args.db) as store:
-        rec_buf = BoundedRecorderBuffer()
+        rec_buf = BoundedRecorderBuffer(maxsize=_recorder_maxsize_from_env())
         ui_server = CardUIServer(
             session_id=brief.session_id,
             port=args.ui_port,
             session_token=args.ui_token,
+            emit_card_events=True,
         )
         controller = SuggestionController(
             brief=brief,
@@ -624,10 +766,61 @@ async def _run_serve_source(
                 await controller.submit_event(ev)
         return
 
-    # Realtime peecee WS source
-    ws_url = args.ws_url or DEFAULT_WS_URL
-    exe_path = Path(args.peecee_cmd) if args.peecee_cmd else DEFAULT_PEECEE_SCRIPT
-    should_spawn = bool(args.peecee_cmd) or (args.ws_url is None and exe_path.exists())
+    # Peecee source: offline WAV transcription vs realtime WS
+    env_ws_url = (
+        os.environ.get("COACH_PEECEE_WS_URL")
+        or os.environ.get("PEECEE_WS_URL")
+        or os.environ.get("COACH_NEMO_WS_URL")
+        or os.environ.get("NEMO_WS_URL")
+        or None
+    )
+    env_peecee_bin = (
+        os.environ.get("COACH_PEECEE_BIN") or os.environ.get("PEECEE_SPEECH_BIN") or None
+    )
+    exe_path = (
+        Path(args.peecee_cmd)
+        if args.peecee_cmd
+        else (Path(env_peecee_bin) if env_peecee_bin else DEFAULT_PEECEE_SCRIPT)
+    )
+    raw_sink = _StoreRawSink(store, controller.run_id, controller, brief)
+    if args.audio_wav and args.ws_url is None and env_ws_url is None:
+        proc_off = await asyncio.create_subprocess_exec(
+            str(exe_path),
+            str(args.audio_wav),
+            "en-US",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await proc_off.communicate()
+        if proc_off.returncode != 0:
+            err_msg = stderr_b.decode("utf-8", errors="replace").strip()
+            reason = (
+                "peecee_lease_unavailable" if proc_off.returncode == 75 else "peecee_process_failed"
+            )
+            await controller.report_adapter_health(
+                HealthState.NO_TRANSCRIPT,
+                reason,
+                {"returncode": proc_off.returncode, "stderr": err_msg},
+            )
+            return
+        raw_text = stdout_b.decode("utf-8")
+        raw_sink.record_raw(
+            session_id=brief.session_id,
+            source_id="peecee-offline",
+            received_ms=clock.now_ms(),
+            payload=raw_text,
+        )
+        for ev in parse_nemo_offline_json(raw_text, session_id=brief.session_id, binder=binder):
+            if stop_event.is_set():
+                break
+            _sync_serve_clock(clock, ev.received_ms)
+            await controller.submit_event(ev)
+        return
+
+    ws_url = args.ws_url or env_ws_url or DEFAULT_WS_URL
+    should_spawn = bool(args.peecee_cmd or env_peecee_bin) or (
+        args.ws_url is None and env_ws_url is None and exe_path.exists()
+    )
     pc_cfg = PeeceeConfig(ws_url=ws_url, executable=exe_path)
     proc = (
         PeeceeSpeechProcess(
@@ -640,7 +833,6 @@ async def _run_serve_source(
         else None
     )
     segmenter = NemotronSegmenter(session_id=brief.session_id, binder=binder)
-    raw_sink = _StoreRawSink(store, controller.run_id, controller, brief)
     adapter = PeeceeRealtimeAdapter(
         session_id=brief.session_id,
         config=pc_cfg,
@@ -681,103 +873,228 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return asyncio.run(_serve_async(args))
 
 
+def _try_load_dataset_rows(session_path: str | Path) -> list[dict[str, Any]] | None:
+    src = Path(session_path)
+    if src.suffix in {".db", ".sqlite", ".sqlite3"} or not src.is_file():
+        return None
+    rows: list[dict[str, Any]] = []
+    for raw in src.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        obj = json.loads(stripped)
+        if not isinstance(obj, Mapping):
+            return None
+        if not rows and ("candidate_id" not in obj or "kind" in obj):
+            return None
+        rows.append(dict(obj))
+    return rows if rows else None
+
+
+def _pace_replay_events(events: Sequence[CanonicalEvent], speed_arg: str | None) -> None:
+    if speed_arg is None or str(speed_arg).strip().lower() == "stepped":
+        return
+    speed = float(speed_arg)
+    if speed <= 0.0:
+        raise SystemExit(f"--speed must be > 0 or 'stepped', got {speed_arg!r}")
+    ordered = sorted(events, key=lambda ev: (ev.received_ms, ev.source_sequence, ev.event_id))
+    prev_ms: int | None = None
+    for ev in ordered:
+        if prev_ms is not None and ev.received_ms > prev_ms:
+            time.sleep((ev.received_ms - prev_ms) / 1000.0 / speed)
+        prev_ms = ev.received_ms
+
+
+def _load_replay_events(
+    args: argparse.Namespace,
+    policy: PolicyConfig,
+) -> tuple[SessionBrief, list[CanonicalEvent]]:
+    source = getattr(args, "source", "canonical")
+    if source == "deepgram":
+        if not args.brief:
+            raise SystemExit("--source deepgram requires --brief")
+        brief = _load_brief_file(args.brief)
+        norm = DeepgramNormalizer(
+            session_id=brief.session_id,
+            confidence_floor=policy.abstain.asr_confidence_floor,
+        )
+        events: list[CanonicalEvent] = []
+        for line_no, raw in enumerate(
+            Path(args.session).read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            obj = json.loads(stripped)
+            rx_ms = int(obj.get("received_ms", line_no * 200))
+            events.extend(norm.normalize(obj, rx_ms))
+        return brief, events
+    if source == "peecee" and Path(args.session).suffix == ".json":
+        if not args.brief:
+            raise SystemExit("--source peecee JSON requires --brief")
+        brief = _load_brief_file(args.brief)
+        binder = _make_binder_from_env(brief)
+        raw_text = Path(args.session).read_text(encoding="utf-8")
+        return brief, parse_nemo_offline_json(raw_text, session_id=brief.session_id, binder=binder)
+    return _load_session_source(args.session, brief_path=args.brief, run_id=args.run_id)
+
+
 def _cmd_replay(args: argparse.Namespace) -> int:
-    brief, events = _load_session_source(args.session, brief_path=args.brief, run_id=args.run_id)
     policy, cal_obj = _load_policy_and_cal(args.policy, calibration_path=args.calibration)
+    run_id = args.run_id or f"replay-{uuid.uuid4().hex[:10]}"
+    dataset_rows = _try_load_dataset_rows(args.session)
+    if dataset_rows is not None:
+        split_mode = args.split_by or "conversation"
+        splits = (
+            split_by_series(dataset_rows)
+            if split_mode == "series"
+            else split_by_conversation(dataset_rows)
+        )
+        payload: dict[str, Any] = {
+            "run_id": run_id,
+            "n_rows": len(dataset_rows),
+            "splits": splits.to_dict(),
+        }
+        if args.eval_log:
+            looks = EvalLookCounter(args.eval_log).record_look(
+                run_id, split_by=split_mode, eval_conversations=splits.eval_conversations
+            )
+            payload["look_count"] = looks
+            payload["eval_look_count"] = looks
+        _emit_output(
+            payload,
+            as_json=args.json,
+            summary_lines=[f"Dataset split ({split_mode}): {len(dataset_rows)} rows"],
+        )
+        return 0
+
+    brief, events = _load_replay_events(args, policy)
     clf_name = args.classifier or policy.classifier.version
-    clf = _create_classifier_from_args(clf_name, args.classifier_model_dir)
+    model_dir = args.classifier_model_dir or policy.classifier.model_path
+    clf = _create_classifier_from_args(clf_name, model_dir, local_only=bool(args.local_only))
     provider = _make_provider_from_args(args, policy)
     mode = Mode(args.mode)
-    run_id = args.run_id or f"replay-{uuid.uuid4().hex[:10]}"
+    _ = _recorder_maxsize_from_env()
+    _pace_replay_events(events, args.speed)
 
-    with SQLiteStore(args.db) as store:
-        res = simulate_replay(
-            brief,
-            events,
-            policy,
-            clf,
-            calibration=cal_obj,
-            store=store,
-            run_id=run_id,
-            mode=mode,
-            provider=provider,
-            simulated_latency_ms=args.simulated_latency_ms,
-            cache_classifier=not args.no_cache,
-        )
-        inv = check_conservation_invariants(store, brief.session_id, run_id)
-        report = build_session_report(store, brief.session_id, run_id)
+    grouped_events: dict[str, list[CanonicalEvent]] = {}
+    for ev in events:
+        grouped_events.setdefault(ev.session_id, []).append(ev)
+    if not grouped_events:
+        grouped_events[brief.session_id] = []
 
-        payload: dict[str, Any] = {
-            "session_id": res.session_id,
-            "run_id": res.run_id,
-            "speed": args.speed,
-            "duration_ms": res.duration_ms,
-            "decisions_count": res.decisions_count,
-            "dropped_count": res.dropped_count,
-            "routed_count": res.routed_count,
-            "withdrawn_count": res.withdrawn_count,
-            "expired_count": res.expired_count,
-            "displayed_cards": [
-                {
-                    "suggestion_id": c.suggestion_id,
-                    "candidate_id": c.candidate_id,
-                    "category": str(c.category),
-                    "display_ms": c.display_ms,
-                    "text": c.text,
-                    "route": str(c.route),
-                    "origin": str(c.origin),
-                }
-                for c in res.displayed_cards
-            ],
-            "invariants": inv.to_dict(),
-            "report": report.to_dict(),
-        }
+    try:
+        with SQLiteStore(args.db) as store:
+            session_results = []
+            session_briefs: list[tuple[SessionBrief, list[CanonicalEvent]]] = []
+            for sid, sess_evs in grouped_events.items():
+                sess_brief = replace(brief, session_id=sid)
+                res_s = simulate_replay(
+                    sess_brief,
+                    sess_evs,
+                    policy,
+                    clf,
+                    calibration=cal_obj,
+                    store=store,
+                    run_id=run_id,
+                    mode=mode,
+                    provider=provider,
+                    simulated_latency_ms=args.simulated_latency_ms,
+                    cache_classifier=not args.no_cache,
+                )
+                session_results.append(res_s)
+                session_briefs.append((sess_brief, sess_evs))
 
-        labels: list[LabelRecord] = load_labels_jsonl(args.labels) if args.labels else []
-        if args.labels:
-            payload["evaluation"] = match_opportunities(
-                res.displayed_cards,
-                labels,
-                settle_ms=policy.display.settle_ms,
-                duration_ms=res.duration_ms,
-            )
-        if args.split_by:
-            split_items: Sequence[Any] = labels if labels else [brief]
-            splits = (
-                split_by_series(split_items)
-                if args.split_by == "series"
-                else split_by_conversation(split_items)
-            )
-            payload["splits"] = splits.to_dict()
-            eval_convs = splits.eval_conversations
-        else:
-            eval_convs = (brief.session_id,)
-        if args.eval_log:
-            payload["eval_look_count"] = EvalLookCounter(args.eval_log).record_look(
-                run_id,
-                split_by=args.split_by or "conversation",
-                eval_conversations=eval_convs,
-            )
-        if args.sweep_t_display:
-            t_vals = [float(x.strip()) for x in args.sweep_t_display.split(",") if x.strip()]
-            payload["sweep"] = sweep_t_display(
-                [(brief, events)],
-                labels,
-                policy,
-                clf,
-                t_vals,
-                calibration=cal_obj,
-                store=store,
-                simulated_latency_ms=args.simulated_latency_ms,
-            )
+            res = session_results[0]
+            all_cards = [c for r in session_results for c in r.displayed_cards]
+            total_dur_ms = sum(r.duration_ms for r in session_results)
+            invs = [
+                check_conservation_invariants(store, sb.session_id, run_id)
+                for sb, _ in session_briefs
+            ]
+            all_inv_passed = all(i.passed for i in invs)
+            inv = invs[0]
+            report = build_session_report(store, brief.session_id, run_id)
+
+            payload = {
+                "session_id": res.session_id,
+                "run_id": res.run_id,
+                "speed": args.speed if args.speed is not None else "stepped",
+                "duration_ms": total_dur_ms,
+                "decisions_count": sum(r.decisions_count for r in session_results),
+                "dropped_count": sum(r.dropped_count for r in session_results),
+                "routed_count": sum(r.routed_count for r in session_results),
+                "withdrawn_count": sum(r.withdrawn_count for r in session_results),
+                "expired_count": sum(r.expired_count for r in session_results),
+                "displayed_cards": [
+                    {
+                        "suggestion_id": c.suggestion_id,
+                        "candidate_id": c.candidate_id,
+                        "session_id": c.session_id,
+                        "category": str(c.category),
+                        "display_ms": c.display_ms,
+                        "text": c.text,
+                        "route": str(c.route),
+                        "origin": str(c.origin),
+                    }
+                    for c in all_cards
+                ],
+                "invariants": {**inv.to_dict(), "passed": all_inv_passed},
+                "report": report.to_dict(),
+            }
+
+            labels: list[LabelRecord] = load_labels_jsonl(args.labels) if args.labels else []
+            if args.labels:
+                payload["evaluation"] = match_opportunities(
+                    all_cards,
+                    labels,
+                    settle_ms=policy.display.settle_ms,
+                    duration_ms=total_dur_ms,
+                )
+            if args.split_by:
+                split_items: Sequence[Any] = labels if labels else [sb for sb, _ in session_briefs]
+                splits = (
+                    split_by_series(split_items)
+                    if args.split_by == "series"
+                    else split_by_conversation(split_items)
+                )
+                payload["splits"] = splits.to_dict()
+                eval_convs = splits.eval_conversations
+            else:
+                eval_convs = tuple(sb.session_id for sb, _ in session_briefs)
+            if args.eval_log:
+                looks = EvalLookCounter(args.eval_log).record_look(
+                    run_id,
+                    split_by=args.split_by or "conversation",
+                    eval_conversations=eval_convs,
+                )
+                payload["eval_look_count"] = looks
+                payload["look_count"] = looks
+            if args.sweep_t_display:
+                t_vals = [float(x.strip()) for x in args.sweep_t_display.split(",") if x.strip()]
+                sweep_res = sweep_t_display(
+                    session_briefs,
+                    labels,
+                    policy,
+                    clf,
+                    t_vals,
+                    calibration=cal_obj,
+                    store=store,
+                    simulated_latency_ms=args.simulated_latency_ms,
+                )
+                payload["sweep"] = sweep_res
+                payload["sweep_curve"] = sweep_res
+    finally:
+        if provider is not None:
+            asyncio.run(provider.aclose())
 
     lines = [
         f"Replay {res.session_id} (run={res.run_id}): "
-        f"decisions={res.decisions_count}, displayed={len(res.displayed_cards)}, "
-        f"invariants={inv.passed}"
+        f"decisions={payload['decisions_count']}, displayed={len(all_cards)}, "
+        f"invariants={all_inv_passed}"
     ]
     _emit_output(payload, as_json=args.json, summary_lines=lines)
-    return 0 if inv.passed else 2
+    return 0 if all_inv_passed else 2
 
 
 def _cmd_bench(args: argparse.Namespace) -> int:
@@ -844,6 +1161,27 @@ def _build_inputs_by_candidate_from_session(
     return brief, by_cand, by_seg
 
 
+_DECISION_CONTEXT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "candidate_id",
+        "session_id",
+        "origin",
+        "based_on_state_version",
+        "builder_version",
+        "prefilter_version",
+        "anchor_refs",
+        "context_refs",
+        "anchor_received_ms",
+        "display_by_ms",
+        "token_counts",
+        "omitted",
+        "flags",
+        "serialized_sha256",
+    }
+)
+
+
 def _load_training_rows(
     data_path: str | Path,
     *,
@@ -878,6 +1216,47 @@ def _load_training_rows(
                 ctx = DecisionContext.from_dict(obj["context"])
                 cin = ClassifierInput(context=ctx, serialized_text=str(obj["serialized_text"]))
                 lbl = LabelRecord.from_dict(obj["label"])
+                clf_res = (
+                    ClassifierResult.from_dict(obj["classifier_result"])
+                    if obj.get("classifier_result") is not None
+                    else None
+                )
+                train_examples.append((cin, lbl))
+                cal_rows.append((cin, clf_res, lbl))
+            elif "candidate_id" in obj and "serialized_text" in obj and "kind" not in obj:
+                ctx_payload = {k: v for k, v in obj.items() if k in _DECISION_CONTEXT_FIELDS}
+                ctx = DecisionContext.from_dict(ctx_payload)
+                cin = ClassifierInput(context=ctx, serialized_text=str(obj["serialized_text"]))
+                if "label" in obj and isinstance(obj["label"], Mapping):
+                    lbl = LabelRecord.from_dict(obj["label"])
+                else:
+                    worthwhile = bool(obj.get("worthwhile", False))
+                    raw_cats = obj.get("categories") or ()
+                    cats = tuple(Category(str(c)) for c in raw_cats) if worthwhile else ()
+                    src_str = str(obj.get("sample_source") or SampleSource.RANDOM.value)
+                    nr = (
+                        None
+                        if worthwhile
+                        else NoneReason(str(obj.get("none_reason") or NoneReason.NO_GAP.value))
+                    )
+                    lbl = LabelRecord(
+                        schema_version=1,
+                        label_id=str(obj.get("label_id") or f"lbl-{ctx.candidate_id}"),
+                        session_id=ctx.session_id,
+                        annotator=str(obj.get("annotator") or "dataset"),
+                        sample_source=SampleSource(src_str),
+                        annotation_pass=AnnotationPass.OFFLINE,
+                        candidate_id=ctx.candidate_id,
+                        state_version_at_decision=ctx.based_on_state_version,
+                        worthwhile=worthwhile,
+                        categories=cats,
+                        example_questions=tuple(
+                            str(q) for q in (obj.get("example_questions") or ()) if str(q).strip()
+                        ),
+                        evidence_refs=ctx.anchor_refs,
+                        validity=ValidityInterval(open_ms=ctx.anchor_received_ms),
+                        none_reason=nr,
+                    )
                 clf_res = (
                     ClassifierResult.from_dict(obj["classifier_result"])
                     if obj.get("classifier_result") is not None
@@ -970,6 +1349,25 @@ def _cmd_train(args: argparse.Namespace) -> int:
 
 
 def _cmd_calibrate(args: argparse.Namespace) -> int:
+    with Path(args.data).open("r", encoding="utf-8") as fh:
+        for line_no, raw in enumerate(fh, start=1):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            obj = json.loads(stripped)
+            if not isinstance(obj, Mapping):
+                raise SystemExit(f"Line {line_no} in {args.data} must be a JSON object")
+            raw_src = obj.get("sample_source")
+            if raw_src is None and isinstance(obj.get("label"), Mapping):
+                raw_src = obj["label"].get("sample_source")
+            if raw_src is not None and str(raw_src) != SampleSource.RANDOM.value:
+                print(
+                    f"Calibration rejected: calibration requires sample_source == 'random', "
+                    f"found {raw_src!r} at line {line_no}",
+                    file=sys.stderr,
+                )
+                return 2
+
     _, cal_rows, brief = _load_training_rows(
         args.data,
         session_path=args.session,
@@ -1015,11 +1413,15 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         print(f"Calibration rejected: {exc}", file=sys.stderr)
         return 2
 
-    saved_path = cal_model.save(args.out)
     calibrated_pairs = [
         (cal_model.calibrate(ctx, res, mode=session_mode), lbl) for ctx, res, lbl in fit_rows
     ]
     eval_rep = evaluate_calibration(calibrated_pairs)
+    out_data = cal_model.to_dict()
+    out_data["evaluation"] = eval_rep.to_dict()
+    saved_path = Path(args.out)
+    saved_path.parent.mkdir(parents=True, exist_ok=True)
+    saved_path.write_text(json.dumps(out_data, indent=2, sort_keys=True), encoding="utf-8")
     payload: dict[str, Any] = {
         "calibration_version": cal_model.calibration_version,
         "classifier_version": cal_model.classifier_version,
@@ -1036,7 +1438,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
 
 
 def _cmd_annotate(args: argparse.Namespace) -> int:
-    if args.kappa:
+    if args.kappa and not (args.session and args.out and not args.labels):
         first_path = args.labels or args.out
         if not first_path:
             raise SystemExit("--kappa requires --labels (or --out) with first-pass labels")
@@ -1055,12 +1457,30 @@ def _cmd_annotate(args: argparse.Namespace) -> int:
     if not args.out:
         raise SystemExit("annotate requires --out unless --kappa is passed")
 
-    brief, events = _load_session_source(args.session, brief_path=args.brief)
+    brief, events = _load_session_source(
+        args.session, brief_path=args.brief, allow_default_brief=True
+    )
+    if args.db and args.brief is None:
+        with SQLiteStore(args.db) as db_store:
+            runs = db_store.list_runs(brief.session_id)
+            if runs:
+                srow = db_store.get_session(brief.session_id, str(runs[-1]["run_id"]))
+                if srow is not None and srow.get("brief_json"):
+                    brief = SessionBrief.from_dict(json.loads(str(srow["brief_json"])))
     policy = load_policy(args.policy, allow_null_calibration=True) if args.policy else None
 
     pass1: Pass1Session | None = None
     pass2: Pass2Session | None = None
-    if args.pass_num == 1:
+    retest: BlindRetestSession | None = None
+    if args.kappa:
+        first_labels = load_labels_jsonl(args.kappa)
+        retest = BlindRetestSession(
+            first_labels=first_labels,
+            events=events,
+            annotator=args.annotator,
+            out_path=args.out,
+        )
+    elif args.pass_num == 1:
         pass1 = Pass1Session(
             brief=brief,
             events=events,
@@ -1070,21 +1490,69 @@ def _cmd_annotate(args: argparse.Namespace) -> int:
         )
     else:
         src = SampleSource(args.sample_source)
+        review_queue_ids: list[str] = []
         if args.review_queue:
             rq_raw = json.loads(Path(args.review_queue).read_text(encoding="utf-8"))
             rq_list = rq_raw.get("review_queue", rq_raw) if isinstance(rq_raw, Mapping) else rq_raw
             items = load_review_queue_items(
                 brief, events, rq_list, policy=policy, sample_source=src
             )
+            review_queue_ids = [it.candidate_id or it.item_id for it in items]
         else:
             items = build_pass2_items(brief, events, policy=policy, sample_source=src)
-        pass2 = Pass2Session(items=items, annotator=args.annotator, out_path=args.out)
+            if args.db:
+                with SQLiteStore(args.db) as db_store:
+                    runs = db_store.list_runs(brief.session_id)
+                    if runs:
+                        rid = str(runs[-1]["run_id"])
+                        rq_entries: list[dict[str, Any]] = []
+                        for sug in db_store.get_suggestions(brief.session_id, rid):
+                            trs = json.loads(str(sug["transitions_json"]))
+                            if any(
+                                isinstance(t, Mapping)
+                                and t.get("transition") in {"displayed", "shadow_displayed"}
+                                for t in trs
+                            ):
+                                rq_entries.append(
+                                    {
+                                        "suggestion_id": sug["suggestion_id"],
+                                        "candidate_id": sug["candidate_id"],
+                                        "evidence_refs": json.loads(str(sug["evidence_refs_json"])),
+                                        "text": sug.get("text"),
+                                        "category": sug.get("category"),
+                                    }
+                                )
+                        if rq_entries:
+                            rq_items = load_review_queue_items(
+                                brief,
+                                events,
+                                rq_entries,
+                                policy=policy,
+                                sample_source=SampleSource.SHADOW_REVIEW,
+                            )
+                            by_cand = {it.candidate_id: it for it in items if it.candidate_id}
+                            for rit in rq_items:
+                                if rit.candidate_id and rit.candidate_id in by_cand:
+                                    existing = by_cand[rit.candidate_id]
+                                    existing.suggested_question = rit.suggested_question
+                                    existing.suggested_category = rit.suggested_category
+                                    review_queue_ids.append(rit.candidate_id)
+                                else:
+                                    items.append(rit)
+                                    review_queue_ids.append(rit.candidate_id or rit.item_id)
+        pass2 = Pass2Session(
+            items=items,
+            annotator=args.annotator,
+            out_path=args.out,
+            review_queue_ids=review_queue_ids,
+        )
 
     server = AnnotationServer(
         port=args.port,
         session_token=args.ui_token,
         pass1=pass1,
         pass2=pass2,
+        retest=retest,
     )
     server.start()
     try:
@@ -1137,6 +1605,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--source", choices=["peecee", "deepgram", "replay"], default="peecee")
     p_serve.add_argument("--audio-wav", default=None, help="Optional 16kHz PCM WAV file to stream")
     p_serve.add_argument("--stream-file", default=None, help="Offline stream/JSONL file")
+    p_serve.add_argument(
+        "--session", default=None, help="Alias for --stream-file (offline stream/JSONL)"
+    )
     p_serve.add_argument("--ws-url", default=None, help="Realtime peecee-speech WebSocket URL")
     p_serve.add_argument("--peecee-cmd", default=None, help="Path to peecee-speech launcher")
     p_serve.add_argument("--ui-port", type=int, default=8765, help="Loopback UI port (0=ephemeral)")
@@ -1168,7 +1639,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep_play.add_argument("--policy", required=True, help="Path to policy YAML")
     p_rep_play.add_argument("--brief", default=None, help="Path to SessionBrief JSON")
     p_rep_play.add_argument("--db", default=":memory:", help="Output SQLite DB (default :memory:)")
-    p_rep_play.add_argument("--speed", default="1.0", help="Replay speed float or 'stepped'")
+    p_rep_play.add_argument(
+        "--source",
+        choices=["canonical", "replay", "deepgram", "peecee"],
+        default="canonical",
+        help="Input session format",
+    )
+    p_rep_play.add_argument("--speed", default=None, help="Replay speed float or 'stepped'")
     p_rep_play.add_argument("--labels", default=None, help="Path to LabelRecord JSONL")
     p_rep_play.add_argument("--split-by", choices=["conversation", "series"], default=None)
     p_rep_play.add_argument("--eval-log", default=None, help="Path to EvalLookCounter JSON")
@@ -1283,6 +1760,7 @@ def build_parser() -> argparse.ArgumentParser:
         "annotate", help="Run 2-pass locked annotation UI or kappa (§12.2–§12.4)"
     )
     p_ann.add_argument("--session", default=None, help="Session JSONL or DB path")
+    p_ann.add_argument("--db", default=None, help="Optional SQLite WAL database")
     p_ann.add_argument("--out", default=None, help="Output LabelRecord JSONL path")
     p_ann.add_argument("--port", type=int, default=8766, help="Loopback HTTP port (0=ephemeral)")
     p_ann.add_argument("--pass", dest="pass_num", type=int, choices=[1, 2], default=2)

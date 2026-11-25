@@ -273,8 +273,28 @@ class PeeceeConfig:
 
 
 def parse_earshot_direction_jsonl(raw: str | Iterable[str]) -> list[DirectionSample]:
-    """Parse `earshot direction` JSONL lines into DirectionSample objects."""
-    lines = raw.splitlines() if isinstance(raw, str) else raw
+    """Parse `earshot direction` JSONL lines or JSON array into DirectionSample objects."""
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("["):
+            parsed = json.loads(s)
+            if not isinstance(parsed, list):
+                raise ValueError(
+                    f"Expected JSON array in earshot direction output, got {type(parsed)}"
+                )
+            return [
+                DirectionSample(
+                    t_ms=max(0, round(float(obj["t"]) * 1000.0)),
+                    azimuth_deg=float(obj["azimuth"]) % 360.0,
+                    contrast=float(obj.get("contrast", 1.0)),
+                    level_db=float(obj.get("level_db", -60.0)),
+                )
+                for obj in parsed
+                if isinstance(obj, Mapping)
+            ]
+        lines: Iterable[str] = raw.splitlines()
+    else:
+        lines = raw
     samples: list[DirectionSample] = []
     for line in lines:
         stripped = line.strip()

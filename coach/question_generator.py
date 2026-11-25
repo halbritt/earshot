@@ -178,7 +178,7 @@ def build_generator_prompt(
     else:
         rec_lines = "none"
     opportunity_block = (
-        f"Target Category: {category.value}\n"
+        f"Opportunity Category: {category.value}\n"
         f"Origin: {context.origin.value}\n"
         f"Anchor Segment IDs: {anchor_ids_str}\n"
         f"Recent Suggestions:\n{rec_lines}"

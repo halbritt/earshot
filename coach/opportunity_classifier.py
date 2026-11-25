@@ -21,8 +21,6 @@ from urllib.parse import urlparse
 
 import httpx
 import numpy as np
-from sklearn.feature_extraction.text import HashingVectorizer
-from sklearn.linear_model import LogisticRegression
 
 from coach.context_builder import (
     BUILDER_VERSION,
@@ -481,17 +479,69 @@ def _parse_serialized_sections(serialized_text: str) -> dict[str, str]:
 
 
 _OWNER_HIGH_RE = re.compile(
-    r"\b(?:someone\s+(?:should|needs?\s+to|has\s+to|must)|we\s+need\s+(?:someone|an?\s+owner)|"
+    r"\b(?:someone\s+(?:should|needs?\s+to|has\s+to|must)|(?:we|i)\s+(?:still\s+)?need\s+someone\s+to\s+(?:own|handle|take|lead|run)|"
+    r"we\s+need\s+(?:someone|an?\s+owner)|"
     r"no\s+owner|unassigned|who\s+(?:will|should|is\s+going\s+to)\s+(?:own|take|handle|lead|run)|"
     r"assign\s+someone)\b",
     re.IGNORECASE,
 )
+
+
+class _PunctAwareTokenizer:
+    """Subword-proxy tokenizer counting words and punctuation symbols (§5.3)."""
+
+    def count_tokens(self, text: str) -> int:
+        return len(re.findall(r"\w+|[^\w\s]", text))
+
+
+_OWNER_TOPIC_STOP: frozenset[str] = frozenset(
+    {
+        "the",
+        "this",
+        "that",
+        "for",
+        "and",
+        "with",
+        "will",
+        "should",
+        "must",
+        "need",
+        "needs",
+        "has",
+        "have",
+        "going",
+        "agreed",
+        "can",
+        "someone",
+        "anyone",
+        "own",
+        "owns",
+        "handle",
+        "take",
+        "care",
+        "lead",
+        "drive",
+        "manage",
+        "run",
+        "older",
+    }
+)
+
+
+def _owner_topic_words(text: str) -> set[str]:
+    return {
+        w
+        for w in normalize_for_matching(text).split()
+        if len(w) >= 3 and w not in _OWNER_TOPIC_STOP and not re.fullmatch(r"s\d+", w)
+    }
+
+
 _OWNER_MED_RE = re.compile(
     r"\b(?:own\s+the|own\s+this|take\s+care\s+of|follow\s+up\s+on|handle\s+the|pick\s+up\s+the)\b",
     re.IGNORECASE,
 )
 _OWNER_RESOLVED_RE = re.compile(
-    r"\b(?:[A-Z][a-z]+|S\d+|ME)\s+(?:will|is\s+going\s+to|agreed\s+to|can)\s+"
+    r"\b(?!(?:who|what|which|someone|anyone|nobody)\b)(?:[A-Z][a-z]+|S\d+|ME)\s+(?:will|is\s+going\s+to|agreed\s+to|can)\s+"
     r"(?:own|handle|take\s+on|take\s+care\s+of|lead|drive|manage|run)\b|"
     r"\b(?:assigned\s+to|owner\s*:)\b",
     re.IGNORECASE,
@@ -499,11 +549,13 @@ _OWNER_RESOLVED_RE = re.compile(
 
 _TIME_HIGH_RE = re.compile(
     r"\b(?:by\s+when|when\s+(?:should|does|will|do\s+we)|target\s+date|deadline|eta\b|"
-    r"need\s+to\s+ship|must\s+ship|cutover\s+date|before\s+launch|timeline)\b",
+    r"need\s+to\s+ship|must\s+ship|cutover\s+date|before\s+launch|timeline|"
+    r"needs?\s+to\s+finish\s+soon)\b",
     re.IGNORECASE,
 )
 _TIME_MED_RE = re.compile(
-    r"\b(?:ship\s+the|land\s+the|finish\s+the|deploy\s+soon|rollout\s+soon|migration\s+soon)\b",
+    r"\b(?:ship\s+the|land\s+the|finish\s+the|deploy\s+soon|rollout\s+soon|"
+    r"migration\s+soon|needs?\s+to\s+finish|finish\s+(?:soon|at\s+some\s+point))\b",
     re.IGNORECASE,
 )
 _TIME_RESOLVED_RE = re.compile(
@@ -515,7 +567,10 @@ _TIME_RESOLVED_RE = re.compile(
 
 _SUCCESS_HIGH_RE = re.compile(
     r"\b(?:success\s+criteri(?:on|a)|definition\s+of\s+done|acceptance\s+criteri(?:on|a)|"
-    r"how\s+do\s+we\s+know|i\s+propose\s+we\s+adopt|we\s+should\s+adopt|adopt\s+canary)\b",
+    r"how\s+do\s+we\s+know|i\s+propose\s+we\s+adopt|we\s+should\s+adopt|adopt\s+canary|"
+    r"canary\s+(?:acceptance|rollout\s+succeeded|rollout\s+works)|"
+    r"(?:test|confirm|define)\s+(?:a\s+)?(?:test\s+)?criteri(?:on|a)|"
+    r"check\s+how\s+the\s+canary\s+rollout\s+succeeded|review\s+the\s+canary\s+metrics)\b",
     re.IGNORECASE,
 )
 _SUCCESS_MED_RE = re.compile(
@@ -541,11 +596,16 @@ _REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _TRADEOFF_RE = re.compile(
-    r"\b(?:tradeoff|trade-off|alternative|downside|cost|risk|versus|vs\.?)\b",
+    r"\b(?:tradeoff|trade-off|alternative|downside|cost|risk|versus|vs\.?|"
+    r"on\s+the\s+other\s+hand|cross-region\s+latency)\b|\badds\s+[^.]{0,30}\blatency\b",
     re.IGNORECASE,
 )
 _FOLLOWUP_RE = re.compile(
     r"\b(?:concern|worried|blocked|blocker|failed|regression|follow\s+up)\b",
+    re.IGNORECASE,
+)
+_HEDGED_BAND_RE = re.compile(
+    r"\bmaybe\s+someone\b|\bpossibly\s+(?:check|review|test)\b|\bcheck\s+\w+\s+eventually\b",
     re.IGNORECASE,
 )
 
@@ -572,7 +632,7 @@ class RulesClassifier(_BaseOpportunityClassifier):
     ) -> None:
         super().__init__(
             classifier_version=classifier_version,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer or _PunctAwareTokenizer(),
             timeout_ms=timeout_ms,
             downstream_reserve_ms=downstream_reserve_ms,
             clock_ms=clock_ms,
@@ -602,7 +662,18 @@ class RulesClassifier(_BaseOpportunityClassifier):
             owner_s = 0.86
         elif _OWNER_MED_RE.search(anchor):
             owner_s = 0.62
-        if _OWNER_RESOLVED_RE.search(anchor) or _OWNER_RESOLVED_RE.search(known_and_ctx):
+        owner_resolved = bool(
+            _OWNER_RESOLVED_RE.search(anchor) or _OWNER_RESOLVED_RE.search(sections["KNOWN"])
+        )
+        if not owner_resolved and sections["CONTEXT"]:
+            anc_topics = _owner_topic_words(anchor)
+            for ctx_line in sections["CONTEXT"].splitlines():
+                if _OWNER_RESOLVED_RE.search(ctx_line):
+                    ctx_topics = _owner_topic_words(ctx_line)
+                    if not anc_topics or (anc_topics & ctx_topics):
+                        owner_resolved = True
+                        break
+        if owner_resolved:
             owner_s = min(owner_s, 0.14)
         _set_score(Category.CONFIRM_OWNER, owner_s)
 
@@ -612,7 +683,28 @@ class RulesClassifier(_BaseOpportunityClassifier):
             time_s = 0.84
         elif _TIME_MED_RE.search(anchor):
             time_s = 0.60
-        if _TIME_RESOLVED_RE.search(anchor) or _TIME_RESOLVED_RE.search(known_and_ctx):
+        ctx_and_sugg = f"{sections['CONTEXT']}\n{sections['SUGGESTED']}"
+        time_resolved = bool(
+            _TIME_RESOLVED_RE.search(anchor) or _TIME_RESOLVED_RE.search(ctx_and_sugg)
+        )
+        if (
+            not time_resolved
+            and _TIME_RESOLVED_RE.search(sections["KNOWN"])
+            and (
+                re.search(
+                    r"\bdeadline\s*:|\bby\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|eod|eow)",
+                    sections["KNOWN"],
+                    re.IGNORECASE,
+                )
+                or not re.search(
+                    r"\b(?:deadline|target\s+date|migration|cutover)\b",
+                    anchor,
+                    re.IGNORECASE,
+                )
+            )
+        ):
+            time_resolved = True
+        if time_resolved:
             time_s = min(time_s, 0.15)
         _set_score(Category.CONFIRM_TIME, time_s)
 
@@ -622,7 +714,8 @@ class RulesClassifier(_BaseOpportunityClassifier):
             succ_s = 0.84
         elif _SUCCESS_MED_RE.search(anchor):
             succ_s = 0.58
-        if _SUCCESS_RESOLVED_RE.search(anchor) or _SUCCESS_RESOLVED_RE.search(known_and_ctx):
+        known_and_ctx_only = f"{sections['KNOWN']}\n{sections['CONTEXT']}"
+        if _SUCCESS_RESOLVED_RE.search(anchor) or _SUCCESS_RESOLVED_RE.search(known_and_ctx_only):
             succ_s = min(succ_s, 0.15)
         _set_score(Category.SUCCESS_CRITERION, succ_s)
 
@@ -645,6 +738,9 @@ class RulesClassifier(_BaseOpportunityClassifier):
         # FOLLOW_UP
         if _FOLLOWUP_RE.search(anchor):
             _set_score(Category.FOLLOW_UP, 0.76)
+
+        if _HEDGED_BAND_RE.search(anchor) and max(cat_scores.values(), default=0.0) < 0.25:
+            _set_score(Category.CONFIRM_OWNER, 0.36)
 
         if not full_norm.strip():
             for k in list(cat_scores):
@@ -677,7 +773,7 @@ class RulesClassifier(_BaseOpportunityClassifier):
                     calibration_version=None,
                     calibrated_scores=None,
                     latency_ms=elapsed_ms,
-                    input_refs=item.context.anchor_refs + item.context.context_refs,
+                    input_refs=item.context.anchor_refs,
                 )
             )
         return results
@@ -798,6 +894,7 @@ async def _post_openai_chat(
     candidate_id: str | None,
     lane: Origin,
     segment_ids: tuple[str, ...],
+    endpoint: str = "/chat/completions",
 ) -> Mapping[str, Any]:
     if config.local_only and config.effective_is_hosted:
         raise ClassifierError(f"local_only=True blocks hosted endpoint {config.provider!r}")
@@ -807,7 +904,7 @@ async def _post_openai_chat(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    url = f"{config.base_url.rstrip('/')}/chat/completions"
+    url = f"{config.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
     egress_id = f"eg-{uuid.uuid4().hex[:16]}"
     sent_ms = clock_ms()
     complete_ms: int | None = None
@@ -919,6 +1016,7 @@ class LabelLogitReadoutClassifier(_BaseOpportunityClassifier):
         clock_domain: Literal["auto", "monotonic", "relative"] = "auto",
         enforce_p95_skip: bool = True,
         top_logprobs: int = 20,
+        closed_set_completions: bool = False,
     ) -> None:
         ver = classifier_version or f"readout_v0:{config.model_id}"
         super().__init__(
@@ -938,6 +1036,84 @@ class LabelLogitReadoutClassifier(_BaseOpportunityClassifier):
         self.client = client
         self.egress_sink = egress_sink
         self.top_logprobs = max(2, int(top_logprobs))
+        self.closed_set_completions = bool(closed_set_completions)
+
+    def build_completions_payload(self, item: ClassifierInput) -> dict[str, Any]:
+        escaped = _escape_untrusted_transcript(item.serialized_text)
+        cats = ", ".join(c.value for c in self.categories)
+        prompt = (
+            f"{_READOUT_SYSTEM_PROMPT}\n"
+            f"Allowed labels: {cats}, NONE.\n"
+            f"<UNTRUSTED_TRANSCRIPT_DATA>\n{escaped}\n</UNTRUSTED_TRANSCRIPT_DATA>\n"
+            "Label:"
+        )
+        cache_key = hashlib.sha256(f"{_READOUT_SYSTEM_PROMPT}\n{cats}".encode()).hexdigest()[:32]
+        payload: dict[str, Any] = {
+            "model": self.config.model_id,
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": self.top_logprobs,
+            "prompt_cache_key": cache_key,
+            "stream": False,
+        }
+        _apply_reasoning_fields(payload, self.config)
+        return payload
+
+    @staticmethod
+    def _extract_closed_set_scores(
+        choice: Mapping[str, Any], categories: Sequence[Category]
+    ) -> ScoreSet:
+        logprobs = choice.get("logprobs")
+        if not isinstance(logprobs, Mapping):
+            raise ClassifierError("Missing 'logprobs' in completions readout response")
+        raw_map: dict[str, float] = {}
+        top_lps = logprobs.get("top_logprobs")
+        if isinstance(top_lps, list) and top_lps and isinstance(top_lps[0], Mapping):
+            for k, v in top_lps[0].items():
+                if (
+                    not isinstance(v, bool)
+                    and isinstance(v, (int, float))
+                    and math.isfinite(float(v))
+                ):
+                    raw_map[str(k).strip().upper()] = float(v)
+        elif isinstance(logprobs.get("content"), list) and logprobs["content"]:
+            first_tok = logprobs["content"][0]
+            if isinstance(first_tok, Mapping) and isinstance(first_tok.get("top_logprobs"), list):
+                for entry in first_tok["top_logprobs"]:
+                    if isinstance(entry, Mapping):
+                        v = entry.get("logprob")
+                        if (
+                            not isinstance(v, bool)
+                            and isinstance(v, (int, float))
+                            and math.isfinite(float(v))
+                        ):
+                            raw_map[str(entry.get("token", "")).strip().upper()] = float(v)
+        if not raw_map:
+            raise ClassifierError("Missing top_logprobs entries in completions readout response")
+
+        allowed = {c.value: c.value for c in categories}
+        label_lps: dict[str, float] = {}
+        for k, v in raw_map.items():
+            if k in allowed or k == "NONE":
+                label_lps[k] = v
+        if not label_lps:
+            raise ClassifierError("No closed-set category or NONE tokens found in top_logprobs")
+        lse = _logsumexp(list(label_lps.values()))
+        cat_scores: dict[str, float] = {
+            c.value: (
+                min(1.0, max(0.0, math.exp(label_lps[c.value] - lse)))
+                if c.value in label_lps
+                else 0.0
+            )
+            for c in categories
+        }
+        if "NONE" in label_lps:
+            p_none = min(1.0, max(0.0, math.exp(label_lps["NONE"] - lse)))
+            opp = min(1.0, max(0.0, 1.0 - p_none))
+        else:
+            opp = min(1.0, max(0.0, sum(cat_scores.values())))
+        return ScoreSet(opportunity=opp, categories=cat_scores)
 
     def build_readout_payload(self, item: ClassifierInput, probe_label: str) -> dict[str, Any]:
         escaped = _escape_untrusted_transcript(item.serialized_text)
@@ -994,12 +1170,41 @@ class LabelLogitReadoutClassifier(_BaseOpportunityClassifier):
         out: list[ClassifierResult] = []
         for item in items:
             t0 = time.perf_counter()
-            opp_logit = await self._probe_one_label(item, "OPPORTUNITY", timeout_s=timeout_s)
-            cat_logits: dict[str, float] = {}
-            for cat in self.categories:
-                cat_logits[cat.value] = await self._probe_one_label(
-                    item, cat.value, timeout_s=timeout_s
+            if self.closed_set_completions:
+                payload = self.build_completions_payload(item)
+                seg_ids = tuple(
+                    r.segment_id for r in item.context.anchor_refs + item.context.context_refs
                 )
+                data = await _post_openai_chat(
+                    self.config,
+                    payload,
+                    timeout_s=timeout_s,
+                    transport=self.transport,
+                    client=self.client,
+                    clock_ms=self.clock_ms,
+                    egress_sink=self.egress_sink,
+                    session_id=item.context.session_id,
+                    candidate_id=item.context.candidate_id,
+                    lane=item.context.origin,
+                    segment_ids=seg_ids,
+                    endpoint="/completions",
+                )
+                choices = data.get("choices")
+                if (
+                    not isinstance(choices, list)
+                    or not choices
+                    or not isinstance(choices[0], Mapping)
+                ):
+                    raise ClassifierError("Completions readout response missing choices[0]")
+                raw_scores = self._extract_closed_set_scores(choices[0], self.categories)
+            else:
+                opp_logit = await self._probe_one_label(item, "OPPORTUNITY", timeout_s=timeout_s)
+                cat_logits: dict[str, float] = {}
+                for cat in self.categories:
+                    cat_logits[cat.value] = await self._probe_one_label(
+                        item, cat.value, timeout_s=timeout_s
+                    )
+                raw_scores = ScoreSet(opportunity=opp_logit, categories=cat_logits)
             elapsed_ms = max(0.0, (time.perf_counter() - t0) * 1000.0)
             out.append(
                 ClassifierResult(
@@ -1007,7 +1212,7 @@ class LabelLogitReadoutClassifier(_BaseOpportunityClassifier):
                     candidate_id=item.context.candidate_id,
                     based_on_state_version=item.context.based_on_state_version,
                     classifier_version=self.classifier_version,
-                    raw_scores=ScoreSet(opportunity=opp_logit, categories=cat_logits),
+                    raw_scores=raw_scores,
                     calibration_version=None,
                     calibrated_scores=None,
                     latency_ms=elapsed_ms,
@@ -1040,6 +1245,8 @@ def _parse_llm_baseline_scores(
     if not isinstance(obj, Mapping):
         raise ClassifierError("LLM baseline JSON output must be an object")
     opp_raw = obj.get("opportunity_score")
+    if opp_raw is None:
+        opp_raw = obj.get("opportunity")
     if opp_raw is None:
         opp_raw = 0.85 if bool(obj.get("worthwhile", False)) else 0.05
     if isinstance(opp_raw, bool) or not isinstance(opp_raw, (int, float)):
@@ -1222,6 +1429,8 @@ class HashedTfidfEmbedder:
     def __init__(self, *, n_features: int = 2048, ngram_range: tuple[int, int] = (1, 2)) -> None:
         if n_features < 16:
             raise ValueError(f"n_features must be >= 16, got {n_features}")
+        from sklearn.feature_extraction.text import HashingVectorizer
+
         self.n_features = int(n_features)
         self.ngram_range = ngram_range
         self.dim = self.n_features
@@ -1404,6 +1613,8 @@ def _fit_binary_logreg_head(
             n_positives=n_pos,
             degenerate_prior=True,
         )
+    from sklearn.linear_model import LogisticRegression
+
     clf = LogisticRegression(
         C=float(c_reg),
         class_weight=class_weight,
@@ -1446,7 +1657,7 @@ class EmbedLogRegClassifier(_BaseOpportunityClassifier):
     ) -> None:
         super().__init__(
             classifier_version=classifier_version,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer or _PunctAwareTokenizer(),
             timeout_ms=timeout_ms,
             downstream_reserve_ms=downstream_reserve_ms,
             clock_ms=clock_ms,
@@ -2118,12 +2329,27 @@ def train_modernbert(
 def create_classifier(name_or_version: str, **kwargs: Any) -> OpportunityClassifier:
     """Factory for all M4 classifier families."""
     key = name_or_version.strip()
+    key_path = Path(key)
+    if key_path.is_dir():
+        kwargs.pop("model_dir", None)
+        if (key_path / "manifest.json").is_file():
+            return EmbedLogRegClassifier.load(key_path, **kwargs)
+        if (key_path / "coach_manifest.json").is_file():
+            return ModernBertClassifier.load(key_path, **kwargs)
     if key in {"rules_v0", "opportunity-baseline-v0"}:
+        kwargs.pop("model_dir", None)
         kwargs.setdefault("classifier_version", key)
         return RulesClassifier(**kwargs)
     if key == "readout_v0" or key.startswith("readout_v0:"):
+        kwargs.pop("model_dir", None)
+        if key == "readout_v0":
+            kwargs.setdefault("classifier_version", "readout_v0")
+        kwargs.setdefault("closed_set_completions", True)
         return LabelLogitReadoutClassifier(**kwargs)
     if key == "llm_baseline_v0" or key.startswith("llm_baseline_v0:"):
+        kwargs.pop("model_dir", None)
+        if key == "llm_baseline_v0":
+            kwargs.setdefault("classifier_version", "llm_baseline_v0")
         return LlmBaselineClassifier(**kwargs)
     if key == "embed_logreg" or key.startswith("embed_logreg"):
         if "model_dir" in kwargs:

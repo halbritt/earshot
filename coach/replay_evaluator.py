@@ -17,8 +17,10 @@ from typing import Any
 import numpy as np
 
 from coach.calibration import CalibrationModel, CalibrationRegistry, default_calibration_registry
-from coach.canonical_state import CanonicalState, StateSnapshot
+from coach.canonical_state import CanonicalState, SegmentRecord, StateSnapshot
 from coach.context_builder import (
+    _SENTENCE_FINAL_RE,
+    DEFAULT_ANCHOR_MAX_TOKENS,
     CategoryPolicy,
     ContextBuildResult,
     PolicyConfig,
@@ -26,6 +28,7 @@ from coach.context_builder import (
     build_decision_context,
     build_decision_contexts,
     effective_max_cards_per_10_min,
+    normalize_for_matching,
 )
 from coach.contracts import (
     SCHEMA_VERSION,
@@ -43,6 +46,7 @@ from coach.contracts import (
     Origin,
     Outcome,
     ReasonCode,
+    RetentionConfig,
     Route,
     SegmentRef,
     SessionBrief,
@@ -55,7 +59,7 @@ from coach.opportunity_classifier import (
     OpportunityClassifier,
     classify_batch_cached,
 )
-from coach.provider_adapter import ProviderAdapter
+from coach.provider_adapter import BreakerState, ProviderAdapter
 from coach.question_generator import generate_question
 from coach.routing_policy import route_candidate
 from coach.storage import SQLiteStore
@@ -542,6 +546,7 @@ def _store_decision_from_routing(
     clf_res: Any,
     routing: Any,
     serialized_text: str | None,
+    retention: RetentionConfig | None = None,
 ) -> None:
     if routing.outcome is Outcome.NONE:
         t_state = "no_opportunity"
@@ -560,6 +565,7 @@ def _store_decision_from_routing(
         classifier=clf_res,
         routing=routing,
         serialized_text=serialized_text,
+        retention=retention,
     )
 
 
@@ -590,11 +596,41 @@ async def async_simulate_replay(
         if calibration is not None
         else (default_calibration_registry() if policy.classifier.calibration else None)
     )
-    eff_health = (
-        health
-        if health is not None
-        else (provider.health_state if provider is not None else HealthState.TEMPLATE_ONLY)
+    local_blocked = (
+        provider is not None and provider.config.local_only and provider.config.effective_is_hosted
     )
+    if health is not None:
+        eff_health = health
+    elif local_blocked or provider is None:
+        eff_health = HealthState.TEMPLATE_ONLY
+    else:
+        eff_health = provider.health_state
+    health_timeline: list[dict[str, Any]] = [
+        {
+            "at_ms": ordered[0].received_ms if ordered else 0,
+            "state": eff_health.value,
+            "health": eff_health.value,
+            "reason": (
+                "local_only"
+                if local_blocked
+                else ("init" if provider is not None else "no_provider")
+            ),
+        }
+    ]
+
+    def _record_health(new_state: HealthState, at_ms: int, reason: str) -> None:
+        nonlocal eff_health
+        eff_health = new_state
+        if health_timeline[-1]["state"] != new_state.value:
+            health_timeline.append(
+                {
+                    "at_ms": at_ms,
+                    "state": new_state.value,
+                    "health": new_state.value,
+                    "reason": reason,
+                }
+            )
+
     rng = random.Random(rng_seed)
 
     if store is not None:
@@ -603,12 +639,17 @@ async def async_simulate_replay(
             run_id=run_id,
             runtime_mode=mode,
             effective_max_cards_per_10_min=effective_max_cards_per_10_min(brief, policy),
+            health_timeline=health_timeline,
         )
 
     speaker_update_times: dict[str, int] = {}
     speaker_update_keys: dict[str, tuple[int, int, str]] = {}
+    speaker_boundary_end_ms: dict[str, int] = {}
     boundary_events: list[tuple[int, str | None]] = []
-    assigned_segments: set[str] = set()
+    covered_revs: set[tuple[str, int]] = set()
+    pending_buf: list[SegmentRecord] = []
+    prev_anchor_norm: str | None = None
+    tok = classifier.tokenizer or WhitespaceTokenizer()
     displayed_cards: list[DisplayedCardEvent] = []
     displayed_times: list[int] = []
     latencies_ms: list[float] = []
@@ -629,45 +670,135 @@ async def async_simulate_replay(
         if ev.kind is EventKind.BOUNDARY:
             boundary_events.append((ev.received_ms, ev.speaker_id))
 
-    for ev_idx, ev in enumerate(ordered):
-        apply_res = state.apply(ev)
-        prefix_snap = state.snapshot()
-        if store is not None and apply_res.accepted:
-            can_rev: int | None = None
-            if ev.segment_id and ev.segment_id in prefix_snap.segments_by_id:
-                can_rev = prefix_snap.segments_by_id[ev.segment_id].revision
-            store.record_canonical_event(
-                run_id=run_id,
-                event=ev,
-                retention=brief.retention,
-                canonical_revision=can_rev,
-            )
-        if apply_res.accepted and ev.kind is EventKind.SPEAKER_UPDATE and ev.segment_id:
-            speaker_update_times[ev.segment_id] = ev.received_ms
-            speaker_update_keys[ev.segment_id] = (
-                ev.source_revision if ev.source_revision is not None else 0,
-                ev.source_sequence,
-                ev.event_id,
-            )
-        if (
-            ev.kind is not EventKind.SEGMENT
-            or ev.stability is not Stability.COMMITTED
-            or not ev.segment_id
-            or ev.segment_id in assigned_segments
-        ):
-            continue
-        seg = prefix_snap.segments_by_id.get(ev.segment_id)
-        if seg is None or seg.speaker_id in recipient_ids:
+    for step_idx in range(len(ordered) + 1):
+        flush_batches: list[tuple[StateSnapshot, list[SegmentRecord], int]] = []
+        if step_idx == len(ordered):
+            if pending_buf:
+                flush_batches.append((state.snapshot(), list(pending_buf), len(ordered) - 1))
+                pending_buf.clear()
+        else:
+            ev = ordered[step_idx]
+            pre_snap = state.snapshot() if pending_buf else None
+            apply_res = state.apply(ev)
+            prefix_snap = state.snapshot()
+            if store is not None and apply_res.accepted:
+                can_rev: int | None = None
+                if ev.segment_id and ev.segment_id in prefix_snap.segments_by_id:
+                    can_rev = prefix_snap.segments_by_id[ev.segment_id].revision
+                store.record_canonical_event(
+                    run_id=run_id,
+                    event=ev,
+                    retention=brief.retention,
+                    canonical_revision=can_rev,
+                )
+            if apply_res.accepted and ev.kind is EventKind.BOUNDARY:
+                if ev.speaker_id and ev.end_ms is not None:
+                    prev_b = speaker_boundary_end_ms.get(ev.speaker_id)
+                    if prev_b is None or ev.end_ms > prev_b:
+                        speaker_boundary_end_ms[ev.speaker_id] = ev.end_ms
+                if pending_buf and (
+                    ev.speaker_id is None or pending_buf[0].speaker_id == ev.speaker_id
+                ):
+                    flush_batches.append((prefix_snap, list(pending_buf), step_idx))
+                    pending_buf.clear()
+            elif apply_res.accepted and ev.kind is EventKind.SPEAKER_UPDATE and ev.segment_id:
+                speaker_update_times[ev.segment_id] = ev.received_ms
+                speaker_update_keys[ev.segment_id] = (
+                    ev.source_revision if ev.source_revision is not None else 0,
+                    ev.source_sequence,
+                    ev.event_id,
+                )
+                upd_seg = prefix_snap.segments_by_id.get(ev.segment_id)
+                if upd_seg is not None and upd_seg.committed:
+                    in_buf = [
+                        i for i, s in enumerate(pending_buf) if s.segment_id == upd_seg.segment_id
+                    ]
+                    if in_buf:
+                        if upd_seg.speaker_id in recipient_ids:
+                            pending_buf = [
+                                s for s in pending_buf if s.segment_id != upd_seg.segment_id
+                            ]
+                        else:
+                            for idx_b in in_buf:
+                                pending_buf[idx_b] = upd_seg
+                    elif (
+                        upd_seg.speaker_id not in recipient_ids
+                        and (upd_seg.segment_id, upd_seg.revision) not in covered_revs
+                    ):
+                        flush_batches.append((prefix_snap, [upd_seg], step_idx))
+            elif (
+                ev.kind is EventKind.SEGMENT
+                and ev.stability is Stability.COMMITTED
+                and ev.segment_id
+            ):
+                seg = prefix_snap.segments_by_id.get(ev.segment_id)
+                if seg is not None and (seg.segment_id, seg.revision) not in covered_revs:
+                    if seg.speaker_id in recipient_ids:
+                        if pending_buf and pre_snap is not None:
+                            flush_batches.append(
+                                (pre_snap, list(pending_buf), max(0, step_idx - 1))
+                            )
+                            pending_buf.clear()
+                    elif seg.revision > 1 and any(rid == seg.segment_id for rid, _ in covered_revs):
+                        if pending_buf and pre_snap is not None:
+                            flush_batches.append(
+                                (pre_snap, list(pending_buf), max(0, step_idx - 1))
+                            )
+                            pending_buf.clear()
+                        flush_batches.append((prefix_snap, [seg], step_idx))
+                    else:
+                        if pending_buf:
+                            prev_s = pending_buf[-1]
+                            spk_chg = prev_s.speaker_id != seg.speaker_id
+                            ovlp_chg = (
+                                prev_s.overlap or seg.overlap
+                            ) and prev_s.channel != seg.channel
+                            gap_chg = (seg.start_ms - prev_s.end_ms) >= 2000
+                            joined_txt = " ".join(
+                                s.text.strip() for s in [*pending_buf, seg] if s.text.strip()
+                            )
+                            if (
+                                spk_chg
+                                or ovlp_chg
+                                or gap_chg
+                                or tok.count_tokens(joined_txt) > DEFAULT_ANCHOR_MAX_TOKENS
+                            ) and pre_snap is not None:
+                                flush_batches.append(
+                                    (pre_snap, list(pending_buf), max(0, step_idx - 1))
+                                )
+                                pending_buf.clear()
+                        pending_buf.append(seg)
+                        cur_txt = " ".join(s.text.strip() for s in pending_buf if s.text.strip())
+                        has_punct = _SENTENCE_FINAL_RE.search(seg.text) is not None
+                        has_bnd = seg.boundary is not None and seg.boundary != "segment"
+                        if (
+                            has_punct
+                            or has_bnd
+                            or tok.count_tokens(cur_txt) >= DEFAULT_ANCHOR_MAX_TOKENS
+                        ):
+                            flush_batches.append((prefix_snap, list(pending_buf), step_idx))
+                            pending_buf.clear()
+
+        if not flush_batches:
             continue
 
-        assigned_segments.add(seg.segment_id)
-        built_items = build_decision_contexts(
-            prefix_snap,
-            anchor_segments=[seg],
-            policy=policy,
-            tokenizer=classifier.tokenizer,
-        )
-        for built in built_items:
+        eval_built: list[tuple[StateSnapshot, SegmentRecord, int, ContextBuildResult]] = []
+        for f_snap, f_segs, f_idx in flush_batches:
+            for fs in f_segs:
+                covered_revs.add((fs.segment_id, fs.revision))
+            b_items = build_decision_contexts(
+                f_snap,
+                anchor_segments=f_segs,
+                policy=policy,
+                tokenizer=classifier.tokenizer,
+                speaker_boundary_end_ms=speaker_boundary_end_ms,
+                initial_previous_anchor_norm_text=prev_anchor_norm,
+            )
+            for b_res in b_items:
+                prev_anchor_norm = normalize_for_matching(b_res.anchor.joined_text)
+                eval_built.append((f_snap, b_res.anchor.segments[0], f_idx, b_res))
+
+        for prefix_snap, seg, ev_idx, built in eval_built:
             decisions_count += 1
             if built.dropped:
                 dropped_count += 1
@@ -695,6 +826,7 @@ async def async_simulate_replay(
                         context=dummy_ctx,
                         terminal_state="dropped",
                         terminal_reason=drop.reason_code,
+                        retention=brief.retention,
                     )
                 continue
 
@@ -709,7 +841,21 @@ async def async_simulate_replay(
             measured_ms = max(0.0, (time.perf_counter() - t0) * 1000.0)
             clf_raw = clf_list[0]
             if cal_obj is not None and not isinstance(clf_raw, ClassifierErrorResult):
-                clf_res = cal_obj.calibrate(ctx, clf_raw, mode=prefix_snap.brief.mode)
+                if isinstance(cal_obj, CalibrationRegistry):
+                    cal_ver = (
+                        policy.classifier.calibration
+                        if policy.classifier.calibration
+                        and clf_raw.classifier_version == policy.classifier.version
+                        else None
+                    )
+                    clf_res = cal_obj.calibrate(
+                        ctx,
+                        clf_raw,
+                        mode=prefix_snap.brief.mode,
+                        calibration_version=cal_ver,
+                    )
+                else:
+                    clf_res = cal_obj.calibrate(ctx, clf_raw, mode=prefix_snap.brief.mode)
             else:
                 clf_res = clf_raw
             stage_ms = _sample_stage_latency_ms(
@@ -717,13 +863,23 @@ async def async_simulate_replay(
             )
             latencies_ms.append(float(stage_ms))
 
+            route_health = eff_health
+            if health is None and provider is not None and not local_blocked:
+                brk_state = provider.advance_clock(ctx.anchor_received_ms + stage_ms)
+                if brk_state is BreakerState.HALF_OPEN and provider.half_open_probe_available:
+                    route_health = HealthState.OK
+                else:
+                    route_health = provider.health_state
+                    if route_health is not eff_health:
+                        _record_health(route_health, ctx.anchor_received_ms + stage_ms, "breaker")
+
             routing = route_candidate(
                 ctx,
                 clf_res,
                 prefix_snap,
                 policy,
                 mode=mode,
-                health=eff_health,
+                health=route_health,
                 now_ms=ctx.anchor_received_ms + stage_ms,
                 speaker_update_times_ms=speaker_update_times,
                 ledger_texts=ledger_texts,
@@ -740,6 +896,7 @@ async def async_simulate_replay(
                         clf_res=clf_res,
                         routing=routing,
                         serialized_text=built.serialized_text,
+                        retention=brief.retention,
                     )
                 continue
 
@@ -749,6 +906,8 @@ async def async_simulate_replay(
             tpl = tpl_map.get(cpol.template) if cpol.template else None
             ready_ms = ctx.anchor_received_ms + stage_ms
             cand: SuggestionCandidate
+            is_generic_cand = False
+            is_fallback_cand = False
             if routing.route is Route.GENERATOR:
                 if provider is not None:
                     orig_sink = provider.egress_sink
@@ -789,6 +948,10 @@ async def async_simulate_replay(
                     finally:
                         provider.egress_sink = orig_sink
                         provider.clock_ms = orig_clock
+                        if health is None and not local_blocked:
+                            new_p_health = provider.health_state
+                            if new_p_health is not eff_health:
+                                _record_health(new_p_health, ready_ms, "generator_breaker")
 
                     if gen_out.candidate is None:
                         if store is not None:
@@ -802,9 +965,12 @@ async def async_simulate_replay(
                                 classifier=clf_res,
                                 routing=effective_routing,
                                 serialized_text=built.serialized_text,
+                                retention=brief.retention,
                             )
                         continue
                     cand = gen_out.candidate
+                    is_fallback_cand = bool(gen_out.fallback_used)
+                    is_generic_cand = bool(gen_out.fallback_used and not cand.grounded_slots)
                     if gen_out.fallback_used and not egress_recorded:
                         effective_routing = replace(routing, route=cand.route)
                 elif tpl is not None:
@@ -830,9 +996,11 @@ async def async_simulate_replay(
                                 classifier=clf_res,
                                 routing=effective_routing,
                                 serialized_text=built.serialized_text,
+                                retention=brief.retention,
                             )
                         continue
                     cand = rendered.candidate
+                    is_generic_cand = bool(rendered.is_generic)
                 else:
                     if store is not None:
                         store.record_decision(
@@ -843,6 +1011,7 @@ async def async_simulate_replay(
                             classifier=clf_res,
                             routing=effective_routing,
                             serialized_text=built.serialized_text,
+                            retention=brief.retention,
                         )
                     continue
             else:
@@ -856,6 +1025,7 @@ async def async_simulate_replay(
                             classifier=clf_res,
                             routing=effective_routing,
                             serialized_text=built.serialized_text,
+                            retention=brief.retention,
                         )
                     continue
 
@@ -880,9 +1050,11 @@ async def async_simulate_replay(
                             classifier=clf_res,
                             routing=effective_routing,
                             serialized_text=built.serialized_text,
+                            retention=brief.retention,
                         )
                     continue
                 cand = rendered.candidate
+                is_generic_cand = bool(rendered.is_generic)
             settle_end = ctx.anchor_received_ms + policy.display.settle_ms
             bnd_hits = [
                 ts
@@ -914,28 +1086,83 @@ async def async_simulate_replay(
                         classifier=clf_res,
                         routing=effective_routing,
                         serialized_text=built.serialized_text,
+                        retention=brief.retention,
                     )
                 continue
+
+            if is_fallback_cand:
+                norm_cand_q = normalize_for_matching(cand.text)
+                cand_q_toks = set(norm_cand_q.split())
+                dup_reason: ReasonCode | None = None
+                for prev_q in ledger_texts.values():
+                    norm_prev_q = normalize_for_matching(prev_q)
+                    if norm_prev_q == norm_cand_q:
+                        dup_reason = ReasonCode.DUPLICATE
+                        break
+                    p_toks = set(norm_prev_q.split())
+                    if (
+                        cand_q_toks
+                        and p_toks
+                        and (len(cand_q_toks & p_toks) / len(cand_q_toks | p_toks)) >= 0.75
+                    ):
+                        dup_reason = ReasonCode.NEAR_DUPLICATE
+                        break
+                if dup_reason is not None:
+                    if store is not None:
+                        sup_rt = replace(
+                            effective_routing,
+                            outcome=Outcome.SUPPRESS,
+                            route=None,
+                            reason_codes=(dup_reason,),
+                        )
+                        store.record_decision(
+                            run_id=run_id,
+                            context=ctx,
+                            terminal_state="suppressed",
+                            terminal_reason=dup_reason,
+                            classifier=clf_res,
+                            routing=sup_rt,
+                            serialized_text=built.serialized_text,
+                            retention=brief.retention,
+                        )
+                    continue
 
             in_win = [t for t in displayed_times if (target_ms - 600_000) <= t <= target_ms]
             if cap <= 0 or len(in_win) >= cap:
                 if store is not None:
+                    sup_rt = replace(
+                        effective_routing,
+                        outcome=Outcome.SUPPRESS,
+                        route=None,
+                        reason_codes=(ReasonCode.PROACTIVE_DISABLED,),
+                    )
                     store.record_decision(
                         run_id=run_id,
                         context=ctx,
                         terminal_state="suppressed",
                         terminal_reason=ReasonCode.PROACTIVE_DISABLED,
                         classifier=clf_res,
-                        routing=effective_routing,
+                        routing=sup_rt,
                         serialized_text=built.serialized_text,
+                        retention=brief.retention,
                     )
                 continue
 
             # 7-step revalidation against events occurring in (anchor_received_ms, target_ms]
             ev_seg_ids = {r.segment_id for r in cand.evidence_refs}
+            anchor_seg_ids = {r.segment_id for r in ctx.anchor_refs}
             withdraw_reason: ReasonCode | None = None
             for fut_ev in ordered[ev_idx + 1 :]:
                 if fut_ev.received_ms > target_ms:
+                    break
+                if (
+                    is_generic_cand
+                    and fut_ev.kind is EventKind.SEGMENT
+                    and fut_ev.stability is Stability.COMMITTED
+                    and fut_ev.segment_id not in anchor_seg_ids
+                    and fut_ev.speaker_id not in recipient_ids
+                ):
+                    withdraw_reason = ReasonCode.GENERIC_REFERENT_UNCLEAR
                     break
                 if (
                     fut_ev.kind is EventKind.SEGMENT
@@ -986,16 +1213,19 @@ async def async_simulate_replay(
                     break
 
             if withdraw_reason is not None:
-                withdrawn_count += 1
+                is_unrendered = withdraw_reason is ReasonCode.GENERIC_REFERENT_UNCLEAR
+                if not is_unrendered:
+                    withdrawn_count += 1
                 if store is not None:
                     store.record_decision(
                         run_id=run_id,
                         context=ctx,
-                        terminal_state="withdrawn",
+                        terminal_state="unrendered" if is_unrendered else "withdrawn",
                         terminal_reason=withdraw_reason,
                         classifier=clf_res,
                         routing=effective_routing,
                         serialized_text=built.serialized_text,
+                        retention=brief.retention,
                     )
                 continue
 
@@ -1044,6 +1274,7 @@ async def async_simulate_replay(
                     classifier=clf_res,
                     routing=effective_routing,
                     serialized_text=built.serialized_text,
+                    retention=brief.retention,
                 )
                 tr_disp = LedgerEvent(
                     schema_version=SCHEMA_VERSION,
@@ -1070,6 +1301,7 @@ async def async_simulate_replay(
                     current_state="expired",
                     terminal_reason=ReasonCode.DISPLAY_TTL_PASSED,
                     transitions=[tr_disp.to_dict(), tr_exp.to_dict()],
+                    retention=brief.retention,
                 )
 
     final_snap = state.snapshot()
@@ -1079,6 +1311,7 @@ async def async_simulate_replay(
             run_id=run_id,
             runtime_mode=mode,
             effective_max_cards_per_10_min=effective_max_cards_per_10_min(final_snap.brief, policy),
+            health_timeline=health_timeline,
             reducer_counters=final_snap.counters,
             revision_history=final_snap.revision_history,
         )
@@ -1309,6 +1542,27 @@ def paired_conversation_bootstrap(
     }
 
 
+_DECISION_CONTEXT_KEYS = frozenset(
+    {
+        "schema_version",
+        "candidate_id",
+        "session_id",
+        "origin",
+        "based_on_state_version",
+        "builder_version",
+        "prefilter_version",
+        "anchor_refs",
+        "context_refs",
+        "anchor_received_ms",
+        "display_by_ms",
+        "token_counts",
+        "omitted",
+        "flags",
+        "serialized_sha256",
+    }
+)
+
+
 def load_benchmark_inputs_jsonl(
     path: str | Path,
     *,
@@ -1331,6 +1585,12 @@ def load_benchmark_inputs_jsonl(
                 raise ValueError(f"JSONL line {line_no} must be a JSON object")
             if "context" in obj and "serialized_text" in obj:
                 ctx = DecisionContext.from_dict(obj["context"])
+                inputs.append(
+                    ClassifierInput(context=ctx, serialized_text=str(obj["serialized_text"]))
+                )
+            elif "candidate_id" in obj and "serialized_text" in obj and "kind" not in obj:
+                ctx_payload = {k: v for k, v in obj.items() if k in _DECISION_CONTEXT_KEYS}
+                ctx = DecisionContext.from_dict(ctx_payload)
                 inputs.append(
                     ClassifierInput(context=ctx, serialized_text=str(obj["serialized_text"]))
                 )

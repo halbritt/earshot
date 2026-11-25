@@ -559,7 +559,6 @@ def test_sortformer_recipient_binder_azimuth_speaker_update_and_uncertain(
     )
     mock_nemo_ws.set_config(
         MockNemoConfig(
-            flip_speaker_on_commit={1: 2},
             script=[
                 ScriptedTurn(
                     trigger_after_frames=2,
@@ -593,9 +592,9 @@ def test_sortformer_recipient_binder_azimuth_speaker_update_and_uncertain(
                     trigger_on_commit=True,
                     transcript="Who confirms the deployment window",
                     words=[
-                        MockWord("Who", 4.0, 4.3, speaker=1),
-                        MockWord("confirms", 4.3, 4.7, speaker=1),
-                        MockWord("deployment", 4.7, 5.2, speaker=1),
+                        MockWord("Who", 4.0, 4.3, speaker=3),
+                        MockWord("confirms", 4.3, 4.7, speaker=3),
+                        MockWord("deployment", 4.7, 5.2, speaker=3),
                     ],
                 ),
             ],
@@ -647,8 +646,8 @@ def test_sortformer_recipient_binder_azimuth_speaker_update_and_uncertain(
         ready_url=f"http://127.0.0.1:{port}/",
     ):
         _wait_until(
-            lambda: db_path.is_file() and _count_committed_segments(db_path, sid) >= 3,
-            msg="Sortformer turns did not commit >= 3 segments",
+            lambda: db_path.is_file() and _count_committed_segments(db_path, sid) >= 4,
+            msg="Sortformer turns did not commit >= 4 segments",
         )
 
     with open_db(db_path, readonly=True) as conn:

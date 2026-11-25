@@ -769,6 +769,9 @@ class SQLiteStore:
             )
 
     def record_egress(self, *, run_id: str, record: EgressRecord) -> None:
+        usage_payload = dict(record.usage)
+        if "cached_tokens" not in usage_payload and "cached_input_tokens" in usage_payload:
+            usage_payload["cached_tokens"] = int(usage_payload["cached_input_tokens"])
         with self._conn:
             self._conn.execute(
                 """
@@ -797,7 +800,7 @@ class SQLiteStore:
                     record.first_byte_ms,
                     record.complete_ms,
                     record.finish_reason,
-                    json.dumps(record.usage, sort_keys=True),
+                    json.dumps(usage_payload, sort_keys=True),
                     1 if record.discarded else 0,
                 ),
             )

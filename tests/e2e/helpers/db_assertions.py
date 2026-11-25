@@ -471,7 +471,7 @@ def assert_six_conservation_invariants(
         egress = fetch_normalized_rows(conn, "egress_log", session_id, run_id=run_id)
 
     non_recip_segments, valid_revs = _extract_segment_revisions(events, recipient_ids)
-    anchor_cids_by_seg: dict[str, set[str]] = {}
+    anchor_cids_by_seg_rev: dict[tuple[str, int], set[str]] = {}
     by_candidate: dict[str, list[dict[str, Any]]] = {}
     for dec in decisions:
         cid = dec.get("candidate_id")
@@ -480,22 +480,37 @@ def assert_six_conservation_invariants(
         by_candidate.setdefault(cid, []).append(dec)
         origin = str(dec.get("origin") or "proactive")
         seen_in_row: set[str] = set()
-        for seg_id, _rev in _iter_ref_pairs(dec.get("anchor_refs")):
+        for seg_id, rev in _iter_ref_pairs(dec.get("anchor_refs")):
             if seg_id in seen_in_row:
                 raise AssertionError(
                     f"Inv 1 violated: segment {seg_id} repeated in anchor_refs for {cid}"
                 )
             seen_in_row.add(seg_id)
             if origin != "manual":
-                anchor_cids_by_seg.setdefault(seg_id, set()).add(cid)
+                anchor_cids_by_seg_rev.setdefault((seg_id, rev), set()).add(cid)
 
-    # Inv 1: Every committed non-recipient segment in exactly 1 anchor; every candidate in 1 part.
+    # Inv 1: Every committed non-recipient segment (at its latest canonical revision)
+    # belongs to == 1 proactive anchor (and <= 1 per historical revision);
+    # every candidate belongs to 1 partition.
+    for (seg_id, rev), owners in sorted(anchor_cids_by_seg_rev.items()):
+        if len(owners) > 1:
+            raise AssertionError(
+                f"Inv 1 violated: non-recipient segment {seg_id} rev {rev} in {len(owners)} "
+                f"anchors ({sorted(owners)}), expected <= 1"
+            )
+
+    latest_rev_by_seg: dict[str, int] = {}
+    for seg_id, rev in valid_revs:
+        if rev > latest_rev_by_seg.get(seg_id, 0):
+            latest_rev_by_seg[seg_id] = rev
+
     for seg_id in sorted(non_recip_segments):
-        owners = anchor_cids_by_seg.get(seg_id, set())
+        latest_rev = latest_rev_by_seg.get(seg_id, 1)
+        owners = anchor_cids_by_seg_rev.get((seg_id, latest_rev), set())
         if len(owners) != 1:
             raise AssertionError(
-                f"Inv 1 violated: non-recipient segment {seg_id} in {len(owners)} anchors "
-                f"({sorted(owners)}), expected 1"
+                f"Inv 1 violated: non-recipient segment {seg_id} (rev={latest_rev}) in "
+                f"{len(owners)} anchors ({sorted(owners)}), expected 1"
             )
 
     scored_cids: set[str] = set()

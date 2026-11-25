@@ -91,6 +91,7 @@ class CardUIServer:
         session_token: str | None = None,
         on_action: ActionHandler | None = None,
         initial_state: UIStateSnapshot | None = None,
+        emit_card_events: bool = False,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError(f"CardUIServer must bind strictly to 127.0.0.1, got {host!r}")
@@ -101,6 +102,8 @@ class CardUIServer:
         self._bound_port = port
         self._token = session_token or secrets.token_urlsafe(32)
         self._on_action = on_action
+        self._emit_card_events = bool(emit_card_events)
+        self._last_emitted_card_id: str | None = None
         self._state: dict[str, Any] = (
             initial_state.to_dict()
             if initial_state is not None
@@ -229,19 +232,50 @@ class CardUIServer:
             return self._text_response(200, "OK", "application/json; charset=utf-8", body)
         return self._text_response(404, "Not Found", "text/plain; charset=utf-8", b"Not Found\n")
 
+    @staticmethod
+    def _build_card_frame(state: Mapping[str, Any]) -> dict[str, Any] | None:
+        card = state.get("active_card")
+        if not isinstance(card, Mapping):
+            return None
+        frame = dict(card)
+        frame["type"] = "card"
+        frame["session_id"] = state.get("session_id")
+        frame["mode"] = state.get("mode")
+        frame["health"] = state.get("health")
+        frame["health_reason"] = state.get("health_reason")
+        if "question" not in frame:
+            frame["question"] = card.get("question") or card.get("text")
+        return frame
+
     async def broadcast_state(self, state: UIStateSnapshot | Mapping[str, Any]) -> None:
         if isinstance(state, UIStateSnapshot):
             payload = state.to_dict()
         else:
             payload = {"type": "state", **dict(state)}
         self._state = payload
+        card = payload.get("active_card")
+        card_sid = (
+            str(card["suggestion_id"])
+            if isinstance(card, Mapping) and card.get("suggestion_id")
+            else None
+        )
+        card_frame: dict[str, Any] | None = None
+        if self._emit_card_events:
+            if card_sid is not None and card_sid != self._last_emitted_card_id:
+                self._last_emitted_card_id = card_sid
+                card_frame = self._build_card_frame(payload)
+            elif card_sid is None:
+                self._last_emitted_card_id = None
         if not self._clients:
             return
         encoded = json.dumps(payload, sort_keys=True)
+        encoded_card = json.dumps(card_frame, sort_keys=True) if card_frame is not None else None
         dead: list[ServerConnection] = []
         for ws in list(self._clients):
             try:
                 await ws.send(encoded)
+                if encoded_card is not None:
+                    await ws.send(encoded_card)
             except OSError, ConnectionClosed:
                 dead.append(ws)
         for ws in dead:
@@ -257,6 +291,10 @@ class CardUIServer:
         self._clients.add(websocket)
         try:
             await websocket.send(json.dumps(self._state, sort_keys=True))
+            if self._emit_card_events:
+                card_frame = self._build_card_frame(self._state)
+                if card_frame is not None:
+                    await websocket.send(json.dumps(card_frame, sort_keys=True))
             async for raw in websocket:
                 if not isinstance(raw, str):
                     continue

@@ -1002,17 +1002,20 @@ def build_session_report(store: SQLiteStore, session_id: str, run_id: str) -> Se
     cards_per_10_min = (
         (displayed_count / (duration_ms / 600_000.0)) if duration_ms > 0 else float(displayed_count)
     )
-    proactive_displayed = sum(
-        1
+    proactive_disp_times = sorted(
+        int(card["displayed_at_ms"])
         for card in displayed_cards
         if dec_by_cand.get(card["candidate_id"], {}).get("origin", "proactive") == "proactive"
     )
-    proactive_rate = (
-        (proactive_displayed / (duration_ms / 600_000.0))
-        if duration_ms > 0
-        else float(proactive_displayed)
-    )
-    budget_compliant = proactive_rate <= float(eff_cap) + 1e-9
+    max_in_10m = 0
+    left = 0
+    for right, t_r in enumerate(proactive_disp_times):
+        while t_r - proactive_disp_times[left] > 600_000:
+            left += 1
+        win_cnt = right - left + 1
+        if win_cnt > max_in_10m:
+            max_in_10m = win_cnt
+    budget_compliant = max_in_10m <= eff_cap
 
     return SessionReport(
         session_id=session_id,

@@ -73,7 +73,17 @@ def load_labels_jsonl(path: str | Path) -> list[LabelRecord]:
             obj = json.loads(stripped)
             if not isinstance(obj, Mapping):
                 raise AnnotationValidationError(f"Line {line_no} in {src} must be a JSON object")
-            labels.append(LabelRecord.from_dict(obj))
+            row_obj = dict(obj)
+            val = row_obj.get("validity")
+            if isinstance(val, Mapping) and val.get("ideal_ms") is not None:
+                try:
+                    if int(val["ideal_ms"]) < int(val["open_ms"]):
+                        val_copy = dict(val)
+                        val_copy["ideal_ms"] = None
+                        row_obj["validity"] = val_copy
+                except KeyError, TypeError, ValueError:
+                    pass
+            labels.append(LabelRecord.from_dict(row_obj))
     return labels
 
 
@@ -213,6 +223,18 @@ class Pass1Session:
             self._now_ms += delta_ms
             return self._apply_up_to(self._now_ms)
 
+    def prefix_at(self, at_ms: int) -> list[dict[str, Any]]:
+        """Advance playhead monotonically up to at_ms (or return earlier prefix) and list events."""
+        with self._lock:
+            if at_ms < 0:
+                raise AnnotationValidationError(f"at_ms must be >= 0, got {at_ms}")
+            if at_ms > self._now_ms:
+                self._now_ms = at_ms
+                self._apply_up_to(self._now_ms)
+            return [
+                _event_view(ev) for ev in self._events[: self._cursor] if ev.received_ms <= at_ms
+            ]
+
     def state_view(self) -> dict[str, Any]:
         with self._lock:
             snap = self._state.snapshot()
@@ -237,18 +259,24 @@ class Pass1Session:
         categories: Sequence[Category | str] = (),
         notes: str | None = None,
         confidence: str = "sure",
+        at_ms: int | None = None,
+        state_version_override: int | None = None,
     ) -> LabelRecord:
         with self._lock:
+            if at_ms is not None and at_ms > self._now_ms:
+                self._now_ms = at_ms
+                self._apply_up_to(self._now_ms)
             snap = self._state.snapshot()
             recipient_ids = {"ME", snap.brief.recipient.participant_id}
             other_segs = [s for s in snap.segments if s.speaker_id not in recipient_ids]
             latest_seg = other_segs[-1] if other_segs else None
             cand_id: str | None = None
             ev_refs: tuple[SegmentRef, ...] = ()
-            open_ms = self._now_ms
+            mark_ms = self._now_ms if at_ms is None else at_ms
+            open_ms = mark_ms
             if latest_seg is not None:
                 ev_refs = (SegmentRef(latest_seg.segment_id, latest_seg.revision),)
-                open_ms = min(self._now_ms, latest_seg.received_ms)
+                open_ms = min(mark_ms, latest_seg.received_ms)
                 built = build_decision_contexts(snap, anchor_segments=[latest_seg])
                 if built and built[0].context is not None:
                     cand_id = built[0].context.candidate_id
@@ -263,14 +291,18 @@ class Pass1Session:
                 sample_source=SampleSource.PASS1_MARK,
                 annotation_pass=AnnotationPass.ONLINE,
                 candidate_id=cand_id,
-                state_version_at_decision=snap.state_version,
+                state_version_at_decision=(
+                    int(state_version_override)
+                    if state_version_override is not None
+                    else snap.state_version
+                ),
                 worthwhile=True,
                 categories=parsed_cats,
                 example_questions=tuple(str(q) for q in example_questions if str(q).strip()),
                 evidence_refs=ev_refs,
                 validity=ValidityInterval(
                     open_ms=open_ms,
-                    ideal_ms=self._now_ms,
+                    ideal_ms=mark_ms,
                     close_ms=None,
                     closed_by=None,
                 ),
@@ -504,9 +536,14 @@ class Pass2Session:
         out_path: str | Path | None = None,
         store: SQLiteStore | None = None,
         run_id: str = "annotate-pass2",
+        review_queue_ids: Sequence[str] = (),
     ) -> None:
         self._items: dict[str, Pass2Item] = {it.item_id: it for it in items}
+        self._by_cand_id: dict[str, Pass2Item] = {
+            it.candidate_id: it for it in items if it.candidate_id is not None
+        }
         self._item_order: tuple[str, ...] = tuple(it.item_id for it in items)
+        self._review_queue_ids: tuple[str, ...] = tuple(review_queue_ids)
         self._annotator = annotator
         self._out_path = Path(out_path) if out_path is not None else None
         self._store = store
@@ -514,9 +551,35 @@ class Pass2Session:
         self._lock = threading.Lock()
 
     def _get(self, item_id: str) -> Pass2Item:
-        if item_id not in self._items:
-            raise KeyError(f"Unknown Pass 2 item {item_id!r}")
-        return self._items[item_id]
+        if item_id in self._items:
+            return self._items[item_id]
+        if item_id in self._by_cand_id:
+            return self._by_cand_id[item_id]
+        raise KeyError(f"Unknown Pass 2 item {item_id!r}")
+
+    def review_queue_list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rq_set = set(self._review_queue_ids)
+            out: list[dict[str, Any]] = []
+            for iid in self._item_order:
+                it = self._items[iid]
+                if (
+                    it.item_id in rq_set
+                    or (it.candidate_id and it.candidate_id in rq_set)
+                    or it.sample_source is SampleSource.SHADOW_REVIEW
+                ):
+                    out.append(
+                        {
+                            "item_id": it.item_id,
+                            "candidate_id": it.candidate_id,
+                            "session_id": it.session_id,
+                            "sample_source": str(it.sample_source),
+                            "suggested_question": it.suggested_question,
+                            "suggested_category": it.suggested_category,
+                            "state": it.state,
+                        }
+                    )
+            return out
 
     def list_items(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -564,6 +627,7 @@ class Pass2Session:
             },
             "continuation_available": item.step1_locked,
             "continuation": list(item._continuation) if item.step1_locked else None,
+            "continuation_events": list(item._continuation) if item.step1_locked else None,
         }
 
     def get_item_view(self, item_id: str) -> dict[str, Any]:
@@ -588,6 +652,7 @@ class Pass2Session:
         example_questions: Sequence[str] = (),
         none_reason: NoneReason | str | None = None,
         confidence: str = "sure",
+        sample_source: SampleSource | str | None = None,
     ) -> None:
         if not isinstance(worthwhile, bool):
             raise AnnotationValidationError("worthwhile must be a boolean")
@@ -607,6 +672,13 @@ class Pass2Session:
             raise AnnotationValidationError("none_reason must be null when worthwhile=True")
         if not isinstance(confidence, str) or not confidence.strip():
             raise AnnotationValidationError("confidence must be a non-empty string")
+        if sample_source is not None:
+            try:
+                item.sample_source = SampleSource(str(sample_source))
+            except ValueError as exc:
+                raise AnnotationValidationError(
+                    f"Invalid sample_source: {sample_source!r}"
+                ) from exc
         item.worthwhile = worthwhile
         item.categories = parsed_cats
         item.example_questions = tuple(str(q) for q in example_questions if str(q).strip())
@@ -622,6 +694,7 @@ class Pass2Session:
         example_questions: Sequence[str] = (),
         none_reason: NoneReason | str | None = None,
         confidence: str = "sure",
+        sample_source: SampleSource | str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             item = self._get(item_id)
@@ -636,6 +709,7 @@ class Pass2Session:
                 example_questions=example_questions,
                 none_reason=none_reason,
                 confidence=confidence,
+                sample_source=sample_source,
             )
             return self._view(item)
 
@@ -663,6 +737,7 @@ class Pass2Session:
                     example_questions=step1_payload.get("example_questions") or (),
                     none_reason=step1_payload.get("none_reason"),
                     confidence=str(step1_payload.get("confidence", "sure")),
+                    sample_source=step1_payload.get("sample_source"),
                 )
             if item.worthwhile is None:
                 raise AnnotationValidationError(
@@ -890,6 +965,118 @@ def compute_cohens_kappa(
     }
 
 
+class BlindRetestSession:
+    """Blind test-retest annotation session stripping prior labels (§12.2)."""
+
+    def __init__(
+        self,
+        *,
+        first_labels: Sequence[LabelRecord],
+        events: Sequence[CanonicalEvent] = (),
+        annotator: str = "retest_annotator",
+        out_path: str | Path | None = None,
+    ) -> None:
+        self._first_labels = list(first_labels)
+        self._by_id: dict[str, LabelRecord] = {}
+        for idx, lbl in enumerate(self._first_labels, start=1):
+            iid = lbl.candidate_id or lbl.label_id or f"retest-{idx:04d}"
+            self._by_id[iid] = lbl
+            if lbl.label_id:
+                self._by_id[lbl.label_id] = lbl
+        self._events_by_seg: dict[str, CanonicalEvent] = {
+            ev.segment_id: ev
+            for ev in events
+            if ev.segment_id is not None and ev.kind is EventKind.SEGMENT
+        }
+        self._annotator = annotator
+        self._out_path = Path(out_path) if out_path is not None else None
+        self._submitted: dict[str, LabelRecord] = {}
+        self._lock = threading.Lock()
+
+    def _resolve(self, item_id: str) -> tuple[str, LabelRecord]:
+        if item_id not in self._by_id:
+            raise KeyError(f"Unknown retest item {item_id!r}")
+        lbl = self._by_id[item_id]
+        key = lbl.candidate_id or lbl.label_id
+        return key, lbl
+
+    def get_item(self, item_id: str) -> dict[str, Any]:
+        with self._lock:
+            key, lbl = self._resolve(item_id)
+            ev_views = [
+                _event_view(self._events_by_seg[r.segment_id])
+                for r in lbl.evidence_refs
+                if r.segment_id in self._events_by_seg
+            ]
+            return {
+                "item_id": key,
+                "candidate_id": lbl.candidate_id,
+                "session_id": lbl.session_id,
+                "state_version_at_decision": lbl.state_version_at_decision,
+                "evidence_refs": [r.to_dict() for r in lbl.evidence_refs],
+                "open_ms": lbl.validity.open_ms,
+                "sample_source": str(lbl.sample_source),
+                "events": ev_views,
+                "worthwhile": None,
+                "categories": None,
+                "none_reason": None,
+                "annotator": None,
+            }
+
+    def submit_item(
+        self,
+        item_id: str,
+        *,
+        worthwhile: bool,
+        categories: Sequence[Category | str] = (),
+        none_reason: NoneReason | str | None = None,
+        example_questions: Sequence[str] = (),
+        confidence: str = "sure",
+        notes: str | None = None,
+    ) -> LabelRecord:
+        with self._lock:
+            key, orig = self._resolve(item_id)
+            if not isinstance(worthwhile, bool):
+                raise AnnotationValidationError("worthwhile must be a boolean")
+            parsed_cats = tuple(Category(str(c)) for c in categories)
+            parsed_nr: NoneReason | None = None
+            if none_reason is not None and str(none_reason).strip():
+                parsed_nr = NoneReason(str(none_reason))
+            if not worthwhile and parsed_cats:
+                raise AnnotationValidationError("categories must be empty when worthwhile=False")
+            if worthwhile and parsed_nr is not None:
+                raise AnnotationValidationError("none_reason must be null when worthwhile=True")
+            lbl = LabelRecord(
+                schema_version=SCHEMA_VERSION,
+                label_id=f"lbl-retest-{uuid.uuid4().hex[:12]}",
+                session_id=orig.session_id,
+                annotator=self._annotator,
+                sample_source=orig.sample_source,
+                annotation_pass=AnnotationPass.OFFLINE,
+                candidate_id=orig.candidate_id,
+                state_version_at_decision=orig.state_version_at_decision,
+                worthwhile=worthwhile,
+                categories=parsed_cats,
+                example_questions=tuple(str(q) for q in example_questions if str(q).strip()),
+                evidence_refs=orig.evidence_refs,
+                validity=orig.validity,
+                none_reason=parsed_nr,
+                confidence=confidence,
+                notes=notes,
+            )
+            self._submitted[key] = lbl
+            if self._out_path is not None:
+                save_labels_jsonl(list(self._submitted.values()), self._out_path, append=False)
+            return lbl
+
+    def kappa_report(self) -> dict[str, Any]:
+        with self._lock:
+            second = list(self._submitted.values())
+        res = compute_cohens_kappa(self._first_labels, second)
+        res["worthwhile_kappa"] = res["worthwhile"]["kappa"]
+        return res
+
+
 _ANNOTATION_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -944,6 +1131,7 @@ class AnnotationServer:
         session_token: str | None = None,
         pass1: Pass1Session | None = None,
         pass2: Pass2Session | None = None,
+        retest: BlindRetestSession | None = None,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError(f"AnnotationServer must bind strictly to 127.0.0.1, got {host!r}")
@@ -954,6 +1142,7 @@ class AnnotationServer:
         self._token = session_token or secrets.token_urlsafe(32)
         self._pass1 = pass1
         self._pass2 = pass2
+        self._retest = retest
         self._httpd: _AnnotationHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -1048,8 +1237,62 @@ class AnnotationServer:
                                 "status": "ok",
                                 "pass1": owner._pass1 is not None,
                                 "pass2": owner._pass2 is not None,
+                                "retest": owner._retest is not None,
                             },
                         )
+                    elif path.startswith("/api/sessions/") and path.endswith("/prefix"):
+                        if owner._pass1 is None:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass1_not_configured"})
+                            return
+                        at_vals = qs.get("at_ms")
+                        if not at_vals:
+                            raise AnnotationValidationError("at_ms query parameter is required")
+                        at_ms = int(at_vals[0])
+                        inc_fut = str((qs.get("include_future") or [""])[0]).strip().lower()
+                        scroll_vals = qs.get("scroll_to_ms")
+                        if inc_fut in {"1", "true", "yes"} or (
+                            scroll_vals and int(scroll_vals[0]) > at_ms
+                        ):
+                            raise AnnotationLockError(
+                                f"scroll_ahead_forbidden: cannot view past playhead at_ms={at_ms}"
+                            )
+                        sid = path.removeprefix("/api/sessions/").removesuffix("/prefix").strip("/")
+                        self._send_json(
+                            HTTPStatus.OK,
+                            {
+                                "session_id": sid,
+                                "at_ms": at_ms,
+                                "events": owner._pass1.prefix_at(at_ms),
+                            },
+                        )
+                    elif path.startswith("/api/candidates/") and path.endswith("/step1"):
+                        if owner._pass2 is None:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass2_not_configured"})
+                            return
+                        cid = (
+                            path.removeprefix("/api/candidates/").removesuffix("/step1").strip("/")
+                        )
+                        self._send_json(HTTPStatus.OK, owner._pass2.get_item_view(cid))
+                    elif path == "/api/review-queue":
+                        if owner._pass2 is None:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass2_not_configured"})
+                            return
+                        self._send_json(HTTPStatus.OK, {"items": owner._pass2.review_queue_list()})
+                    elif path == "/api/retest/kappa":
+                        if owner._retest is None:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND, {"error": "retest_not_configured"}
+                            )
+                            return
+                        self._send_json(HTTPStatus.OK, owner._retest.kappa_report())
+                    elif path.startswith("/api/retest/"):
+                        if owner._retest is None:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND, {"error": "retest_not_configured"}
+                            )
+                            return
+                        rid = path.removeprefix("/api/retest/").strip("/")
+                        self._send_json(HTTPStatus.OK, owner._retest.get_item(rid))
                     elif path == "/api/pass1/state":
                         if owner._pass1 is None:
                             self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass1_not_configured"})
@@ -1060,10 +1303,10 @@ class AnnotationServer:
                             self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass1_not_configured"})
                             return
                         at_vals = qs.get("at_ms")
-                        at_ms = int(at_vals[0]) if at_vals else None
+                        opt_at_ms = int(at_vals[0]) if at_vals else None
                         self._send_json(
                             HTTPStatus.OK,
-                            {"events": owner._pass1.visible_events(at_ms=at_ms)},
+                            {"events": owner._pass1.visible_events(at_ms=opt_at_ms)},
                         )
                     elif path == "/api/pass2/items":
                         if owner._pass2 is None:
@@ -1128,6 +1371,75 @@ class AnnotationServer:
                             categories=body.get("categories") or (),
                             notes=body.get("notes"),
                             confidence=str(body.get("confidence", "sure")),
+                        )
+                        self._send_json(HTTPStatus.OK, {"label": lbl.to_dict()})
+                    elif path.startswith("/api/sessions/") and path.endswith("/marks"):
+                        if owner._pass1 is None:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass1_not_configured"})
+                            return
+                        eq = body.get("example_questions") or ()
+                        if not eq and body.get("question"):
+                            eq = [str(body["question"])]
+                        lbl = owner._pass1.mark_opportunity(
+                            example_questions=eq,
+                            categories=body.get("categories") or (),
+                            notes=body.get("notes"),
+                            confidence=str(body.get("confidence", "sure")),
+                            at_ms=int(body["at_ms"]) if body.get("at_ms") is not None else None,
+                            state_version_override=(
+                                int(body["state_version"])
+                                if body.get("state_version") is not None
+                                else None
+                            ),
+                        )
+                        self._send_json(HTTPStatus.OK, {"label": lbl.to_dict()})
+                    elif path.startswith("/api/candidates/"):
+                        if owner._pass2 is None:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "pass2_not_configured"})
+                            return
+                        rest = path.removeprefix("/api/candidates/")
+                        if rest.endswith("/step1"):
+                            cid = rest.removesuffix("/step1").strip("/")
+                            view = owner._pass2.set_step1(
+                                cid,
+                                worthwhile=body["worthwhile"],
+                                categories=body.get("categories") or (),
+                                example_questions=body.get("example_questions") or (),
+                                none_reason=body.get("none_reason"),
+                                confidence=str(body.get("confidence", "sure")),
+                                sample_source=body.get("sample_source"),
+                            )
+                            self._send_json(HTTPStatus.OK, view)
+                        elif rest.endswith("/step2/unlock"):
+                            cid = rest.removesuffix("/step2/unlock").strip("/")
+                            payload = (
+                                body.get("step1")
+                                if "step1" in body
+                                else (body if "worthwhile" in body else None)
+                            )
+                            view = owner._pass2.reveal_continuation(cid, step1_payload=payload)
+                            self._send_json(HTTPStatus.OK, view)
+                        elif rest.endswith("/step2"):
+                            cid = rest.removesuffix("/step2").strip("/")
+                            lbl = owner._pass2.submit_step2(cid, **body)
+                            self._send_json(HTTPStatus.OK, {"label": lbl.to_dict()})
+                        else:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    elif path.startswith("/api/retest/"):
+                        if owner._retest is None:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND, {"error": "retest_not_configured"}
+                            )
+                            return
+                        rid = path.removeprefix("/api/retest/").strip("/")
+                        lbl = owner._retest.submit_item(
+                            rid,
+                            worthwhile=body["worthwhile"],
+                            categories=body.get("categories") or (),
+                            none_reason=body.get("none_reason"),
+                            example_questions=body.get("example_questions") or (),
+                            confidence=str(body.get("confidence", "sure")),
+                            notes=body.get("notes"),
                         )
                         self._send_json(HTTPStatus.OK, {"label": lbl.to_dict()})
                     elif path.startswith("/api/pass2/items/"):

@@ -487,8 +487,22 @@ class SuggestionController:
 
         self._state = CanonicalState(brief)
         self._cursor = CoverageCursor()
-        self._health: HealthState = HealthState.PAUSED if mode is Mode.PAUSED else HealthState.OK
-        self._health_reason: str | None = "paused" if mode is Mode.PAUSED else None
+        local_blocked = (
+            provider is not None
+            and provider.config.local_only
+            and provider.config.effective_is_hosted
+        )
+        self._health: HealthState
+        self._health_reason: str | None
+        if mode is Mode.PAUSED:
+            self._health = HealthState.PAUSED
+            self._health_reason = "paused"
+        elif local_blocked:
+            self._health = HealthState.TEMPLATE_ONLY
+            self._health_reason = "local_only"
+        else:
+            self._health = HealthState.OK
+            self._health_reason = None
         self._health_timeline: list[dict[str, Any]] = [
             {
                 "at_ms": self._clock.now_ms(),
@@ -503,6 +517,8 @@ class SuggestionController:
         self._last_transcript_event_ms: int = self._clock.now_ms()
         self._last_gap_ms: int | None = None
         self._recipient_speaking = False
+        self._recipient_speaking_until_ms: int = 0
+        self._otr_start_ms: int | None = None
         self._speaker_update_times: dict[str, int] = {}
         self._speaker_boundary_end_ms: dict[str, int] = {}
         self._speaker_boundary_rx_ms: dict[str, int] = {}
@@ -695,6 +711,7 @@ class SuggestionController:
                 "category": cand.category.value,
                 "category_chip": CATEGORY_CHIPS.get(cand.category.value, cand.category.value),
                 "text": cand.text,
+                "question": cand.text,
                 "word_count": cand.word_count,
                 "pinned": self._active.pinned,
                 "origin": cand.origin.value,
@@ -721,9 +738,16 @@ class SuggestionController:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        if self._ui_broadcast_task is not None and not self._ui_broadcast_task.done():
-            self._ui_broadcast_task.cancel()
-        self._ui_broadcast_task = loop.create_task(self._ui.broadcast_state(ui_snap))
+        prev = self._ui_broadcast_task
+        ui_server = self._ui
+
+        async def _send() -> None:
+            if prev is not None and not prev.done():
+                with contextlib.suppress(BaseException):
+                    await prev
+            await ui_server.broadcast_state(ui_snap)
+
+        self._ui_broadcast_task = loop.create_task(_send())
 
     def set_recipient_speaking(self, speaking: bool) -> None:
         self._recipient_speaking = speaking
@@ -956,6 +980,10 @@ class SuggestionController:
             if ev.stability is Stability.INTERIM:
                 self._recipient_speaking = True
             elif ev.stability is Stability.COMMITTED and ev.segment_id:
+                self._recipient_speaking_until_ms = max(
+                    self._recipient_speaking_until_ms, ev.received_ms + 1400
+                )
+                self._display_wake.set()
                 seg = snap.segments_by_id.get(ev.segment_id)
                 if seg is not None:
                     self._check_used_inferred(seg)
@@ -1133,15 +1161,18 @@ class SuggestionController:
             has_overflow = len(live_anchors) > max_per_job
             selected = live_anchors[-max_per_job:]
 
+            batch_prev_norm = self._prev_anchor_norm_text
+            norm_by_cand: dict[str, str] = {}
             surviving: list[ContextBuildResult] = []
             for anchor in selected:
                 pf = run_prefilter(
                     anchor,
                     state_version=snap.state_version,
-                    previous_anchor_norm_text=self._prev_anchor_norm_text,
+                    previous_anchor_norm_text=batch_prev_norm,
                 )
-                self._prev_anchor_norm_text = pf.normalized_text
+                batch_prev_norm = pf.normalized_text
                 if not pf.passed and pf.drop_record is not None:
+                    self._prev_anchor_norm_text = pf.normalized_text
                     drop = pf.drop_record
                     dummy_ctx = DecisionContext(
                         schema_version=SCHEMA_VERSION,
@@ -1177,6 +1208,8 @@ class SuggestionController:
                         tokenizer=self._classifier.tokenizer,
                         suggestion_catalog=self._suggestions_by_id,
                     )
+                    if built.context is not None:
+                        norm_by_cand[built.context.candidate_id] = pf.normalized_text
                     surviving.append(built)
 
         if not surviving:
@@ -1208,6 +1241,7 @@ class SuggestionController:
                 bool,
             ]
         ] = []
+        retry_pending = False
         async with self._state_lock:
             current_snap = self._state.snapshot()
             recipient_ids = {"ME", current_snap.brief.recipient.participant_id}
@@ -1217,9 +1251,23 @@ class SuggestionController:
                 assert built.context is not None and built.serialized_text is not None
                 ctx = built.context
                 if self._calibration is not None and not isinstance(clf_raw, ClassifierErrorResult):
-                    clf_res = self._calibration.calibrate(
-                        ctx, clf_raw, mode=current_snap.brief.mode
-                    )
+                    if isinstance(self._calibration, CalibrationRegistry):
+                        cal_ver = (
+                            self._policy.classifier.calibration
+                            if self._policy.classifier.calibration
+                            and clf_raw.classifier_version == self._policy.classifier.version
+                            else None
+                        )
+                        clf_res = self._calibration.calibrate(
+                            ctx,
+                            clf_raw,
+                            mode=current_snap.brief.mode,
+                            calibration_version=cal_ver,
+                        )
+                    else:
+                        clf_res = self._calibration.calibrate(
+                            ctx, clf_raw, mode=current_snap.brief.mode
+                        )
                 else:
                     clf_res = clf_raw
 
@@ -1229,6 +1277,35 @@ class SuggestionController:
                     or cur_seg.speaker_id in recipient_ids
                     for ref in ctx.anchor_refs
                 )
+                if (
+                    not stale
+                    and isinstance(clf_raw, ClassifierErrorResult)
+                    and clf_raw.error in {"timeout", "deadline_exceeded"}
+                ):
+                    if (
+                        clf_raw.error == "timeout"
+                        and self._consecutive_clf_errors < self._classifier_error_threshold
+                        and self._clock.now_ms() < ctx.display_by_ms
+                        and self.health is not HealthState.MANUAL_ONLY
+                    ):
+                        retry_pending = True
+                        continue
+                    if (
+                        self._clock.now_ms() >= ctx.display_by_ms
+                        or clf_raw.error == "deadline_exceeded"
+                        or self.health is HealthState.MANUAL_ONLY
+                    ):
+                        self._retire_anchor(
+                            built.anchor,
+                            state_version=current_snap.state_version,
+                            reason=ReasonCode.EXPIRED_UNEVALUATED,
+                        )
+                        self._cursor.mark_covered(built.anchor.segments)
+                        if ctx.candidate_id in norm_by_cand:
+                            self._prev_anchor_norm_text = norm_by_cand[ctx.candidate_id]
+                        continue
+                if ctx.candidate_id in norm_by_cand:
+                    self._prev_anchor_norm_text = norm_by_cand[ctx.candidate_id]
                 eff_health = (
                     HealthState.OK if (probe_ready and not probe_reserved) else self._health
                 )
@@ -1346,7 +1423,7 @@ class SuggestionController:
                 ledger_cats_copy=l_cats,
                 is_probe=is_probe,
             )
-        return has_overflow
+        return has_overflow or retry_pending
 
     def _record_gen_latency(self, elapsed_ms: int) -> None:
         self._gen_latencies_ms.append(max(0, elapsed_ms))
@@ -2013,9 +2090,23 @@ class SuggestionController:
                     if self._calibration is not None and not isinstance(
                         clf_raw, ClassifierErrorResult
                     ):
-                        clf_res = self._calibration.calibrate(
-                            ctx, clf_raw, mode=cur_snap.brief.mode
-                        )
+                        if isinstance(self._calibration, CalibrationRegistry):
+                            cal_ver = (
+                                self._policy.classifier.calibration
+                                if self._policy.classifier.calibration
+                                and clf_raw.classifier_version == self._policy.classifier.version
+                                else None
+                            )
+                            clf_res = self._calibration.calibrate(
+                                ctx,
+                                clf_raw,
+                                mode=cur_snap.brief.mode,
+                                calibration_version=cal_ver,
+                            )
+                        else:
+                            clf_res = self._calibration.calibrate(
+                                ctx, clf_raw, mode=cur_snap.brief.mode
+                            )
                     else:
                         clf_res = clf_raw
                     routing = route_candidate(
@@ -2584,12 +2675,33 @@ class SuggestionController:
         act = str(action.get("action") or "").strip().lower()
         now_ms = self._clock.now_ms()
         if act == "manual":
-            await self.trigger_manual()
+            if self._started and not self._stopping:
+                if self._manual_in_flight:
+                    await self.trigger_manual()
+                else:
+                    self._manual_in_flight = True
+                    loop = asyncio.get_running_loop()
+                    fut: asyncio.Future[ManualResult] = loop.create_future()
+                    try:
+                        await self._manual_queue.put(fut)
+                    except BaseException:
+                        self._manual_in_flight = False
+                        raise
+            else:
+                await self.trigger_manual()
             return self.build_ui_snapshot().to_dict()
         if act == "off_record":
-            target = (
-                self._pre_otr_mode if self._mode is Mode.OFF_THE_RECORD else Mode.OFF_THE_RECORD
-            )
+            active_arg = action.get("active")
+            if isinstance(active_arg, bool):
+                target = (
+                    Mode.OFF_THE_RECORD
+                    if active_arg
+                    else (self._pre_otr_mode if self._mode is Mode.OFF_THE_RECORD else self._mode)
+                )
+            else:
+                target = (
+                    self._pre_otr_mode if self._mode is Mode.OFF_THE_RECORD else Mode.OFF_THE_RECORD
+                )
             await self.set_mode(target)
             return self.build_ui_snapshot().to_dict()
         if act == "mode":
@@ -2610,7 +2722,23 @@ class SuggestionController:
                 )
             elif act == "dismiss":
                 fb_raw = action.get("feedback")
-                fb = FeedbackReason(str(fb_raw)) if fb_raw else None
+                if fb_raw is None:
+                    fb_raw = action.get("key")
+                fb_key_map = {
+                    "1": "too_late",
+                    "2": "already_answered",
+                    "3": "not_relevant",
+                    "4": "badly_phrased",
+                }
+                if fb_raw is not None:
+                    fb_norm = fb_key_map.get(str(fb_raw).strip(), str(fb_raw).strip())
+                    fb = (
+                        FeedbackReason(fb_norm)
+                        if fb_norm in {e.value for e in FeedbackReason}
+                        else None
+                    )
+                else:
+                    fb = None
                 await self._transition_active(
                     LedgerState.DISMISSED, ReasonCode.USER_ACTION, at_ms=now_ms, feedback=fb
                 )
@@ -2639,6 +2767,7 @@ class SuggestionController:
             now_ms = self._clock.now_ms()
             if new_mode is Mode.OFF_THE_RECORD:
                 self._pre_otr_mode = self._mode
+                self._otr_start_ms = now_ms
                 await self._retire_uncovered_segments(self._state.snapshot(), ReasonCode.OFF_RECORD)
                 await self._close_open_items_for_halt()
                 self._mode = Mode.OFF_THE_RECORD
@@ -2663,6 +2792,8 @@ class SuggestionController:
                     )
             elif self._mode is Mode.OFF_THE_RECORD:
                 self._mode = new_mode
+                otr_start = self._otr_start_ms if self._otr_start_ms is not None else now_ms
+                self._otr_start_ms = None
                 ctrl = CanonicalEvent(
                     schema_version=SCHEMA_VERSION,
                     session_id=self._brief.session_id,
@@ -2672,6 +2803,8 @@ class SuggestionController:
                     source_sequence=0,
                     source_id="controller",
                     subtype=ControlSubtype.OFF_RECORD_END,
+                    start_ms=otr_start,
+                    end_ms=max(otr_start, now_ms),
                     reason="off_record",
                 )
                 res = self._state.apply(ctrl)
@@ -2679,6 +2812,27 @@ class SuggestionController:
                     self._enqueue_recorder(
                         "canonical_event",
                         event=ctrl,
+                        retention=self._brief.retention,
+                        canonical_revision=None,
+                    )
+                gap_ctrl = CanonicalEvent(
+                    schema_version=SCHEMA_VERSION,
+                    session_id=self._brief.session_id,
+                    event_id=self._next_evt_id("otr-gap"),
+                    kind=EventKind.CONTROL,
+                    received_ms=now_ms,
+                    source_sequence=0,
+                    source_id="controller",
+                    subtype=ControlSubtype.GAP,
+                    start_ms=otr_start,
+                    end_ms=max(otr_start, now_ms),
+                    reason="off_record",
+                )
+                gap_res = self._state.apply(gap_ctrl)
+                if gap_res.accepted:
+                    self._enqueue_recorder(
+                        "canonical_event",
+                        event=gap_ctrl,
                         retention=self._brief.retention,
                         canonical_revision=None,
                     )
@@ -2690,7 +2844,11 @@ class SuggestionController:
             if self._mode is Mode.PAUSED:
                 self._set_health(HealthState.PAUSED, "paused")
             elif self._health is HealthState.PAUSED:
-                if self._provider is not None and self._provider.breaker_state is BreakerState.OPEN:
+                if self._consecutive_clf_errors >= self._classifier_error_threshold:
+                    self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
+                elif self._local_only_blocked() or (
+                    self._provider is not None and self._provider.breaker_state is BreakerState.OPEN
+                ):
                     self._set_health(HealthState.TEMPLATE_ONLY, "generator_breaker_open")
                 else:
                     self._set_health(HealthState.OK, "resumed")
@@ -2712,6 +2870,8 @@ class SuggestionController:
                 deadlines.append(self._deferred.cooldown_end_ms)
         if self._active is not None and not self._active.pinned:
             deadlines.append(self._active.expires_at_ms)
+        if (self._settling or self._deferred is not None) and self._recipient_speaking_until_ms > 0:
+            deadlines.append(self._recipient_speaking_until_ms)
         return min(deadlines) if deadlines else None
 
     def _next_display_wake_ms(self) -> int | None:
@@ -2724,6 +2884,10 @@ class SuggestionController:
                 deadlines.append(self._deferred.cooldown_end_ms)
         if self._active is not None and not self._active.pinned:
             deadlines.append(self._active.expires_at_ms)
+        if (
+            self._settling or self._deferred is not None
+        ) and self._recipient_speaking_until_ms > self._clock.now_ms():
+            deadlines.append(self._recipient_speaking_until_ms)
         if (
             self._mode not in {Mode.PAUSED, Mode.OFF_THE_RECORD}
             and self._health is not HealthState.NO_TRANSCRIPT
@@ -2790,6 +2954,7 @@ class SuggestionController:
         if (
             self._mode not in {Mode.PAUSED, Mode.OFF_THE_RECORD}
             and self._health is not HealthState.NO_TRANSCRIPT
+            and self._proactive_idle.is_set()
             and (now_ms - self._last_transcript_event_ms)
             >= self._policy.health.no_transcript_after_ms
         ):
@@ -2877,7 +3042,7 @@ class SuggestionController:
         self._settling = still_settling
 
     def _display_moment_block(self, now_ms: int, snap: StateSnapshot) -> ReasonCode | None:
-        if self._recipient_speaking:
+        if self._recipient_speaking or now_ms < self._recipient_speaking_until_ms:
             return ReasonCode.RECIPIENT_SPEAKING
         if self._active is not None:
             return ReasonCode.CARD_ACTIVE
