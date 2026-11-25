@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import httpx
 import pytest
 
 from coach.candidate_validator import (
+    _DATE_EXPR_RE,
     parse_generator_json,
     validate_generated_candidate,
     validate_template_candidate,
@@ -1211,6 +1213,134 @@ def test_check4_prep_month_no_backtrack_and_wrapped_day_year() -> None:
     ]:
         res = _val(ok_q, grounded_snap, ["s1"])
         assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
+
+
+def test_check4_comma_inside_wrappers_brackets_hyphens_and_linear_scan() -> None:
+    brief = SessionBrief(
+        schema_version=1,
+        session_id="sess-gen",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="me-1", role="reviewer"),
+        objective="Review Q4 rollout.",
+        participants=(Participant(participant_id="spk-1", label="S1", role="owner"),),
+        agenda=("Rollout",),
+        known_facts=(),
+    )
+    state = CanonicalState(brief)
+    state.apply(
+        _seg(
+            "s1",
+            "We provisioned 12 servers for the March 30 rollout and may ship in 2026.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    snap = state.snapshot()
+
+    def _val(question: str, s: Any = snap) -> Any:
+        return validate_generated_candidate(
+            json.dumps(
+                {
+                    "question": question,
+                    "evidence_segment_ids": ["s1"],
+                    "decline_reason": None,
+                }
+            ),
+            finish_reason="stop",
+            category=Category.CONFIRM_TIME,
+            snapshot=s,
+            supplied_segment_ids=["s1"],
+        )
+
+    for bad_q in [
+        'Should we ship in "may," 2026?',
+        "Should we ship by _may,_ 2026?",
+        "Should we ship by *may,* 2026?",
+        'Should we ship on "March 30," 2026?',
+        "Should we ship on _March 30,_ 2026?",
+        'Is "may," 2026 our target?',
+        "Should we ship by (may), 2026?",
+        "Should we ship by [may], 2026?",
+        "Should we ship by _may_ - 2026?",
+        "Should we ship by may-2026?",
+    ]:
+        res = _val(bad_q)
+        assert not res.valid and res.failed_check == 4, (
+            f"Expected Check 4 reject for {bad_q!r}, got {res}"
+        )
+
+    no_may_state = CanonicalState(brief)
+    no_may_state.apply(
+        _seg(
+            "s1",
+            "We provisioned 12 servers for the March 30 rollout.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    no_may_snap = no_may_state.snapshot()
+    for bad_no_may in [
+        "Should we ship in (may)?",
+        'Should we ship by "may,"?',
+    ]:
+        res = _val(bad_no_may, no_may_snap)
+        assert not res.valid and res.failed_check == 4, (
+            f"Expected Check 4 reject for {bad_no_may!r}, got {res}"
+        )
+
+    grounded_brief = SessionBrief(
+        schema_version=1,
+        session_id="sess-gen",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="me-1", role="reviewer"),
+        objective="Review Q4 plan.",
+        participants=(Participant(participant_id="spk-1", label="S1", role="owner"),),
+        agenda=("Rollout",),
+        known_facts=(KnownFact(key="target", value="May, 2026"),),
+    )
+    grounded_state = CanonicalState(grounded_brief)
+    grounded_state.apply(
+        _seg(
+            "s1",
+            "We may ship on March 30, 2026.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    grounded_snap = grounded_state.snapshot()
+    for ok_q in [
+        "Should we ship by _may,_ 2026?",
+        'Should we ship on "March 30," 2026?',
+        "Should we ship by (may), 2026?",
+        "Should we ship by may-2026?",
+        "Should we ship in (may)?",
+    ]:
+        res = _val(ok_q, grounded_snap)
+        assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
+
+    t0 = time.perf_counter()
+    res_long = _val("_" * 2000 + " ship?")
+    dt_validate = time.perf_counter() - t0
+    assert res_long.valid is True
+    assert dt_validate < 0.1, f"Quadratic scan regression: validate took {dt_validate:.3f}s"
+
+    t1 = time.perf_counter()
+    matches = list(_DATE_EXPR_RE.finditer("by " + "_" * 2000 + " may"))
+    dt_regex = time.perf_counter() - t1
+    assert matches == []
+    assert dt_regex < 0.1, f"Quadratic scan regression: finditer took {dt_regex:.3f}s"
+
+    t2 = time.perf_counter()
+    wrapped_matches = list(_DATE_EXPR_RE.finditer("by " + "_" * 2000 + "may"))
+    dt_wrapped = time.perf_counter() - t2
+    assert len(wrapped_matches) == 1 and wrapped_matches[0].group("prep_month") == "may"
+    assert dt_wrapped < 0.1, f"Quadratic scan regression: wrapped finditer took {dt_wrapped:.3f}s"
 
 
 def test_check5_do_not_suggest_underscore_bypass_blocked() -> None:
