@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Earshot Coach</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="coach-shell">
+    <header class="status-bar" aria-live="polite">
+      <div class="status-group">
+        <span id="health-badge" class="badge health-ok">health: ok</span>
+        <span id="mode-badge" class="badge mode-badge">mode: proactive</span>
+        <span id="health-reason" class="health-reason"></span>
+      </div>
+      <div class="controls-bar">
+        <button id="btn-manual" type="button" title="Manual suggestion (m)">Manual (m)</button>
+        <button id="btn-off-record" type="button" title="Toggle off the record (o)">Off Record (o)</button>
+      </div>
+    </header>
+
+    <section id="manual-banner" class="manual-banner hidden" aria-live="polite"></section>
+
+    <section id="card-panel" class="card-panel hidden" aria-live="polite">
+      <div class="card-meta">
+        <span id="category-chip" class="category-chip"></span>
+        <span id="pinned-badge" class="pinned-badge hidden">PINNED</span>
+        <span id="origin-badge" class="origin-badge"></span>
+      </div>
+      <p id="card-question" class="card-question"></p>
+      <div class="card-actions">
+        <button id="btn-use" type="button">Use (u)</button>
+        <button id="btn-pin" type="button">Pin (p)</button>
+        <button id="btn-dismiss" type="button">Dismiss (d)</button>
+        <button id="btn-evidence" type="button" aria-expanded="false">Evidence (e)</button>
+      </div>
+      <div class="feedback-actions">
+        <button id="btn-fb-1" type="button">1: Too late</button>
+        <button id="btn-fb-2" type="button">2: Already answered</button>
+        <button id="btn-fb-3" type="button">3: Not relevant</button>
+        <button id="btn-fb-4" type="button">4: Badly phrased</button>
+      </div>
+      <section id="evidence-drawer" class="evidence-drawer hidden">
+        <div id="evidence-route" class="evidence-route"></div>
+        <ul id="evidence-list" class="evidence-list"></ul>
+      </section>
+    </section>
+
+    <section id="empty-panel" class="empty-panel">
+      <p id="empty-message">Listening. No card to show.</p>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

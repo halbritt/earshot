@@ -444,6 +444,15 @@ def _check_do_not_suggest(
     return None
 
 
+def check_do_not_suggest(
+    question: str,
+    category: Category,
+    brief: SessionBrief,
+) -> str | None:
+    """Return error reason if question or category matches brief.do_not_suggest."""
+    return _check_do_not_suggest(question, category, brief)
+
+
 def _content_tokens(text: str) -> set[str]:
     return {t for t in normalize_for_matching(text).split() if t and t not in _CONTENT_STOPWORDS}
 

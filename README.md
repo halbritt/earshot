@@ -1,34 +1,49 @@
-# earshot (working name)
+# earshot + coach
 
-A general-purpose front end for microphone arrays: echo cancellation, direction finding and
-beamforming for speech recognition, with the array given as a description file. It is meant
-for two uses: an agent that listens and speaks through one device, and a device that is put
-in a room to transcribe everyone.
+Two-layer live conversation audio front end and conversation coach:
 
-Status: the replay bench exists, and the first part of the core: array description, beam
-design, a fixed beam over a recording, and direction finding. Echo cancellation, speech
-detection and live capture are not built yet. See [docs/plan.md](docs/plan.md).
+1. **Rust Audio Front End (`crates/`):** `no_std` microphone-array beamforming, SRP-PHAT direction finding, echo/speech gating, and WER/CPU replay benchmark (`earshot` CLI and `earshot-bench`).
+2. **Python Live Conversation Coach (`coach/`, `policies/`, `coach/ui/`):** Python 3.14 (`uv`) `asyncio` 5-task coaching runtime with SQLite WAL persistence, organized along the 14 upward-only module boundaries in [`docs/design.md`](docs/design.md) §15, versioned YAML policies/templates (`policies/`), a private `127.0.0.1`-only token-gated WebSocket Card UI (`coach/ui/`), and a 2-pass locked annotation tool (`coach/annotation_tool.py`).
 
-- `docs/plan.md`: why, the design rules, the stages, the interfaces and the order of work.
-- `docs/design.md`: live conversation coach — classifier architecture, `peecee` streaming transcription adapter, and implementation plan.
-- `crates/earshot-bench/`: the replay bench, which scores any front-end variant on a recorded
-  take by word error rate and CPU time. See its [README](crates/earshot-bench/README.md).
-- `crates/earshot-core/`: the processing core, `no_std`: the array as data, delay-and-sum and
-  superdirective beam design, direction finding (SRP-PHAT over azimuth), and the transform. Its beam design is tested against the
-  simulation below.
-- `crates/earshot-cli/`: the `earshot` command, for recordings; there is no service yet.
-  - `earshot beam --array arrays/respeaker-core-v2.toml --steer 100 in.raw out.wav` puts one
-    fixed beam over a raw recording. `--steer 0:100,113.5:305` turns it at given times and
-    `--steer auto` follows the talker. This is what the bench runs as a variant.
-  - `earshot direction --array ... in.raw` prints where the sound comes from, twice a second.
-- `arrays/`: array description files.
-- `sim/arrays.py`: calculated directivity for candidate array geometries
-  (`python3 sim/arrays.py`, needs NumPy; takes a few minutes). It is a one-off calculation;
-  the core's beam design now gives the same numbers.
+## Repository Layout
+
+- `crates/earshot-core/`: `no_std` array geometry, delay-and-sum/superdirective beamforming, SRP-PHAT azimuth direction finding, and FFT transform.
+- `crates/earshot-cli/`: `earshot` CLI (`beam`, `direction`).
+- `crates/earshot-bench/`: replay benchmark scoring front-end variants by WER and CPU time.
+- `coach/`: 14 §15 modules (`transcript_adapter`, `canonical_state` + `contracts` + `storage`, `context_builder`, `opportunity_classifier`, `calibration`, `routing_policy`, `template_renderer`, `question_generator`, `provider_adapter`, `candidate_validator`, `suggestion_controller`, `replay_evaluator`, `annotation_tool`, `telemetry`), `coach/ui/`, and `coach/cli.py` (`coach`).
+- `policies/`: immutable versioned policy (`policies/policy-v0-a.yaml`) and grounded YAML templates (`policies/templates/*.yaml`).
+- `arrays/`, `sim/`: array geometry descriptions and acoustic directivity simulations.
+- `docs/plan.md`, `docs/design.md`: front-end architecture and Live Conversation Coach specification (v0.4).
+
+## `coach` CLI Subcommands
+
+Install/sync Python dependencies with `uv sync --frozen`, then invoke `uv run coach <subcommand>`:
+
+- `coach serve --brief <brief.json> --policy <policy.yaml> --db <coach.db> [--source peecee|deepgram|replay] [--stream-file <path>] [--ws-url <url>] [--ui-port <port>] [--local-only]`: runs the 5-task `asyncio` runtime and private `127.0.0.1` token-gated Card UI.
+- `coach replay --session <jsonl|db> --policy <policy.yaml> [--db <coach.db>] [--labels <labels.jsonl>] [--split-by conversation|series] [--eval-log <path>] [--sweep-t-display <csv>] [--json]`: deterministic policy-level replay and validity-interval opportunity matching.
+- `coach diff --db <coach.db> --run-a <id> --run-b <id> [--labels <labels.jsonl>] [--bootstrap] [--json]`: compares gained/lost/changed cards across two runs, with optional paired conversation bootstrap.
+- `coach report --db <coach.db> --session <id> [--run-id <id>] [--json]`: generates per-session report and checks all 6 §13.2 conservation invariants.
+- `coach explain --db <coach.db> --session <id> --at-ms <int> [--window-ms <int>] [--json]`: queries anchors, scores, routing outcomes, and terminal reasons in a window.
+- `coach annotate --session <jsonl|db> --out <labels.jsonl> [--pass 1|2] [--port <port>]` or `coach annotate --labels <first.jsonl> --kappa <retest.jsonl> [--json]`: 2-pass locked localhost annotation UI and blind test-retest Cohen's kappa.
+- `coach bench --contexts <jsonl> --classifier <name> [--batch-sizes 1,4,8] [--tokens 128,256,512,1024,2048] [--json]`: latency and memory benchmark across real serialized contexts.
+- `coach train --data <jsonl> --out <model_dir> [--backend embed_logreg|modernbert]`: trains `EmbedLogRegClassifier` or optional `ModernBERT`.
+- `coach calibrate --data <labels.jsonl> --classifier <name> --mode <mode> --out <cal.json>`: fits per-head Platt calibration (requires `sample_source == "random"`).
+- `coach delete-session --db <coach.db> --session <id>`: §14.2 session text deletion with WAL checkpoint + `VACUUM`, preserving nulled decision metadata.
+
+### Environment Hooks
+
+- `COACH_SEAT_AZIMUTHS`: JSON object mapping speaker IDs (`ME`, `S1`, ...) to seat azimuth degrees for `RecipientBinder`.
+- `COACH_EARSHOT_DIRECTION_JSON`: path to `earshot direction` JSONL file or inline JSONL string.
+- Provider API keys: passed via `--provider-api-key-env <ENV_VAR>` (never stored in policy/config files).
+
+## Development, Lint & Tests
+
+- `mise run lint`: runs Rust (`cargo fmt --check`, `cargo clippy`) and Python (`ruff check`, `ruff format --check`, `mypy --strict`) checks.
+- `mise run test`: runs both `cargo test` (`mise run test:rust`) and `uv run --frozen pytest` (`mise run test:python`).
 
 ## Languages
 
-Rust for everything. C only where a target chip's toolchain leaves no other choice.
+Rust (`crates/`) for the real-time microphone-array DSP front end; Python 3.14 (`coach/`, `sim/`) for the conversation coach runtime, evaluation/training tooling, and array simulations.
 
 ## Licence
 

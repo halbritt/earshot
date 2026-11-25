@@ -414,6 +414,14 @@ class ProviderAdapter:
     def manual_waiting(self) -> int:
         return self._manual_waiting
 
+    @property
+    def opened_at_ms(self) -> int | None:
+        return self._opened_at_ms
+
+    @property
+    def half_open_probe_available(self) -> bool:
+        return self._breaker_state is BreakerState.HALF_OPEN and not self._half_open_in_flight
+
     def advance_clock(self, now_ms: int) -> BreakerState:
         """Evaluate scheduled OPEN -> HALF_OPEN recovery at now_ms (B13)."""
         if (

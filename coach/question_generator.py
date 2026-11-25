@@ -307,7 +307,9 @@ async def generate_question(
     remaining_ms = context.display_by_ms - now_ms
     effective_budget_ms = min(policy.generator.timeout_ms, remaining_ms - downstream_reserve_ms)
 
-    breaker_state = provider.advance_clock(now_ms)
+    use_prov_clk = clock_ms is not None and clock_ms != provider.clock_ms
+    prov_now_ms = provider.clock_ms() if use_prov_clk else now_ms
+    breaker_state = provider.advance_clock(prov_now_ms)
     local_blocked = provider.config.local_only and provider.config.effective_is_hosted
     p95_too_tight = stage_p95_ms is not None and remaining_ms < stage_p95_ms
     if (
@@ -418,6 +420,7 @@ async def generate_question(
                 from_cache=True,
             )
 
+    req_now_ms = provider.clock_ms() if use_prov_clk else now_ms
     req = GenerationRequest(
         session_id=snapshot.session_id,
         candidate_id=context.candidate_id,
@@ -425,7 +428,7 @@ async def generate_question(
         prompt_blocks=blocks,
         segment_ids=supplied_ids,
         output_token_cap=provider.config.output_token_cap,
-        deadline_ms=now_ms + effective_budget_ms,
+        deadline_ms=req_now_ms + effective_budget_ms,
     )
     try:
         resp = await provider.generate(req)

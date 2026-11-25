@@ -1,0 +1,100 @@
+:root {
+  color-scheme: dark;
+  --bg: #11161d;
+  --panel: #19222d;
+  --border: #2c3b4d;
+  --text: #eef3f8;
+  --muted: #9eb0c2;
+  --ok: #2ea043;
+  --warn: #d29922;
+  --err: #f85149;
+  --chip: #213448;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.coach-shell {
+  max-width: 640px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.status-bar, .card-panel, .empty-panel, .manual-banner {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.status-group, .card-meta, .card-actions, .feedback-actions, .controls-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.badge, .category-chip, .pinned-badge, .origin-badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--chip);
+}
+
+.health-ok { background: #173b24; color: #7ee787; }
+.health-warn { background: #3b2e13; color: #f2cc60; }
+.health-err { background: #491a1a; color: #ff7b72; }
+
+.card-question {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 10px 0;
+  line-height: 1.35;
+}
+
+.evidence-drawer {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.evidence-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.hidden {
+  display: none;
+}
+
+button {
+  background: #233040;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}

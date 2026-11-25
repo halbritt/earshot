@@ -397,16 +397,22 @@ def check_conservation_invariants(
     base_segments: dict[str, tuple[tuple[int, int], str]] = {}
     speaker_updates: dict[str, tuple[tuple[int, int, str], str]] = {}
     valid_revisions: set[tuple[str, int]] = set()
+    latest_committed_rev: dict[str, int] = {}
     if session is not None:
         for pair in _safe_json_loads(session.get("revision_history_json"), []):
             if isinstance(pair, list) and len(pair) == 2:
-                valid_revisions.add((str(pair[0]), int(pair[1])))
+                seg_key_pair, rev_val = str(pair[0]), int(pair[1])
+                valid_revisions.add((seg_key_pair, rev_val))
+                if rev_val > latest_committed_rev.get(seg_key_pair, 0):
+                    latest_committed_rev[seg_key_pair] = rev_val
 
     for ev in events:
         seg_id = ev.get("segment_id")
         can_rev = ev.get("canonical_revision")
         if isinstance(seg_id, str) and isinstance(can_rev, int):
             valid_revisions.add((seg_id, can_rev))
+            if can_rev > latest_committed_rev.get(seg_id, 0):
+                latest_committed_rev[seg_id] = can_rev
         if ev["kind"] == "segment" and ev["stability"] == "committed" and isinstance(seg_id, str):
             if ev.get("speaker_id"):
                 seg_key = (
@@ -431,9 +437,10 @@ def check_conservation_invariants(
         for seg_id, (_, spk) in base_segments.items()
     }
 
-    # Invariant 1: Every committed non-recipient segment belongs to exactly one anchor,
+    # Invariant 1: Every committed non-recipient segment (at its latest canonical revision)
+    # belongs to exactly one proactive anchor (and <= 1 per historical revision),
     # and every anchor is exactly one of scored, dropped, retired.
-    seg_anchor_counts: Counter[str] = Counter()
+    seg_rev_anchor_counts: Counter[tuple[str, int]] = Counter()
     prefilter_strs = {c.value for c in PREFILTER_REASON_CODES}
     sched_strs = {c.value for c in SCHEDULING_REASON_CODES}
     for dec in decisions:
@@ -441,7 +448,9 @@ def check_conservation_invariants(
         if dec.get("origin", "proactive") != "manual":
             for ref in anchor_refs:
                 if isinstance(ref, dict) and isinstance(ref.get("segment_id"), str):
-                    seg_anchor_counts[ref["segment_id"]] += 1
+                    rev = ref.get("revision")
+                    rev_int = int(rev) if isinstance(rev, int) else 1
+                    seg_rev_anchor_counts[(ref["segment_id"], rev_int)] += 1
         is_dropped = dec["terminal_state"] == "dropped"
         is_retired = dec["terminal_state"] == "retired"
         is_scored = dec["raw_scores_json"] is not None
@@ -472,16 +481,27 @@ def check_conservation_invariants(
                 )
             )
 
+    for (seg_id, rev), cnt in sorted(seg_rev_anchor_counts.items()):
+        if cnt > 1:
+            violations.append(
+                InvariantViolation(
+                    invariant_id=1,
+                    name="inv_1_segment_anchor_partition",
+                    detail=f"Segment {seg_id!r} revision {rev} belongs to {cnt} proactive anchors (expected <= 1)",
+                )
+            )
+
     for seg_id, speaker_id in committed_speakers.items():
         if speaker_id in recipient_ids:
             continue
-        cnt = seg_anchor_counts[seg_id]
+        target_rev = latest_committed_rev.get(seg_id, 1)
+        cnt = seg_rev_anchor_counts[(seg_id, target_rev)]
         if cnt != 1:
             violations.append(
                 InvariantViolation(
                     invariant_id=1,
                     name="inv_1_segment_anchor_partition",
-                    detail=f"Committed non-recipient segment {seg_id!r} belongs to {cnt} anchors (expected 1)",
+                    detail=f"Committed non-recipient segment {seg_id!r} (rev={target_rev}) belongs to {cnt} anchors (expected 1)",
                 )
             )
 

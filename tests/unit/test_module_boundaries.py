@@ -108,3 +108,53 @@ def test_m4_module_boundaries_upward_only() -> None:
         "candidate_validator",
     }
     assert not (re_imports & {"suggestion_controller", "annotation_tool", "telemetry", "cli"})
+
+
+def test_m5_module_boundaries_upward_only() -> None:
+    sc_imports = _coach_imports(COACH_DIR / "suggestion_controller.py")
+    assert sc_imports <= {
+        "transcript_adapter",
+        "contracts",
+        "canonical_state",
+        "storage",
+        "context_builder",
+        "opportunity_classifier",
+        "calibration",
+        "routing_policy",
+        "template_renderer",
+        "question_generator",
+        "provider_adapter",
+        "candidate_validator",
+        "ui",
+    }
+    assert not (sc_imports & {"replay_evaluator", "annotation_tool", "telemetry", "cli"})
+
+    for ui_file in sorted((COACH_DIR / "ui").glob("*.py")):
+        ui_imports = _coach_imports(ui_file) - {"ui"}
+        assert ui_imports <= {"contracts", "canonical_state"}
+        assert not (
+            ui_imports
+            & {"suggestion_controller", "replay_evaluator", "annotation_tool", "telemetry", "cli"}
+        )
+
+    ann_imports = _coach_imports(COACH_DIR / "annotation_tool.py")
+    assert ann_imports <= {
+        "transcript_adapter",
+        "contracts",
+        "canonical_state",
+        "storage",
+        "context_builder",
+        "opportunity_classifier",
+        "calibration",
+        "routing_policy",
+        "template_renderer",
+        "question_generator",
+        "provider_adapter",
+        "candidate_validator",
+        "suggestion_controller",
+        "replay_evaluator",
+    }
+    assert not (ann_imports & {"telemetry", "cli"})
+
+    tel_imports = _coach_imports(COACH_DIR / "telemetry.py")
+    assert "cli" not in tel_imports
