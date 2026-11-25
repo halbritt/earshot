@@ -65,3 +65,46 @@ def test_storage_only_imports_contracts_and_canonical_state() -> None:
     imports = _coach_imports(COACH_DIR / "storage.py")
     assert imports <= {"contracts", "canonical_state"}
     assert not (imports & FORBIDDEN_BELOW_CANONICAL)
+
+
+def test_m4_module_boundaries_upward_only() -> None:
+    opp_imports = _coach_imports(COACH_DIR / "opportunity_classifier.py")
+    assert opp_imports <= {"contracts", "canonical_state", "storage", "context_builder"}
+    assert "provider_adapter" not in opp_imports
+
+    cal_imports = _coach_imports(COACH_DIR / "calibration.py")
+    assert cal_imports <= {
+        "contracts",
+        "canonical_state",
+        "storage",
+        "context_builder",
+        "opportunity_classifier",
+    }
+
+    rp_imports = _coach_imports(COACH_DIR / "routing_policy.py")
+    assert rp_imports <= {
+        "contracts",
+        "canonical_state",
+        "storage",
+        "context_builder",
+        "opportunity_classifier",
+        "calibration",
+    }
+    assert "candidate_validator" not in rp_imports
+
+    re_imports = _coach_imports(COACH_DIR / "replay_evaluator.py")
+    assert re_imports <= {
+        "transcript_adapter",
+        "contracts",
+        "canonical_state",
+        "storage",
+        "context_builder",
+        "opportunity_classifier",
+        "calibration",
+        "routing_policy",
+        "template_renderer",
+        "question_generator",
+        "provider_adapter",
+        "candidate_validator",
+    }
+    assert not (re_imports & {"suggestion_controller", "annotation_tool", "telemetry", "cli"})
