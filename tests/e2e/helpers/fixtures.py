@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import struct
 import wave
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -353,11 +355,16 @@ def build_control_event(
     return event
 
 
-def write_events_jsonl(path: Path, events: Iterable[dict[str, Any]]) -> Path:
+def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> Path:
+    """Write an iterable of JSON-serializable mappings as newline-delimited JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps(ev) for ev in events]
+    lines = [json.dumps(dict(row)) for row in rows]
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return path
+
+
+def write_events_jsonl(path: Path, events: Iterable[dict[str, Any]]) -> Path:
+    return write_jsonl(path, events)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -489,6 +496,90 @@ def build_label_record(
     }
 
 
+def build_decision_context_row(
+    *,
+    candidate_id: str = "candidate-0001",
+    session_id: str = "session-001",
+    origin: str = "proactive",
+    based_on_state_version: int = 1,
+    builder_version: str = "ctx-v0",
+    prefilter_version: str = "pre-v0",
+    anchor_refs: Sequence[Mapping[str, Any]] = ({"segment_id": "segment-0001", "revision": 1},),
+    context_refs: Sequence[Mapping[str, Any]] = (),
+    anchor_received_ms: int = 4450,
+    display_by_ms: int = 12450,
+    input_limit_tokens: int = 512,
+    anchor_text: str = "Someone should own the rollback plan.",
+    objective: str = "Verify cutover plan, rollback owner, and test evidence.",
+    context_turns: Sequence[str] = (),
+    serialized_text: str | None = None,
+    speaker_uncertain: bool = False,
+    asr_low_confidence: bool = False,
+    worthwhile: bool | None = None,
+    categories: Sequence[str] | None = None,
+    sample_source: str | None = None,
+) -> dict[str, Any]:
+    """Build a schema-v1 DecisionContext + serialized text JSONL row (§7.1, §5.3)."""
+    if serialized_text is None:
+        lines = [
+            f"[OBJECTIVE] {objective}",
+            "[ROLE] ME=reviewer | S1=engineer",
+            "[KNOWN] launch_date: March 3",
+            "[SUGGESTED] none",
+            "[CONTEXT]",
+            *context_turns,
+            f"[ANCHOR] S1: {anchor_text}",
+        ]
+        text_value = "\n".join(lines)
+    else:
+        text_value = serialized_text
+    sha256 = hashlib.sha256(text_value.encode("utf-8")).hexdigest()
+    header_tokens = len(f"{objective} ME=reviewer S1=engineer launch_date: March 3".split())
+    context_tokens = sum(len(turn.split()) for turn in context_turns)
+    anchor_tokens = len(anchor_text.split()) + 2
+    total_tokens = len(text_value.split())
+    row: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "candidate_id": candidate_id,
+        "session_id": session_id,
+        "origin": origin,
+        "based_on_state_version": based_on_state_version,
+        "builder_version": builder_version,
+        "prefilter_version": prefilter_version,
+        "anchor_refs": [dict(ref) for ref in anchor_refs],
+        "context_refs": [dict(ref) for ref in context_refs],
+        "anchor_received_ms": anchor_received_ms,
+        "display_by_ms": display_by_ms,
+        "token_counts": {
+            "header": header_tokens,
+            "suggested": 1,
+            "context": context_tokens,
+            "anchor": anchor_tokens,
+            "total": total_tokens,
+            "limit": input_limit_tokens,
+        },
+        "omitted": {"turns": 0, "suggestions": 0, "known_facts": 0},
+        "flags": {
+            "speaker_uncertain": speaker_uncertain,
+            "asr_low_confidence": asr_low_confidence,
+        },
+        "serialized_sha256": sha256,
+        "serialized_text": text_value,
+    }
+    if worthwhile is not None:
+        row["worthwhile"] = worthwhile
+    if categories is not None:
+        for cat in categories:
+            if cat not in CATEGORIES:
+                raise ValueError(f"Invalid category: {cat}")
+        row["categories"] = list(categories)
+    if sample_source is not None:
+        if sample_source not in SAMPLE_SOURCES:
+            raise ValueError(f"Invalid sample_source: {sample_source}")
+        row["sample_source"] = sample_source
+    return row
+
+
 def build_policy_dict(
     *,
     generator_enabled: bool = False,
@@ -573,11 +664,27 @@ def build_policy_dict(
     return policy
 
 
-def write_policy_yaml(path: Path, **overrides: Any) -> Path:
+def deep_merge_dict(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """Recursively merge overrides into a deep copy of base without clobbering sibling keys."""
+    merged: dict[str, Any] = copy.deepcopy(dict(base))
+    for key, value in overrides.items():
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[key] = deep_merge_dict(existing, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def write_policy_dict(path: Path, policy: Mapping[str, Any]) -> Path:
+    """Write a policy mapping to YAML."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    policy = build_policy_dict(**overrides)
-    path.write_text(yaml.safe_dump(policy, sort_keys=False), encoding="utf-8")
+    path.write_text(yaml.safe_dump(dict(policy), sort_keys=False), encoding="utf-8")
     return path
+
+
+def write_policy_yaml(path: Path, **overrides: Any) -> Path:
+    return write_policy_dict(path, build_policy_dict(**overrides))
 
 
 _TEMPLATES_SPEC: dict[str, dict[str, Any]] = {
@@ -1837,3 +1944,46 @@ def build_appendix_b_fixture(fixture_id: str) -> AppendixBFixture:
 def build_all_appendix_b_fixtures() -> dict[str, AppendixBFixture]:
     """Build all 24 Appendix B fixtures (B01..B24)."""
     return {fid: build_appendix_b_fixture(fid) for fid in _APPENDIX_B_BUILDERS}
+
+
+_POLICY_BUILDER_KWARGS: frozenset[str] = frozenset(
+    {
+        "generator_enabled",
+        "calibration",
+        "input_limit_tokens",
+        "max_candidates_per_job",
+        "settle_ms",
+        "cooldown_ms",
+        "max_cards_per_10_min",
+        "asr_confidence_floor",
+        "no_transcript_after_ms",
+        "extra_categories",
+    }
+)
+
+
+def write_appendix_b_workspace(fixture: AppendixBFixture, root: Path) -> dict[str, Path]:
+    """Materialize brief, events, policy, templates, and db_path for an Appendix B fixture."""
+    root.mkdir(parents=True, exist_ok=True)
+    policies_dir = root / "policies"
+    templates_dir = policies_dir / "templates"
+    write_templates_dir(templates_dir)
+    builder_kwargs = {
+        k: v for k, v in fixture.policy_overrides.items() if k in _POLICY_BUILDER_KWARGS
+    }
+    nested_overrides = {
+        k: v for k, v in fixture.policy_overrides.items() if k not in _POLICY_BUILDER_KWARGS
+    }
+    policy = deep_merge_dict(build_policy_dict(**builder_kwargs), nested_overrides)
+    policy_path = write_policy_dict(policies_dir / "policy-v0-a.yaml", policy)
+    brief_path = write_brief_json(root / "brief.json", fixture.brief)
+    events_path = write_jsonl(root / "events.jsonl", fixture.events)
+    return {
+        "root": root,
+        "brief_path": brief_path,
+        "events_path": events_path,
+        "policies_dir": policies_dir,
+        "templates_dir": templates_dir,
+        "policy_path": policy_path,
+        "db_path": root / "coach.db",
+    }

@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+import yaml
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
@@ -29,6 +30,8 @@ from websockets.http11 import Request, Response
 
 from tests.e2e.helpers.cli_runner import (
     ManagedProcess,
+    build_coach_test_env,
+    extract_ui_url_and_token,
     resolve_coach_cmd,
     resolve_earshot_cmd,
     run_cli,
@@ -46,9 +49,11 @@ from tests.e2e.helpers.db_assertions import (
 from tests.e2e.helpers.fixtures import (
     REASON_CODES,
     build_all_appendix_b_fixtures,
+    build_appendix_b_fixture,
     build_boundary_event,
     build_brief_update_event,
     build_control_event,
+    build_decision_context_row,
     build_deepgram_results,
     build_deepgram_utterance_end,
     build_label_record,
@@ -59,9 +64,14 @@ from tests.e2e.helpers.fixtures import (
     build_speaker_update_event,
     build_template_dict,
     chunk_pcm16_frames,
+    deep_merge_dict,
     generate_multichannel_pcm,
     generate_pcm16_silence,
     generate_pcm16_sine,
+    read_jsonl,
+    write_appendix_b_workspace,
+    write_jsonl,
+    write_policy_dict,
     write_wav_mono16,
 )
 from tests.e2e.helpers.mock_nemo_ws import (
@@ -700,6 +710,9 @@ def _ephemeral_annotation_stub() -> Iterator[str]:
             if parsed.path == "/api/retest/kappa":
                 self._send(200, {"worthwhile_kappa": 0.72, "per_category": {"CONFIRM_OWNER": 0.8}})
                 return
+            if parsed.path == "/api/review-queue":
+                self._send(200, {"items": [{"candidate_id": "cand-unlabeled", "origin": "replay"}]})
+                return
             self._send(404, {"error": "not found"})
 
         def do_POST(self) -> None:
@@ -722,6 +735,9 @@ def _ephemeral_annotation_stub() -> Iterator[str]:
             if self.path == "/api/candidates/cand-1/step2":
                 state["step2_data"]["cand-1"] = body
                 self._send(200, {"saved": True})
+                return
+            if self.path == "/api/retest/item-1":
+                self._send(200, {"saved": True, "item_id": "item-1", **body})
                 return
             self._send(404, {"error": "not found"})
 
@@ -789,9 +805,11 @@ def test_ui_client_security_xss_ws_and_annotation_lock() -> None:
                 await ws.send_manual_request()
                 await ws.send_mode("Quiet")
                 await ws.send_off_record(True)
-                for _ in range(6):
-                    ack = await ws.recv_json()
-                    assert ack["type"] == "ack"
+                ack = await ws.wait_for_message(lambda m: m.get("type") == "ack")
+                assert ack["action"] == "use"
+                for _ in range(5):
+                    next_ack = await ws.recv_json()
+                    assert next_ack["type"] == "ack"
 
         asyncio.run(_exercise_ws())
         assert [a["action"] for a in actions] == [
@@ -829,6 +847,12 @@ def test_ui_client_security_xss_ws_and_annotation_lock() -> None:
 
         retest = ann.get_retest_item("item-1")
         assert retest["item_id"] == "item-1"
+        submitted_retest = ann.submit_retest(
+            "item-1", worthwhile=False, categories=(), none_reason="no_gap"
+        )
+        assert submitted_retest["saved"] is True
+        queue = ann.get_review_queue()
+        assert queue == [{"candidate_id": "cand-unlabeled", "origin": "replay"}]
         kappa = ann.get_kappa_report()
         assert kappa["worthwhile_kappa"] == 0.72
 
@@ -1434,3 +1458,89 @@ def test_db_assertions_iteration3_regression_checks(tmp_path: Path) -> None:
         conn.commit()
     with pytest.raises(AssertionError, match="grounded_slots"):
         assert_session_text_deleted(slots_str_db, "s1")
+
+
+def test_e2_helper_extensions(tmp_path: Path) -> None:
+    # 1. deep_merge_dict preserves sibling keys in nested policy dicts
+    base = build_policy_dict()
+    merged = deep_merge_dict(
+        base,
+        {
+            "display": {"settle_ms": 250},
+            "generator": {"breaker": {"open_ms": 5000}},
+        },
+    )
+    assert merged["display"]["settle_ms"] == 250
+    assert merged["display"]["display_ttl_ms"] == 15000
+    assert merged["generator"]["breaker"]["open_ms"] == 5000
+    assert merged["generator"]["breaker"]["consecutive_failures"] == 3
+    assert base["display"]["settle_ms"] == 1500
+
+    # 2. write_policy_dict + write_jsonl + build_decision_context_row
+    pol_path = write_policy_dict(tmp_path / "custom_policy.yaml", merged)
+    loaded_pol = yaml.safe_load(pol_path.read_text(encoding="utf-8"))
+    assert loaded_pol["display"]["settle_ms"] == 250
+
+    ctx_row = build_decision_context_row(
+        candidate_id="cand-ctx-1",
+        context_turns=("S1: Can we deploy Friday?",),
+        worthwhile=True,
+        categories=("CONFIRM_OWNER",),
+        sample_source="random",
+    )
+    assert ctx_row["schema_version"] == 1
+    assert "[ANCHOR]" in ctx_row["serialized_text"]
+    assert ctx_row["token_counts"]["limit"] == 512
+    jsonl_path = write_jsonl(tmp_path / "contexts.jsonl", [ctx_row])
+    assert read_jsonl(jsonl_path) == [ctx_row]
+
+    # 3. write_appendix_b_workspace materializes B04 (flat settle_ms) and B13 (generator_enabled)
+    b04_ws = write_appendix_b_workspace(build_appendix_b_fixture("B04"), tmp_path / "b04")
+    assert b04_ws["brief_path"].is_file()
+    assert b04_ws["events_path"].is_file()
+    assert (b04_ws["templates_dir"] / "confirm_owner_v1.yaml").is_file()
+    b04_pol = yaml.safe_load(b04_ws["policy_path"].read_text(encoding="utf-8"))
+    assert b04_pol["display"]["settle_ms"] == 200
+    assert b04_pol["display"]["cooldown_ms"] == 20000
+    b13_ws = write_appendix_b_workspace(build_appendix_b_fixture("B13"), tmp_path / "b13")
+    b13_pol = yaml.safe_load(b13_ws["policy_path"].read_text(encoding="utf-8"))
+    assert b13_pol["generator"]["enabled"] is True
+    assert b13_pol["generator"]["breaker"]["open_ms"] == 60000
+
+    # 4. ManagedProcess.wait_for_output, extract_ui_url_and_token, build_coach_test_env
+    fake_bin = tmp_path / "bin" / "peecee-speech"
+    fake_bin.parent.mkdir(parents=True, exist_ok=True)
+    env = build_coach_test_env(
+        openai_base_url="http://127.0.0.1:9999/v1",
+        nemo_ws_url="ws://127.0.0.1:18921/v1/audio/transcriptions/realtime",
+        peecee_bin=fake_bin,
+        extra_env={"CUSTOM_FLAG": "1"},
+    )
+    assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9999/v1"
+    assert env["PEECEE_WS_URL"] == "ws://127.0.0.1:18921/v1/audio/transcriptions/realtime"
+    assert env["PATH"].startswith(str(fake_bin.parent))
+    assert env["CUSTOM_FLAG"] == "1"
+
+    script = (
+        "import sys, time; "
+        "print('UI listening http://127.0.0.1:43210/?token=tok_e2_abc', flush=True); "
+        "print('stderr-marker-ready', file=sys.stderr, flush=True); "
+        "time.sleep(10)"
+    )
+    with ManagedProcess([sys.executable, "-c", script], startup_timeout=5.0) as proc:
+        url, token = extract_ui_url_and_token(proc, default_port=9999, timeout=5.0)
+        assert url == "http://127.0.0.1:43210"
+        assert token == "tok_e2_abc"
+        err_match = proc.wait_for_output(r"stderr-marker-(\w+)", timeout=5.0)
+        assert err_match.group(1) == "ready"
+        with pytest.raises(TimeoutError, match="never-emitted-pattern"):
+            proc.wait_for_output("never-emitted-pattern", timeout=0.05)
+
+    # default_port fallback & short-lived process exit behavior
+    short_script = "print('token=tok_short_1', flush=True)"
+    with ManagedProcess([sys.executable, "-c", short_script], startup_timeout=5.0) as short_proc:
+        short_url, short_tok = extract_ui_url_and_token(short_proc, default_port=8765, timeout=5.0)
+        assert short_url == "http://127.0.0.1:8765"
+        assert short_tok == "tok_short_1"
+        with pytest.raises(RuntimeError, match="exited with code 0"):
+            short_proc.wait_for_output("missing-after-exit", timeout=1.0)

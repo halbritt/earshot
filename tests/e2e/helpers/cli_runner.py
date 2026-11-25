@@ -372,6 +372,43 @@ class ManagedProcess:
         self._proc = None
         return CliResult(rc, self.stdout_text, self.stderr_text, self._cmd, 0.0)
 
+    def wait_for_output(self, pattern: str, timeout: float = 5.0) -> re.Match[str]:
+        """Wait until combined stdout+stderr matches regex pattern or fail on exit/timeout."""
+        compiled = re.compile(pattern)
+        combined = self.stdout_text + "\n" + self.stderr_text
+        match = compiled.search(combined)
+        if match is not None:
+            return match
+        if self._proc is None:
+            raise RuntimeError(
+                f"Process is not running and output did not match {pattern!r}.\n"
+                f"stdout:\n{self.stdout_text}\nstderr:\n{self.stderr_text}"
+            )
+        deadline = time.monotonic() + timeout
+        while True:
+            rc = self._proc.poll()
+            if rc is not None:
+                for t in self._readers:
+                    t.join(timeout=1.0)
+                combined = self.stdout_text + "\n" + self.stderr_text
+                match = compiled.search(combined)
+                if match is not None:
+                    return match
+                raise RuntimeError(
+                    f"Process exited with code {rc} before matching {pattern!r}.\n"
+                    f"stdout:\n{self.stdout_text}\nstderr:\n{self.stderr_text}"
+                )
+            combined = self.stdout_text + "\n" + self.stderr_text
+            match = compiled.search(combined)
+            if match is not None:
+                return match
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeout}s waiting for {pattern!r}.\n"
+                    f"stdout:\n{self.stdout_text}\nstderr:\n{self.stderr_text}"
+                )
+            time.sleep(0.02)
+
 
 def start_coach_process(
     subcommand: str,
@@ -397,3 +434,49 @@ def start_coach_process(
         ready_regex=ready_regex,
         startup_timeout=startup_timeout,
     )
+
+
+def extract_ui_url_and_token(
+    proc: ManagedProcess,
+    default_port: int,
+    timeout: float = 5.0,
+) -> tuple[str, str]:
+    """Wait for and extract the localhost UI base URL and session token from process output."""
+    token_match = proc.wait_for_output(
+        r"(?:token=|[\"']token[\"']\s*:\s*[\"'])([A-Za-z0-9._-]+)",
+        timeout=timeout,
+    )
+    token = token_match.group(1)
+    combined = proc.stdout_text + "\n" + proc.stderr_text
+    url_match = re.search(r"http://127\.0\.0\.1:(\d+)", combined)
+    port = int(url_match.group(1)) if url_match is not None else default_port
+    return (f"http://127.0.0.1:{port}", token)
+
+
+def build_coach_test_env(
+    *,
+    openai_base_url: str | None = None,
+    nemo_ws_url: str | None = None,
+    peecee_bin: Path | None = None,
+    extra_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build environment overrides wiring coach CLI subprocesses to local test mocks."""
+    env: dict[str, str] = {}
+    if openai_base_url is not None:
+        env["OPENAI_BASE_URL"] = openai_base_url
+        env["COACH_OPENAI_BASE_URL"] = openai_base_url
+        env["OPENAI_API_KEY"] = "test-e2e-key"
+    if nemo_ws_url is not None:
+        env["PEECEE_WS_URL"] = nemo_ws_url
+        env["NEMO_WS_URL"] = nemo_ws_url
+        env["COACH_PEECEE_WS_URL"] = nemo_ws_url
+        env["COACH_NEMO_WS_URL"] = nemo_ws_url
+    if peecee_bin is not None:
+        peecee_dir = str(peecee_bin.parent)
+        existing_path = os.environ.get("PATH", "")
+        env["PATH"] = f"{peecee_dir}{os.pathsep}{existing_path}" if existing_path else peecee_dir
+        env["PEECEE_SPEECH_BIN"] = str(peecee_bin)
+        env["COACH_PEECEE_BIN"] = str(peecee_bin)
+    if extra_env:
+        env.update(extra_env)
+    return env

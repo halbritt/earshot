@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlsplit
@@ -85,6 +85,20 @@ class CardUISession:
             if msg.get("type") == "health" and health == expected_health:
                 return msg
             if health == expected_health:
+                return msg
+
+    async def wait_for_message(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            rem = deadline - asyncio.get_running_loop().time()
+            if rem <= 0:
+                raise TimeoutError("Timed out waiting for matching message on UI WS")
+            msg = await self.recv_json(timeout=rem)
+            if predicate(msg):
                 return msg
 
     async def send_action(self, action: str, **payload: Any) -> None:
@@ -447,3 +461,35 @@ class AnnotationClient:
         if "worthwhile_kappa" not in data or "per_category" not in data:
             raise AssertionError(f"Kappa report missing expected metrics: {data}")
         return data
+
+    def get_review_queue(self, *, path: str = "/api/review-queue") -> list[dict[str, Any]]:
+        target = path if path.startswith("/") else f"/{path}"
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"{self.base_url}{target}", headers=self._headers())
+        resp.raise_for_status()
+        data = resp.json()
+        items = data["items"] if isinstance(data, dict) and "items" in data else data
+        if not isinstance(items, list) or not all(isinstance(row, dict) for row in items):
+            raise AssertionError(f"Expected list[dict] from {target}, got {type(data).__name__}")
+        return list(items)
+
+    def submit_retest(
+        self,
+        item_id: str,
+        *,
+        worthwhile: bool,
+        categories: Sequence[str],
+        none_reason: str | None = None,
+        path_template: str = "/api/retest/{item_id}",
+    ) -> dict[str, Any]:
+        path = path_template.format(item_id=item_id)
+        payload: dict[str, Any] = {
+            "worthwhile": worthwhile,
+            "categories": list(categories),
+            "none_reason": none_reason,
+        }
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.post(f"{self.base_url}{path}", json=payload, headers=self._headers())
+        resp.raise_for_status()
+        res = resp.json()
+        return res if isinstance(res, dict) else {"result": res}
