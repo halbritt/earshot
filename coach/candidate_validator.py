@@ -37,7 +37,10 @@ BLOCKING_LEDGER_STATES: frozenset[LedgerState] = frozenset(
 
 _EXPECTED_JSON_KEYS = frozenset({"question", "evidence_segment_ids", "decline_reason"})
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
-_BENIGN_DOT_RE = re.compile(r"(?:\d+\.\d+|v\d+(?:\.\d+)*|\be\.g\.|\bi\.e\.|\bU\.S\.)", re.I)
+_BENIGN_DOT_RE = re.compile(
+    r"(?:\d+\.\d+|v\d+(?:\.\d+)*|(?<![^\W_])(?:e\.g\.|i\.e\.|U\.S\.))",
+    re.I,
+)
 
 _NUMBER_TOKEN_RE = re.compile(
     r"(?<![^\W_])[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?(?![^\W_])"
@@ -91,10 +94,17 @@ _WEEKDAYS = (
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
 )
+_MONTH_WRAP = r"""[_*`"'~“‘”’]*"""
 _DATE_EXPR_RE = re.compile(
-    rf"(?<![^\W_])(?:(?P<month_day>(?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?)|"
-    rf"(?P<month_year>(?:{_MONTHS})\s+\d{{4}}(?![^\W_]))|"
-    rf"(?:in|by|before|after|until|on|since)\s+(?P<prep_month>{_MONTHS})(?![^\W_])(?!\s+\d)|"
+    rf"(?<![^\W_])(?:(?P<month_day>{_MONTH_WRAP}(?P<month_day_month>{_MONTHS}){_MONTH_WRAP}\s+"
+    rf"(?P<month_day_day>\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?))|"
+    rf"(?P<month_year>{_MONTH_WRAP}(?P<month_year_month>{_MONTHS}){_MONTH_WRAP},?\s+"
+    rf"(?P<month_year_year>\d{{4}})(?![^\W_]))|"
+    rf"(?P<day_month>(?P<day_month_day>\d{{1,2}}(?:st|nd|rd|th)?)\s+"
+    rf"{_MONTH_WRAP}(?P<day_month_month>{_MONTHS}){_MONTH_WRAP}"
+    rf"(?:,?\s+(?P<day_month_year>\d{{4}}))?(?![^\W_]))|"
+    rf"(?:in|by|before|after|until|on|since)\s+{_MONTH_WRAP}(?P<prep_month>{_MONTHS})"
+    rf"{_MONTH_WRAP}(?![^\W_])(?!,?\s+\d)|"
     rf"(?:{_MONTHS_STANDALONE})|"
     rf"(?:{_WEEKDAYS})|"
     rf"\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|"
@@ -366,10 +376,22 @@ def _check_premise_grounding(
 
     # 2. Date / time expressions (word-boundary matched; no leading preposition captured)
     for m in _DATE_EXPR_RE.finditer(question):
-        prep_month = m.group("prep_month")
-        raw_expr = prep_month if prep_month is not None else m.group(0)
+        if m.group("month_day") is not None:
+            raw_expr = f"{m.group('month_day_month')} {m.group('month_day_day')}"
+        elif m.group("month_year") is not None:
+            raw_expr = f"{m.group('month_year_month')} {m.group('month_year_year')}"
+        elif m.group("day_month") is not None:
+            day_yr = m.group("day_month_year")
+            raw_expr = f"{m.group('day_month_day')} {m.group('day_month_month')}" + (
+                f", {day_yr}" if day_yr is not None else ""
+            )
+        elif m.group("prep_month") is not None:
+            raw_expr = m.group("prep_month")
+        else:
+            raw_expr = m.group(0)
         expr = " ".join(raw_expr.lower().split())
-        pat = re.compile(rf"(?<![^\W_]){re.escape(expr)}(?![^\W_])")
+        expr_parts = [re.escape(part) for part in re.split(r",?\s+", expr) if part]
+        pat = re.compile(rf"(?<![^\W_]){r',?\s+'.join(expr_parts)}(?![^\W_])")
         if not pat.search(corpus_ws_lower):
             return f"Ungrounded date/time expression {raw_expr!r}"
 
@@ -398,7 +420,7 @@ def _check_do_not_suggest(
         norm_term = normalize_for_matching(term)
         if not norm_term:
             continue
-        pat = re.compile(rf"(?<!\w){re.escape(norm_term)}(?!\w)")
+        pat = re.compile(rf"(?<![^\W_]){re.escape(norm_term)}(?![^\W_])")
         if pat.search(norm_q) or pat.search(norm_cat):
             return f"Matches do_not_suggest term {term!r}"
     return None

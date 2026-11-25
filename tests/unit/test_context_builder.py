@@ -24,6 +24,8 @@ from coach.context_builder import (
     effective_max_cards_per_10_min,
     extract_slots_span_rules_v0,
     load_policy,
+    normalize_for_matching,
+    run_prefilter,
     verify_grounded_slot,
 )
 from coach.contracts import (
@@ -796,3 +798,34 @@ def test_gap_token_overflow_clock_domain_and_empty_anchor_value_error() -> None:
     assert overflow.context.flags["input_overflow"] is True
     assert set(overflow.context.omitted) == {"turns", "suggestions", "known_facts", "gaps"}
     assert overflow.context.omitted["gaps"] > 0
+
+
+def test_normalize_for_matching_underscores_and_prefilter_backchannel() -> None:
+    assert normalize_for_matching("_salary_") == "salary"
+    assert normalize_for_matching("__salary__") == "salary"
+    assert normalize_for_matching("_secret project_") == "secret project"
+    assert normalize_for_matching("salary_band") == "salary band"
+    assert normalize_for_matching("_yeah_") == "yeah"
+    assert normalize_for_matching("mm-hm") == "mm hm"
+    assert normalize_for_matching("uh-huh") == "uh huh"
+    assert normalize_for_matching("didn't") == "didn t"
+
+    state = CanonicalState(_make_brief())
+    state.apply(
+        _seg_event(
+            "u1", speaker_id="spk-1", text="_yeah_", start_ms=1000, seq=1, boundary="utterance_end"
+        )
+    )
+    state.apply(_seg_event("u2", speaker_id="spk-1", text="mm-hm", start_ms=2000, seq=2))
+    anchors = coalesce_anchors(state.snapshot())
+    assert len(anchors) == 2
+
+    pf1 = run_prefilter(anchors[0], state_version=1)
+    assert pf1.passed is False
+    assert pf1.reason_code is ReasonCode.BACKCHANNEL
+    assert pf1.normalized_text == "yeah"
+
+    pf2 = run_prefilter(anchors[1], state_version=1)
+    assert pf2.passed is False
+    assert pf2.reason_code is ReasonCode.BACKCHANNEL
+    assert pf2.normalized_text == "mm hm"

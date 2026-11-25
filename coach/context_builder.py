@@ -604,7 +604,7 @@ _FILLER_STOPWORDS: frozenset[str] = frozenset(
     }
 )
 
-_PUNCT_STRIP_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+_PUNCT_STRIP_RE = re.compile(r"(?:[^\w\s]|_)", flags=re.UNICODE)
 
 
 def normalize_for_matching(text: str) -> str:

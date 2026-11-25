@@ -1057,6 +1057,155 @@ def test_check4_underscore_wrappers_and_may_year_grounding() -> None:
         assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
 
 
+def test_check4_date_wrappers_comma_and_day_month() -> None:
+    brief = _make_brief()
+    state = CanonicalState(brief)
+    state.apply(
+        _seg(
+            "s1",
+            "We provisioned 12 servers for the March 30 rollout.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    snap = state.snapshot()
+
+    def _val(question: str, s: Any = snap, seg_ids: list[str] | None = None) -> Any:
+        return validate_generated_candidate(
+            json.dumps(
+                {
+                    "question": question,
+                    "evidence_segment_ids": seg_ids or ["s1"],
+                    "decline_reason": None,
+                }
+            ),
+            finish_reason="stop",
+            category=Category.CONFIRM_TIME,
+            snapshot=s,
+            supplied_segment_ids=seg_ids or ["s1"],
+        )
+
+    for bad_q in [
+        "Should we ship by _may_?",
+        "Should we ship in *may*?",
+        "Should we ship in `may`?",
+        'Should we ship in "may"?',
+        "Is _may_ 2026 our target?",
+        "Is may, 2026 our target?",
+        "Will we finish by 12 March?",
+        "Will we finish by 12 march?",
+    ]:
+        res = _val(bad_q)
+        assert not res.valid and res.failed_check == 4, (
+            f"Expected Check 4 reject for {bad_q!r}, got {res}"
+        )
+
+    # Grounded day-first, comma-separated, and wrapped month expressions pass
+    state.apply(
+        _seg(
+            "s2",
+            "We agreed on 12 March and may ship in May, 2026.",
+            start_ms=3000,
+            end_ms=4000,
+            received_ms=4050,
+            seq=2,
+        )
+    )
+    snap2 = state.snapshot()
+    for ok_q in [
+        "Will we finish by 12 March?",
+        "Is may, 2026 our target?",
+        "Is _may_ 2026 our target?",
+        "Should we ship by _may_?",
+    ]:
+        res = _val(ok_q, snap2, ["s1", "s2"])
+        assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
+
+
+def test_check5_do_not_suggest_underscore_bypass_blocked() -> None:
+    brief = _make_brief(do_not_suggest=("salary", "secret project", "cat"))
+    state = CanonicalState(brief)
+    state.apply(
+        _seg(
+            "s1",
+            "Let us review _salary_ and salary_band and the _secret project_.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    snap = state.snapshot()
+
+    for bad_q in [
+        "What is the _salary_ band?",
+        "What is the __salary__ band?",
+        "Can we discuss the _secret project_?",
+        "What is the salary_band?",
+    ]:
+        res = validate_generated_candidate(
+            json.dumps(
+                {
+                    "question": bad_q,
+                    "evidence_segment_ids": ["s1"],
+                    "decline_reason": None,
+                }
+            ),
+            finish_reason="stop",
+            category=Category.CONFIRM_OWNER,
+            snapshot=snap,
+            supplied_segment_ids=["s1"],
+        )
+        assert res.valid is False, f"Expected Check 5 reject for {bad_q!r}"
+        assert res.failed_check == 5
+        assert res.reason_code is ReasonCode.DO_NOT_SUGGEST
+
+    # Whole-token boundary still respected (do_not_suggest 'cat' does not block 'catalog')
+    res_ok = validate_generated_candidate(
+        json.dumps(
+            {
+                "question": "Who owns the catalog?",
+                "evidence_segment_ids": ["s1"],
+                "decline_reason": None,
+            }
+        ),
+        finish_reason="stop",
+        category=Category.CONFIRM_OWNER,
+        snapshot=snap,
+        supplied_segment_ids=["s1"],
+    )
+    assert res_ok.valid is True
+
+    # Template candidate with _salary_ slot is also rejected at Check 5
+    seg_text = snap.segments_by_id["s1"].text
+    slot_start = seg_text.index("_salary_")
+    slot_end = slot_start + len("_salary_")
+    tpl_cand = SuggestionCandidate(
+        schema_version=1,
+        suggestion_id="sug-tpl-dns",
+        candidate_id="cand-tpl-dns",
+        origin=Origin.PROACTIVE,
+        category=Category.CONFIRM_OWNER,
+        route=Route.TEMPLATE,
+        text="Who owns _salary_?",
+        word_count=3,
+        based_on_state_version=snap.state_version,
+        evidence_refs=(SegmentRef("s1", 1),),
+        template_id="confirm_owner_v1",
+        grounded_slots={
+            "action": GroundedSlot("_salary_", "s1", 1, slot_start, slot_end, "span_rules_v0")
+        },
+        ready_ms=2100,
+        display_by_ms=10_000,
+    )
+    t_res = validate_template_candidate(tpl_cand, snap)
+    assert t_res.valid is False
+    assert t_res.failed_check == 5
+    assert t_res.reason_code is ReasonCode.DO_NOT_SUGGEST
+
+
 async def test_half_open_breaker_never_wedges_on_cancel_or_malformed_sse() -> None:
     now = [1000]
     egress_rows: list[Any] = []
