@@ -1,14 +1,44 @@
 [tasks.test]
-description = "All tests (cargo test: scoring, variant runner, command line end to end)"
+description = "All tests (Rust cargo test and Python pytest)"
 run = '''sh -eu -c '
-# host:exec is an optional private wrapper task (resource-limited runner). Use it when this
-# machine defines it; every other clone runs cargo directly.
 if mise tasks info host:exec >/dev/null 2>&1; then
-  exec mise run host:exec --timeout 15m --weight 1 -- cargo test -q "$@"
+  exec mise run host:exec --timeout 15m --weight 1 -- sh -eu -c "cargo test -q && uv run --frozen pytest -q" </dev/null
 fi
-exec cargo test -q "$@"
+cargo test -q </dev/null
+exec uv run --frozen pytest -q </dev/null
+' sh'''
+
+[tasks."test:rust"]
+description = "Rust tests (cargo test)"
+run = '''sh -eu -c '
+if mise tasks info host:exec >/dev/null 2>&1; then
+  exec mise run host:exec --timeout 15m --weight 1 -- cargo test -q "$@" </dev/null
+fi
+exec cargo test -q "$@" </dev/null
+' sh'''
+
+[tasks."test:python"]
+description = "Python tests (pytest)"
+run = '''sh -eu -c '
+if mise tasks info host:exec >/dev/null 2>&1; then
+  exec mise run host:exec --timeout 15m --weight 1 -- uv run --frozen pytest -q "$@" </dev/null
+fi
+exec uv run --frozen pytest -q "$@" </dev/null
 ' sh'''
 
 [tasks.lint]
-description = "Formatting and clippy, warnings as errors"
+description = "Formatting, clippy, ruff, and mypy checks"
+run = """
+cargo fmt --check && cargo clippy -q --all-targets -- -D warnings && \
+uv run --frozen ruff check coach tests && \
+uv run --frozen ruff format --check coach tests && \
+uv run --frozen mypy coach tests
+"""
+
+[tasks."lint:rust"]
+description = "Rust formatting and clippy checks"
 run = "cargo fmt --check && cargo clippy -q --all-targets -- -D warnings"
+
+[tasks."lint:python"]
+description = "Python ruff and mypy checks"
+run = "uv run --frozen ruff check coach tests && uv run --frozen ruff format --check coach tests && uv run --frozen mypy coach tests"
