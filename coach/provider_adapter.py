@@ -491,22 +491,23 @@ class ProviderAdapter:
                 saw_first = True
                 on_first_byte()
             obj = json.loads(data_str)
-            if isinstance(obj, Mapping):
-                usage_obj = obj.get("usage")
-                if isinstance(usage_obj, Mapping):
-                    raw_usage = dict(usage_obj)
-                choices = obj.get("choices")
-                if isinstance(choices, list) and choices:
-                    c0 = choices[0]
-                    if isinstance(c0, Mapping):
-                        fr = c0.get("finish_reason")
-                        if isinstance(fr, str):
-                            finish_reason = fr
-                        delta = c0.get("delta")
-                        if isinstance(delta, Mapping):
-                            content = delta.get("content")
-                            if isinstance(content, str):
-                                chunks.append(content)
+            if not isinstance(obj, Mapping):
+                raise ValueError("Provider SSE chunk JSON must be an object")
+            usage_obj = obj.get("usage")
+            if isinstance(usage_obj, Mapping):
+                raw_usage = dict(usage_obj)
+            choices = obj.get("choices")
+            if isinstance(choices, list) and choices:
+                c0 = choices[0]
+                if isinstance(c0, Mapping):
+                    fr = c0.get("finish_reason")
+                    if isinstance(fr, str):
+                        finish_reason = fr
+                    delta = c0.get("delta")
+                    if isinstance(delta, Mapping):
+                        content = delta.get("content")
+                        if isinstance(content, str):
+                            chunks.append(content)
         return ("".join(chunks), finish_reason, raw_usage)
 
     async def generate(self, req: GenerationRequest) -> GenerationResponse:

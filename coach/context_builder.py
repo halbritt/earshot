@@ -938,6 +938,7 @@ def build_decision_context(
             "turns": len(prior_turns),
             "suggestions": len(all_suggestions),
             "known_facts": len(all_facts),
+            "gaps": len(relevant_gaps),
         }
         if prior_turns:
             max_omit_end = max(t.end_ms for t in prior_turns)

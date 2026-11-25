@@ -39,7 +39,9 @@ _EXPECTED_JSON_KEYS = frozenset({"question", "evidence_segment_ids", "decline_re
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
 _BENIGN_DOT_RE = re.compile(r"(?:\d+\.\d+|v\d+(?:\.\d+)*|\be\.g\.|\bi\.e\.|\bU\.S\.)", re.I)
 
-_NUMBER_TOKEN_RE = re.compile(r"(?<!\w)[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?(?!\w)")
+_NUMBER_TOKEN_RE = re.compile(
+    r"(?<![^\W_])[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?(?![^\W_])"
+)
 _NUMBER_WORDS: frozenset[str] = frozenset(
     {
         "zero",
@@ -77,7 +79,7 @@ _NUMBER_WORDS: frozenset[str] = frozenset(
     }
 )
 _NUMBER_WORD_RE = re.compile(
-    r"(?<!\w)(?:" + "|".join(sorted(_NUMBER_WORDS)) + r")(?!\w)",
+    r"(?<![^\W_])(?:" + "|".join(sorted(_NUMBER_WORDS)) + r")(?![^\W_])",
     flags=re.IGNORECASE,
 )
 _MONTHS_STANDALONE = (
@@ -90,15 +92,19 @@ _WEEKDAYS = (
     r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
 )
 _DATE_EXPR_RE = re.compile(
-    rf"\b(?:(?P<month_day>(?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?)|"
-    rf"(?:in|by|before|after|until|on|since)\s+(?P<prep_month>{_MONTHS})\b(?!\s+\d)|"
+    rf"(?<![^\W_])(?:(?P<month_day>(?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?)|"
+    rf"(?P<month_year>(?:{_MONTHS})\s+\d{{4}}(?![^\W_]))|"
+    rf"(?:in|by|before|after|until|on|since)\s+(?P<prep_month>{_MONTHS})(?![^\W_])(?!\s+\d)|"
     rf"(?:{_MONTHS_STANDALONE})|"
     rf"(?:{_WEEKDAYS})|"
     rf"\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|"
-    rf"q[1-4](?:\s+\d{{4}})?|\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm))\b",
+    rf"q[1-4](?:\s+\d{{4}})?|\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm))(?![^\W_])",
     flags=re.IGNORECASE,
 )
-_WORD_TOKEN_RE = re.compile(r"(?<!\w)[^\W\d_](?:[\w-]|['’](?=\w))*", flags=re.UNICODE)
+_WORD_TOKEN_RE = re.compile(
+    r"(?<![^\W_])[^\W\d_](?:[^\W_]|-(?=[^\W_])|['’](?=[^\W_]))*(?![^\W_])",
+    flags=re.UNICODE,
+)
 _INITIAL_STOPLIST: frozenset[str] = frozenset(
     {
         "Who",
@@ -363,7 +369,7 @@ def _check_premise_grounding(
         prep_month = m.group("prep_month")
         raw_expr = prep_month if prep_month is not None else m.group(0)
         expr = " ".join(raw_expr.lower().split())
-        pat = re.compile(rf"(?<!\w){re.escape(expr)}(?!\w)")
+        pat = re.compile(rf"(?<![^\W_]){re.escape(expr)}(?![^\W_])")
         if not pat.search(corpus_ws_lower):
             return f"Ungrounded date/time expression {raw_expr!r}"
 

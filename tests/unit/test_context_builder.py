@@ -787,10 +787,12 @@ def test_gap_token_overflow_clock_domain_and_empty_anchor_value_error() -> None:
     assert "[GAP: mono_before_anchor]" in bounded.serialized_text
     assert "[GAP: mono_after_anchor]" not in bounded.serialized_text
 
-    # Unavoidable overflow above limit always sets input_overflow=True
+    # Unavoidable overflow above limit always sets input_overflow=True and uniform omitted keys
     overflow = build_decision_context(
         snap, [snap.segments_by_id["a1"]], input_limit_tokens=20, tokenizer=WhitespaceTokenizer()
     )
     assert overflow.context is not None
     assert overflow.context.token_counts["total"] > 20
     assert overflow.context.flags["input_overflow"] is True
+    assert set(overflow.context.omitted) == {"turns", "suggestions", "known_facts", "gaps"}
+    assert overflow.context.omitted["gaps"] > 0

@@ -982,6 +982,81 @@ def test_check4_word_boundaries_prepositions_unicode_apostrophe_markdown_slashes
     assert res_u.valid is True
 
 
+def test_check4_underscore_wrappers_and_may_year_grounding() -> None:
+    brief = SessionBrief(
+        schema_version=1,
+        session_id="sess-c4-r3",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="me-1", role="reviewer"),
+        objective="Review Q4 rollout.",
+        participants=(Participant(participant_id="spk-1", label="S1", role="owner"),),
+        agenda=("Rollout",),
+        known_facts=(KnownFact(key="launch_date", value="March 12"),),
+    )
+    state = CanonicalState(brief)
+    state.apply(
+        CanonicalEvent(
+            schema_version=1,
+            session_id="sess-c4-r3",
+            event_id="ev-c4-r3-1",
+            kind=EventKind.SEGMENT,
+            segment_id="s1",
+            source_revision=1,
+            channel=1,
+            speaker_id="spk-1",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            text=(
+                "Alice and Jean-Luc deployed 100 servers in March 2026 on port 8080 "
+                "for the Q4 plan."
+            ),
+            stability=Stability.COMMITTED,
+            source_sequence=1,
+        )
+    )
+    snap = state.snapshot()
+
+    def _val(question: str) -> Any:
+        return validate_generated_candidate(
+            json.dumps(
+                {
+                    "question": question,
+                    "evidence_segment_ids": ["s1"],
+                    "decline_reason": None,
+                }
+            ),
+            finish_reason="stop",
+            category=Category.CONFIRM_TIME,
+            snapshot=snap,
+            supplied_segment_ids=["s1"],
+        )
+
+    for bad_q in [
+        "Will _Bob_ own this plan?",
+        "Will _Charlie_ own this plan?",
+        "Will __Charlie__ own this plan?",
+        "Should we keep _80_ servers?",
+        "Should we keep _5_ servers?",
+        "Should we ship in may 2026?",
+        "Should we ship by may 2026?",
+        "Is may 2026 our target?",
+        "Is _may 2026_ our target?",
+    ]:
+        res = _val(bad_q)
+        assert not res.valid and res.failed_check == 4, (
+            f"Expected Check 4 reject for {bad_q!r}, got {res}"
+        )
+
+    for ok_q in [
+        "May we review the Q4 plan?",
+        "Will _Alice_ and Jean-Luc ship by March 12?",
+        "Is March 2026 still the target?",
+    ]:
+        res = _val(ok_q)
+        assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
+
+
 async def test_half_open_breaker_never_wedges_on_cancel_or_malformed_sse() -> None:
     now = [1000]
     egress_rows: list[Any] = []
@@ -997,6 +1072,12 @@ async def test_half_open_breaker_never_wedges_on_cancel_or_malformed_sse() -> No
                 return httpx.Response(
                     200,
                     text="data: {not json\n\n",
+                    headers={"content-type": "text/event-stream"},
+                )
+            if mode[0] == "non_mapping_sse":
+                return httpx.Response(
+                    200,
+                    text="data: [1, 2, 3]\n\ndata: [DONE]\n\n",
                     headers={"content-type": "text/event-stream"},
                 )
             return _sse_response(
@@ -1050,6 +1131,18 @@ async def test_half_open_breaker_never_wedges_on_cancel_or_malformed_sse() -> No
     with pytest.raises(ProviderError):
         await adapter.generate(req)
     assert adapter.breaker_state.value == BreakerState.OPEN.value
+    assert adapter._half_open_in_flight is False
+    assert egress_rows[-1].discarded is True
+    assert egress_rows[-1].finish_reason == "invalid_response"
+
+    # 2b. Non-Mapping JSON SSE chunk in HALF_OPEN -> ProviderError, discarded=True, OPEN, lock reset
+    now[0] += 1000
+    assert adapter.advance_clock(now[0]) is BreakerState.HALF_OPEN
+    mode[0] = "non_mapping_sse"
+    with pytest.raises(ProviderError):
+        await adapter.generate(req)
+    assert adapter.breaker_state.value == BreakerState.OPEN.value
+    assert adapter._half_open_in_flight is False
     assert egress_rows[-1].discarded is True
     assert egress_rows[-1].finish_reason == "invalid_response"
 
