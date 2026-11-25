@@ -8,7 +8,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from coach.canonical_state import SegmentRecord, StateSnapshot
-from coach.context_builder import normalize_for_matching, verify_grounded_slot
+from coach.context_builder import (
+    assign_speaker_roles,
+    normalize_for_matching,
+    verify_grounded_slot,
+)
 from coach.contracts import (
     Category,
     LedgerState,
@@ -35,7 +39,7 @@ _EXPECTED_JSON_KEYS = frozenset({"question", "evidence_segment_ids", "decline_re
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
 _BENIGN_DOT_RE = re.compile(r"(?:\d+\.\d+|v\d+(?:\.\d+)*|\be\.g\.|\bi\.e\.|\bU\.S\.)", re.I)
 
-_NUMBER_TOKEN_RE = re.compile(r"[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?")
+_NUMBER_TOKEN_RE = re.compile(r"(?<!\w)[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?(?!\w)")
 _NUMBER_WORDS: frozenset[str] = frozenset(
     {
         "zero",
@@ -72,22 +76,29 @@ _NUMBER_WORDS: frozenset[str] = frozenset(
         "billion",
     }
 )
-_MONTHS = (
-    r"january|february|march|april|may|june|july|august|september|october|november|december|"
+_NUMBER_WORD_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(sorted(_NUMBER_WORDS)) + r")(?!\w)",
+    flags=re.IGNORECASE,
+)
+_MONTHS_STANDALONE = (
+    r"january|february|march|april|june|july|august|september|october|november|december|"
     r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
 )
+_MONTHS = rf"{_MONTHS_STANDALONE}|may"
 _WEEKDAYS = (
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
 )
 _DATE_EXPR_RE = re.compile(
-    rf"\b(?:(?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?|"
-    rf"(?:in|by|before|after|until|on|since)\s+(?:{_MONTHS})\b|"
-    rf"(?:{_WEEKDAYS})\b|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|"
+    rf"\b(?:(?P<month_day>(?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?)|"
+    rf"(?:in|by|before|after|until|on|since)\s+(?P<prep_month>{_MONTHS})\b(?!\s+\d)|"
+    rf"(?:{_MONTHS_STANDALONE})|"
+    rf"(?:{_WEEKDAYS})|"
+    rf"\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|"
     rf"q[1-4](?:\s+\d{{4}})?|\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm))\b",
     flags=re.IGNORECASE,
 )
-_CAP_WORD_RE = re.compile(r"^[A-Z][A-Za-z0-9_-]*$")
+_WORD_TOKEN_RE = re.compile(r"(?<!\w)[^\W\d_](?:[\w-]|['’](?=\w))*", flags=re.UNICODE)
 _INITIAL_STOPLIST: frozenset[str] = frozenset(
     {
         "Who",
@@ -292,34 +303,39 @@ def _check_single_question_format(question: str, max_words: int) -> str | None:
     return None
 
 
+def _strip_possessive(tok: str) -> str:
+    if tok.endswith("'s") or tok.endswith("’s") or tok.endswith("'S") or tok.endswith("’S"):
+        return tok[:-2]
+    return tok
+
+
 def _build_grounding_corpus(
     snapshot: StateSnapshot,
     supplied_segment_ids: Sequence[str],
     brief: SessionBrief,
-) -> tuple[str, set[str]]:
+) -> tuple[str, set[str], set[str], set[str], set[str]]:
     parts: list[str] = [
         brief.objective,
         *brief.agenda,
         *(f"{f.key} {f.value}" for f in brief.known_facts),
-        *(f"{p.participant_id} {p.label} {p.role or ''}" for p in brief.participants),
-        brief.recipient.participant_id,
+        *(f"{p.label} {p.role or ''}" for p in brief.participants),
         brief.recipient.role or "",
-        "ME",
-        *(f"S{i}" for i in range(1, 10)),
     ]
     for sid in supplied_segment_ids:
         seg = snapshot.segments_by_id.get(sid)
         if seg is not None:
             parts.append(seg.text)
     raw_corpus = " ".join(parts)
-    tokens: set[str] = set()
-    for raw_tok in raw_corpus.split():
-        cleaned = raw_tok.strip(".,!?;:\"'”’()[]{}").lower()
-        if cleaned.endswith("'s") or cleaned.endswith("’s"):
-            cleaned = cleaned[:-2]
+    corpus_ws_lower = " ".join(raw_corpus.lower().split())
+    number_tokens = {m.group(0).lower() for m in _NUMBER_TOKEN_RE.finditer(raw_corpus)}
+    number_words = {m.group(0).lower() for m in _NUMBER_WORD_RE.finditer(raw_corpus)}
+    text_tokens: set[str] = set()
+    for m in _WORD_TOKEN_RE.finditer(raw_corpus):
+        cleaned = _strip_possessive(m.group(0)).replace("’", "'").lower()
         if cleaned:
-            tokens.add(cleaned)
-    return (raw_corpus.lower(), tokens)
+            text_tokens.add(cleaned)
+    role_tokens = {"me"} | {lbl.lower() for lbl in assign_speaker_roles(snapshot).values()}
+    return (corpus_ws_lower, number_tokens, number_words, text_tokens, role_tokens)
 
 
 def _check_premise_grounding(
@@ -328,35 +344,40 @@ def _check_premise_grounding(
     supplied_segment_ids: Sequence[str],
     brief: SessionBrief,
 ) -> str | None:
-    corpus_lower, corpus_tokens = _build_grounding_corpus(snapshot, supplied_segment_ids, brief)
+    corpus_ws_lower, corpus_numbers, corpus_num_words, text_tokens, role_tokens = (
+        _build_grounding_corpus(snapshot, supplied_segment_ids, brief)
+    )
 
-    # 1. Numbers & number words
+    # 1. Numbers & number words (whole-token matching only; no synthetic S1..S9)
     for m in _NUMBER_TOKEN_RE.finditer(question):
         num_tok = m.group(0).lower()
-        if num_tok not in corpus_tokens and num_tok not in corpus_lower:
+        if num_tok not in corpus_numbers:
             return f"Ungrounded number {m.group(0)!r}"
-    for raw_tok in question.split():
-        norm_tok = raw_tok.strip(".,!?;:\"'”’()[]{}").lower()
-        if norm_tok in _NUMBER_WORDS and norm_tok not in corpus_tokens:
-            return f"Ungrounded number word {norm_tok!r}"
+    for m in _NUMBER_WORD_RE.finditer(question):
+        num_word = m.group(0).lower()
+        if num_word not in corpus_num_words:
+            return f"Ungrounded number word {num_word!r}"
 
-    # 2. Date / time expressions
+    # 2. Date / time expressions (word-boundary matched; no leading preposition captured)
     for m in _DATE_EXPR_RE.finditer(question):
-        expr = " ".join(m.group(0).lower().split())
-        if expr not in corpus_lower:
-            return f"Ungrounded date/time expression {m.group(0)!r}"
+        prep_month = m.group("prep_month")
+        raw_expr = prep_month if prep_month is not None else m.group(0)
+        expr = " ".join(raw_expr.lower().split())
+        pat = re.compile(rf"(?<!\w){re.escape(expr)}(?!\w)")
+        if not pat.search(corpus_ws_lower):
+            return f"Ungrounded date/time expression {raw_expr!r}"
 
-    # 3. Capitalized names / acronyms
-    for idx, raw_tok in enumerate(question.split()):
-        stripped = raw_tok.strip(".,!?;:\"'”’()[]{}")
-        if stripped.endswith("'s") or stripped.endswith("’s"):
-            stripped = stripped[:-2]
-        if not stripped or not _CAP_WORD_RE.match(stripped):
+    # 3. Capitalized names / acronyms (Unicode, apostrophes, markdown wrappers, slashes)
+    for m in _WORD_TOKEN_RE.finditer(question):
+        tok = _strip_possessive(m.group(0))
+        if not tok or not tok[0].isupper():
             continue
-        if idx == 0 and stripped in _INITIAL_STOPLIST:
+        is_sentence_initial = not question[: m.start()].strip(" \"'“‘(*_`~")
+        if is_sentence_initial and tok in _INITIAL_STOPLIST:
             continue
-        if stripped.lower() not in corpus_tokens:
-            return f"Ungrounded capitalized name/acronym {stripped!r}"
+        norm = tok.replace("’", "'").lower()
+        if norm not in text_tokens and norm not in role_tokens:
+            return f"Ungrounded capitalized name/acronym {tok!r}"
     return None
 
 

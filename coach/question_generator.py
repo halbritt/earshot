@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -20,6 +22,7 @@ from coach.context_builder import (
 from coach.contracts import (
     Category,
     DecisionContext,
+    EgressRecord,
     ReasonCode,
     Route,
     SegmentRef,
@@ -74,7 +77,12 @@ class GenerationOutcome:
 
 
 def _escape_untrusted_text(text: str) -> str:
-    return text.replace("</UNTRUSTED_TRANSCRIPT_DATA>", "<\\/UNTRUSTED_TRANSCRIPT_DATA>")
+    return re.sub(
+        r"</\s*UNTRUSTED_TRANSCRIPT_DATA\b",
+        r"<\\/UNTRUSTED_TRANSCRIPT_DATA",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def build_generator_prompt(
@@ -332,6 +340,41 @@ async def generate_question(
     if store is not None and breaker_state is not BreakerState.HALF_OPEN:
         cached = store.get_cached_model_output(prompt_sha256, model_version)
         if cached is not None and isinstance(cached.get("text"), str):
+            cache_egress_id = f"eg-cache-{uuid.uuid4().hex[:16]}"
+            if provider.egress_sink is not None:
+                hit_ms = clk()
+                raw_usage = cached.get("usage")
+                cached_in = 1
+                if isinstance(raw_usage, Mapping):
+                    try:
+                        parsed_in = int(raw_usage.get("input_tokens") or 0)
+                        if parsed_in > 0:
+                            cached_in = parsed_in
+                    except TypeError, ValueError:
+                        cached_in = 1
+                provider.egress_sink(
+                    EgressRecord(
+                        schema_version=1,
+                        egress_id=cache_egress_id,
+                        session_id=snapshot.session_id,
+                        candidate_id=context.candidate_id,
+                        lane=context.origin,
+                        provider=f"{provider.config.provider}:cache",
+                        model_id=model_version,
+                        segment_ids=supplied_ids,
+                        sent_at_ms=hit_ms,
+                        first_byte_ms=hit_ms,
+                        complete_ms=hit_ms,
+                        finish_reason="cache_hit",
+                        usage={
+                            "input_tokens": cached_in,
+                            "cached_input_tokens": cached_in,
+                            "output_tokens": 0,
+                            "reasoning_tokens": 0,
+                        },
+                        discarded=False,
+                    )
+                )
             val = validate_generated_candidate(
                 cached["text"],
                 finish_reason=(
@@ -351,17 +394,24 @@ async def generate_question(
                 cand = _build_validated_candidate(
                     val, context, category, snapshot, policy, ready_ms=clk()
                 )
-                return GenerationOutcome(candidate=cand, terminal_reason=None, from_cache=True)
+                return GenerationOutcome(
+                    candidate=cand,
+                    terminal_reason=None,
+                    egress_id=cache_egress_id,
+                    from_cache=True,
+                )
             if val.reason_code is ReasonCode.GENERATOR_DECLINED:
                 return GenerationOutcome(
                     candidate=None,
                     terminal_reason=ReasonCode.GENERATOR_DECLINED,
+                    egress_id=cache_egress_id,
                     from_cache=True,
                     decline_reason=val.reason,
                 )
             return GenerationOutcome(
                 candidate=None,
                 terminal_reason=ReasonCode.GENERATOR_INVALID_OUTPUT,
+                egress_id=cache_egress_id,
                 failed_check=val.failed_check,
                 validation_reason=val.reason,
                 validation_reason_code=val.reason_code,
@@ -406,7 +456,11 @@ async def generate_question(
         store.put_cached_model_output(
             serialized_sha256=prompt_sha256,
             model_version=model_version,
-            output={"text": resp.text, "finish_reason": resp.finish_reason},
+            output={
+                "text": resp.text,
+                "finish_reason": resp.finish_reason,
+                "usage": resp.usage,
+            },
             contains_text=True,
             created_ms=resp.complete_ms,
         )

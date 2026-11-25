@@ -705,3 +705,92 @@ def test_template_slot_too_long_multi_speaker_and_generic_referent_gating() -> N
         },
     )
     assert cross.grounded_failure_reason is ReasonCode.SLOT_UNAVAILABLE
+
+
+def test_gap_token_overflow_clock_domain_and_empty_anchor_value_error() -> None:
+    brief = _make_brief()
+    state = CanonicalState(brief)
+    state.apply(
+        _seg_event(
+            "t1",
+            speaker_id="spk-1",
+            text="We should migrate the billing service soon.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=100_050,
+            seq=1,
+        )
+    )
+    for i in range(25):
+        state.apply(
+            CanonicalEvent(
+                schema_version=1,
+                session_id="sess-m3",
+                event_id=f"ev-gap-{i}",
+                kind=EventKind.CONTROL,
+                received_ms=100_100 + i,
+                source_sequence=10 + i,
+                subtype=ControlSubtype.GAP,
+                start_ms=2100 + i,
+                end_ms=2101 + i,
+                reason="network_disconnect_long_reason_marker",
+            )
+        )
+    # Gap without start_ms/end_ms uses received_ms vs anchor_received_ms (clock-domain separation)
+    state.apply(
+        CanonicalEvent(
+            schema_version=1,
+            session_id="sess-m3",
+            event_id="ev-gap-mono-in",
+            kind=EventKind.CONTROL,
+            received_ms=100_500,
+            source_sequence=50,
+            subtype=ControlSubtype.GAP,
+            reason="mono_before_anchor",
+        )
+    )
+    state.apply(
+        CanonicalEvent(
+            schema_version=1,
+            session_id="sess-m3",
+            event_id="ev-gap-mono-out",
+            kind=EventKind.CONTROL,
+            received_ms=102_000,
+            source_sequence=51,
+            subtype=ControlSubtype.GAP,
+            reason="mono_after_anchor",
+        )
+    )
+    state.apply(
+        _seg_event(
+            "a1",
+            speaker_id="spk-1",
+            text="Someone should own the rollback plan.",
+            start_ms=4000,
+            end_ms=5000,
+            received_ms=101_000,
+            seq=100,
+        )
+    )
+    snap = state.snapshot()
+
+    with pytest.raises(ValueError):
+        build_decision_context(snap, [])
+
+    bounded = build_decision_context(
+        snap, [snap.segments_by_id["a1"]], input_limit_tokens=40, tokenizer=WhitespaceTokenizer()
+    )
+    assert bounded.context is not None and bounded.serialized_text is not None
+    assert bounded.context.token_counts["total"] <= 40
+    assert bounded.context.flags["has_gap"] is True
+    assert bounded.context.omitted["gaps"] > 0
+    assert "[GAP: mono_before_anchor]" in bounded.serialized_text
+    assert "[GAP: mono_after_anchor]" not in bounded.serialized_text
+
+    # Unavoidable overflow above limit always sets input_overflow=True
+    overflow = build_decision_context(
+        snap, [snap.segments_by_id["a1"]], input_limit_tokens=20, tokenizer=WhitespaceTokenizer()
+    )
+    assert overflow.context is not None
+    assert overflow.context.token_counts["total"] > 20
+    assert overflow.context.flags["input_overflow"] is True

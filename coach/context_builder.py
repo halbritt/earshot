@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 import yaml
 
 from coach.canonical_state import (
+    GapRecord,
     SegmentRecord,
     StateSnapshot,
 )
@@ -396,6 +397,8 @@ def _make_anchor_span(
     buf: Sequence[SegmentRecord],
     max_candidate_age_ms: int,
 ) -> AnchorSpan:
+    if not buf:
+        raise ValueError("Anchor must contain at least one segment")
     segs = tuple(buf)
     refs = tuple(SegmentRef(s.segment_id, s.revision) for s in segs)
     cid = compute_candidate_id(session_id, refs)
@@ -772,12 +775,31 @@ def _format_suggestion_line(
     return f"[SUGGESTED] {bucket_age_ms(age_ms)} {category_str} {entry_state}: {text}"
 
 
-def _gap_timestamp_ms(gap_start: int | None, gap_end: int | None, rx_ms: int) -> int:
-    if gap_end is not None:
-        return gap_end
-    if gap_start is not None:
-        return gap_start
-    return rx_ms
+def _gap_included(
+    gap: GapRecord,
+    anchor_end_ms: int,
+    anchor_received_ms: int,
+) -> bool:
+    if gap.end_ms is not None:
+        return gap.end_ms <= anchor_end_ms
+    if gap.start_ms is not None:
+        return gap.start_ms <= anchor_end_ms
+    return gap.received_ms <= anchor_received_ms
+
+
+def _gap_sort_audio_ms(
+    gap: GapRecord,
+    prior_turns: Sequence[SegmentRecord],
+    anchor_start_ms: int,
+) -> int:
+    if gap.end_ms is not None:
+        return gap.end_ms
+    if gap.start_ms is not None:
+        return gap.start_ms
+    for turn in prior_turns:
+        if turn.received_ms > gap.received_ms:
+            return turn.start_ms
+    return anchor_start_ms
 
 
 def _render_context_lines(
@@ -820,11 +842,12 @@ def build_decision_context(
         if max_candidate_age_ms is not None
         else (policy.display.max_candidate_age_ms if policy else DEFAULT_MAX_CANDIDATE_AGE_MS)
     )
-    anchor_span = (
-        anchor
-        if isinstance(anchor, AnchorSpan)
-        else _make_anchor_span(snapshot.session_id, anchor, age_cap)
-    )
+    if isinstance(anchor, AnchorSpan):
+        if not anchor.segments:
+            raise ValueError("Anchor must contain at least one segment")
+        anchor_span = anchor
+    else:
+        anchor_span = _make_anchor_span(snapshot.session_id, anchor, age_cap)
     limit = (
         input_limit_tokens
         if input_limit_tokens is not None
@@ -860,13 +883,13 @@ def build_decision_context(
     has_gap = False
     has_off_record_gap = False
     for g in snapshot.gaps:
-        gts = _gap_timestamp_ms(g.start_ms, g.end_ms, g.received_ms)
-        if gts <= anchor_end_ms:
+        if _gap_included(g, anchor_end_ms, anchor_span.anchor_received_ms):
             has_gap = True
             is_off = g.subtype is ControlSubtype.OFF_RECORD_END or g.reason == "off_record"
             if is_off:
                 has_off_record_gap = True
             label = "off_record" if is_off else (g.reason or str(g.subtype))
+            gts = _gap_sort_audio_ms(g, prior_turns, anchor_start_ms)
             relevant_gaps.append((gts, f"[GAP: {label}]"))
     relevant_gaps.sort(key=lambda item: item[0])
 
@@ -1034,34 +1057,42 @@ def build_decision_context(
     retained_turns = list(reversed(retained_rev))
     omitted_count = len(prior_turns) - len(retained_turns)
     omitted_turns = prior_turns[:omitted_count]
-    used_roles = anchor_roles | {_speaker_label_for_segment(t, role_map) for t in retained_turns}
-    final_role_line = _build_role_line(snapshot, role_map, used_roles)
-    ctx_lines = _render_context_lines(retained_turns, relevant_gaps, role_map)
+    retained_gaps = list(relevant_gaps)
+    omitted_gaps = 0
 
-    final_parts = [obj_line, final_role_line]
-    if known_line:
-        final_parts.append(known_line)
-    final_parts.extend(retained_sug_lines)
-    final_parts.extend(ctx_lines)
-    final_parts.append(anchor_line)
-    serialized_text = "\n".join(final_parts)
-    if tok.count_tokens(serialized_text) > limit and ctx_lines:
-        # Defensive check if final_role_line or gap lines pushed over limit: drop oldest turn
-        while retained_turns and tok.count_tokens(serialized_text) > limit:
-            omitted_turns.append(retained_turns.pop(0))
-            ctx_lines = _render_context_lines(retained_turns, relevant_gaps, role_map)
-            used_roles = anchor_roles | {
-                _speaker_label_for_segment(t, role_map) for t in retained_turns
-            }
-            final_role_line = _build_role_line(snapshot, role_map, used_roles)
-            final_parts = [obj_line, final_role_line]
-            if known_line:
-                final_parts.append(known_line)
-            final_parts.extend(retained_sug_lines)
-            final_parts.extend(ctx_lines)
-            final_parts.append(anchor_line)
-            serialized_text = "\n".join(final_parts)
-        omitted_count = len(omitted_turns)
+    def _assemble_parts() -> tuple[str, list[str], str]:
+        used = anchor_roles | {_speaker_label_for_segment(t, role_map) for t in retained_turns}
+        r_line = _build_role_line(snapshot, role_map, used)
+        c_lines = _render_context_lines(retained_turns, retained_gaps, role_map)
+        parts_out = [obj_line, r_line]
+        if known_line:
+            parts_out.append(known_line)
+        parts_out.extend(retained_sug_lines)
+        parts_out.extend(c_lines)
+        parts_out.append(anchor_line)
+        return (r_line, c_lines, "\n".join(parts_out))
+
+    final_role_line, ctx_lines, serialized_text = _assemble_parts()
+    while retained_turns and tok.count_tokens(serialized_text) > limit:
+        omitted_turns.append(retained_turns.pop(0))
+        final_role_line, ctx_lines, serialized_text = _assemble_parts()
+    omitted_count = len(omitted_turns)
+
+    while retained_gaps and tok.count_tokens(serialized_text) > limit:
+        retained_gaps.pop(0)
+        omitted_gaps += 1
+        final_role_line, ctx_lines, serialized_text = _assemble_parts()
+
+    while retained_sug_lines and tok.count_tokens(serialized_text) > limit:
+        retained_sug_lines.pop(0)
+        omitted_suggestions += 1
+        final_role_line, ctx_lines, serialized_text = _assemble_parts()
+
+    while retained_facts and tok.count_tokens(serialized_text) > limit:
+        retained_facts.pop()
+        omitted_facts += 1
+        known_line = "[KNOWN] " + " | ".join(retained_facts) if retained_facts else ""
+        final_role_line, ctx_lines, serialized_text = _assemble_parts()
 
     if omitted_turns:
         max_omit_end = max(t.end_ms for t in omitted_turns)
@@ -1079,6 +1110,8 @@ def build_decision_context(
 
     sha = hashlib.sha256(serialized_text.encode("utf-8")).hexdigest()
     total_tokens = tok.count_tokens(serialized_text)
+    if total_tokens > limit:
+        flags["input_overflow"] = True
     token_counts = {
         "total": total_tokens,
         "limit": limit,
@@ -1106,6 +1139,7 @@ def build_decision_context(
             "turns": omitted_count,
             "suggestions": omitted_suggestions,
             "known_facts": omitted_facts,
+            "gaps": omitted_gaps,
         },
         flags=flags,
         serialized_sha256=sha,

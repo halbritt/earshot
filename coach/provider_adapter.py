@@ -520,15 +520,36 @@ class ProviderAdapter:
         state = self.advance_clock(now_ms)
         if state is BreakerState.OPEN:
             raise BreakerOpenError("Generator circuit breaker is OPEN")
+        probe_acquired = False
         if state is BreakerState.HALF_OPEN:
             if self._half_open_in_flight:
                 raise BreakerOpenError("Generator half-open probe already in flight")
             self._half_open_in_flight = True
+            probe_acquired = True
 
         remaining_ms = req.deadline_ms - now_ms
         if remaining_ms <= 0:
-            if state is BreakerState.HALF_OPEN:
+            if probe_acquired:
                 self._half_open_in_flight = False
+            if self.egress_sink is not None:
+                self.egress_sink(
+                    EgressRecord(
+                        schema_version=1,
+                        egress_id=f"eg-{uuid.uuid4().hex[:16]}",
+                        session_id=req.session_id,
+                        candidate_id=req.candidate_id,
+                        lane=req.lane,
+                        provider=self.config.provider,
+                        model_id=self.config.model_id,
+                        segment_ids=req.segment_ids,
+                        sent_at_ms=now_ms,
+                        first_byte_ms=None,
+                        complete_ms=now_ms,
+                        finish_reason="timeout",
+                        usage=_zero_usage(),
+                        discarded=True,
+                    )
+                )
             raise ProviderTimeoutError("Generation deadline already expired")
 
         if req.lane is Origin.MANUAL:
@@ -541,6 +562,8 @@ class ProviderAdapter:
         finish_reason: str | None = None
         usage = _zero_usage()
         discarded = False
+        owns_client = False
+        client: httpx.AsyncClient | None = None
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         api_key = resolve_api_key(self.config)
@@ -548,15 +571,15 @@ class ProviderAdapter:
             headers["Authorization"] = f"Bearer {api_key}"
 
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
-        payload = build_openai_payload(self.config, self._caps, req)
         timeout_s = max(0.001, remaining_ms / 1000.0)
-        owns_client = self.client is None
-        client = (
-            self.client
-            if self.client is not None
-            else httpx.AsyncClient(transport=self.transport, timeout=timeout_s)
-        )
         try:
+            payload = build_openai_payload(self.config, self._caps, req)
+            owns_client = self.client is None
+            client = (
+                self.client
+                if self.client is not None
+                else httpx.AsyncClient(transport=self.transport, timeout=timeout_s)
+            )
             async with asyncio.timeout(timeout_s):
                 if payload.get("stream"):
                     async with client.stream(
@@ -594,11 +617,20 @@ class ProviderAdapter:
                             self._half_open_in_flight = False
                         raise ProviderError(f"Provider returned HTTP {resp.status_code}")
                     data = resp.json()
+                    if not isinstance(data, Mapping):
+                        raise ValueError("Provider JSON response must be an object")
                     complete_ms = self.clock_ms()
                     choices = data.get("choices") or []
-                    msg = choices[0].get("message", {}) if choices else {}
+                    if not isinstance(choices, list):
+                        raise ValueError("Provider JSON 'choices' must be a list")
+                    c0 = choices[0] if choices else {}
+                    if not isinstance(c0, Mapping):
+                        raise ValueError("Provider JSON choice entry must be an object")
+                    msg = c0.get("message") or {}
+                    if not isinstance(msg, Mapping):
+                        raise ValueError("Provider JSON 'message' must be an object")
                     text = str(msg.get("content") or "")
-                    fr = choices[0].get("finish_reason") if choices else None
+                    fr = c0.get("finish_reason")
                     finish_reason = str(fr) if fr is not None else None
                     usage = normalize_usage(data.get("usage"))
             self._record_success()
@@ -611,6 +643,11 @@ class ProviderAdapter:
                 first_byte_ms=first_byte_ms,
                 complete_ms=complete_ms,
             )
+        except asyncio.CancelledError:
+            discarded = True
+            finish_reason = "cancelled"
+            complete_ms = self.clock_ms()
+            raise
         except (TimeoutError, httpx.TimeoutException) as exc:
             discarded = True
             finish_reason = "timeout"
@@ -623,7 +660,21 @@ class ProviderAdapter:
             complete_ms = self.clock_ms()
             self._record_failure(complete_ms)
             raise ProviderError(f"Provider transport error: {exc}") from exc
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            httpx.HTTPError,
+        ) as exc:
+            discarded = True
+            finish_reason = "invalid_response"
+            complete_ms = self.clock_ms()
+            self._record_failure(complete_ms)
+            raise ProviderError(f"Invalid provider response: {exc}") from exc
         finally:
+            if probe_acquired:
+                self._half_open_in_flight = False
             if req.lane is Origin.MANUAL:
                 self._manual_waiting = max(0, self._manual_waiting - 1)
             if self.egress_sink is not None:
@@ -644,7 +695,7 @@ class ProviderAdapter:
                     discarded=discarded,
                 )
                 self.egress_sink(rec)
-            if owns_client:
+            if owns_client and client is not None:
                 await client.aclose()
 
     async def aclose(self) -> None:
