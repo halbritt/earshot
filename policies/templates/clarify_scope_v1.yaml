@@ -1,0 +1,25 @@
+id: clarify_scope_v1
+category: CLARIFY_SCOPE
+max_words: 12
+grounded:
+  text: "Does {proposal} include {explicitly_mentioned_boundary}?"
+  slots:
+    proposal:
+      extractor: span_rules_v0
+      max_words: 8
+      must_be_substring: true
+    explicitly_mentioned_boundary:
+      extractor: span_rules_v0
+      max_words: 8
+      must_be_substring: true
+generic:
+  text: "What is included in that?"
+  allowed_when:
+    anchor_is_latest_other_speech: true
+    max_anchor_age_ms: 6000
+resolution_cues:
+  - scope_boundary_stated
+invalidate_on:
+  - evidence_revision_changed
+  - scope_resolved
+  - equivalent_question_asked

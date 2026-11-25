@@ -1,0 +1,22 @@
+id: confirm_owner_v1
+category: CONFIRM_OWNER
+max_words: 12
+grounded:
+  text: "Who will own {action}?"
+  slots:
+    action:
+      extractor: span_rules_v0
+      max_words: 8
+      must_be_substring: true
+generic:
+  text: "Who owns that next step?"
+  allowed_when:
+    anchor_is_latest_other_speech: true
+    max_anchor_age_ms: 6000
+resolution_cues:
+  - first_person_commitment
+  - named_assignment
+invalidate_on:
+  - evidence_revision_changed
+  - ownership_resolved
+  - equivalent_question_asked

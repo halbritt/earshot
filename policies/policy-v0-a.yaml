@@ -1,0 +1,52 @@
+policy_version: policy-v0-a
+mode: technical_working_discussion
+classifier:
+  version: opportunity-baseline-v0
+  calibration: cal-v0-technical
+  input_limit_tokens: 512
+  max_candidates_per_job: 8
+categories:
+  CONFIRM_OWNER:
+    t_low: 0.20
+    t_compute: 0.50
+    t_display: 0.75
+    route: template
+    template: confirm_owner_v1
+    required_lookback_s: 300
+  CONFIRM_TIME:
+    t_low: 0.20
+    t_compute: 0.50
+    t_display: 0.75
+    route: template
+    template: confirm_time_v1
+    required_lookback_s: 300
+  SUCCESS_CRITERION:
+    t_low: 0.20
+    t_compute: 0.50
+    t_display: 0.75
+    route: template
+    template: success_criterion_v1
+    required_lookback_s: 120
+display:
+  max_active_cards: 1
+  settle_ms: 1500
+  max_candidate_age_ms: 8000
+  display_ttl_ms: 15000
+  cooldown_ms: 20000
+  max_cards_per_10_min: 3
+manual:
+  lookback_s: 30
+  score_floor: 0.30
+  budget_ms: 2000
+generator:
+  enabled: false
+  max_words: 20
+  timeout_ms: 2000
+  breaker:
+    consecutive_failures: 3
+    open_ms: 60000
+abstain:
+  speaker_settle_ms: 2000
+  asr_confidence_floor: null
+health:
+  no_transcript_after_ms: 15000

@@ -1,0 +1,21 @@
+id: confirm_time_v1
+category: CONFIRM_TIME
+max_words: 12
+grounded:
+  text: "When does {action} need to be finished?"
+  slots:
+    action:
+      extractor: span_rules_v0
+      max_words: 8
+      must_be_substring: true
+generic:
+  text: "When does that need to be finished?"
+  allowed_when:
+    anchor_is_latest_other_speech: true
+    max_anchor_age_ms: 6000
+resolution_cues:
+  - date_time_commitment
+invalidate_on:
+  - evidence_revision_changed
+  - time_resolved
+  - equivalent_question_asked

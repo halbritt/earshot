@@ -1,0 +1,21 @@
+id: success_criterion_v1
+category: SUCCESS_CRITERION
+max_words: 12
+grounded:
+  text: "How will we know {proposal} worked?"
+  slots:
+    proposal:
+      extractor: span_rules_v0
+      max_words: 8
+      must_be_substring: true
+generic:
+  text: "What would count as success?"
+  allowed_when:
+    anchor_is_latest_other_speech: true
+    max_anchor_age_ms: 6000
+resolution_cues:
+  - metric_or_criterion_stated
+invalidate_on:
+  - evidence_revision_changed
+  - criterion_resolved
+  - equivalent_question_asked
