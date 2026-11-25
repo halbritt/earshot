@@ -258,6 +258,8 @@ def assert_session_text_deleted(
                 for slot_val in slots_val.values():
                     if isinstance(slot_val, dict) and slot_val.get("text") is not None:
                         raise AssertionError("Suggestion grounded_slots still retains slot text")
+                    if isinstance(slot_val, str) and slot_val:
+                        raise AssertionError("Suggestion grounded_slots still retains slot text")
             elif slots_val not in (None, ""):
                 raise AssertionError("Suggestion grounded_slots still retains unredacted text")
 
@@ -543,7 +545,7 @@ def assert_six_conservation_invariants(
         rows = by_candidate.get(cid, [])
         sugs = sug_by_cid.get(cid, [])
         codes: list[str] = []
-        sug_codes: list[str] = []
+        per_sug_codes: list[tuple[str, list[str]]] = []
         terminal_states: set[str] = set()
         has_non_terminal_sug = False
         for r in rows:
@@ -564,7 +566,7 @@ def assert_six_conservation_invariants(
         for s in sugs:
             sc = _row_reason_codes(s)
             codes.extend(sc)
-            sug_codes.extend(sc)
+            per_sug_codes.append((str(s.get("suggestion_id") or "<unknown>"), sc))
             tr = s.get("terminal_reason")
             if isinstance(tr, str) and tr and tr not in TERMINAL_REASON_CODES:
                 raise AssertionError(
@@ -589,10 +591,12 @@ def assert_six_conservation_invariants(
             raise AssertionError(
                 f"Inv 3 violated: candidate {cid} lacks terminal ReasonCode ({codes})"
             )
-        if sugs and not any(c in TERMINAL_REASON_CODES for c in sug_codes):
-            raise AssertionError(
-                f"Inv 3 violated: suggestion for {cid} lacks terminal ReasonCode ({sug_codes})"
-            )
+        for sid_label, sc in per_sug_codes:
+            if not any(c in TERMINAL_REASON_CODES for c in sc):
+                raise AssertionError(
+                    f"Inv 3 violated: suggestion {sid_label} for {cid} lacks terminal "
+                    f"ReasonCode ({sc})"
+                )
 
     # Inv 4: Every displayed suggestion has a closing transition (allowing used -> resolved).
     trans_events_by_sid: dict[str, list[tuple[str, str | None]]] = {}
@@ -651,6 +655,20 @@ def assert_six_conservation_invariants(
                 )
 
     # Inv 5: Every generator invocation has a recorded usage entry (no session-wide fallback).
+    usage_metric_keys = (
+        "prompt_tokens",
+        "input_tokens",
+        "completion_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "latency_ms",
+    )
+    sid_to_cid = {
+        str(s["suggestion_id"]): str(s["candidate_id"])
+        for s in suggestions
+        if s.get("suggestion_id") and s.get("candidate_id")
+    }
     gen_records = [
         r
         for r in [*decisions, *suggestions]
@@ -675,18 +693,33 @@ def assert_six_conservation_invariants(
         }
         has_matched_egress = False
         for eg in egress:
+            eg_usage = eg.get("usage")
+            eg_usage_metrics = isinstance(eg_usage, dict) and any(
+                eg_usage.get(k) is not None for k in usage_metric_keys
+            )
+            is_discarded = bool(eg.get("discarded"))
             eg_has_metrics = bool(eg.get("model") or eg.get("model_id")) and (
-                isinstance(eg.get("usage"), dict)
+                eg_usage_metrics
                 or eg.get("complete_ms") is not None
-                or eg.get("sent_at_ms") is not None
-                or eg.get("timestamp_ms") is not None
+                or (
+                    is_discarded
+                    and (eg.get("sent_at_ms") is not None or eg.get("timestamp_ms") is not None)
+                )
             )
             if not eg_has_metrics:
                 continue
+            eg_cid = eg.get("candidate_id")
+            eg_sid = eg.get("suggestion_id")
+            if eg_cid not in (None, "", rec_cid):
+                continue
+            if rec_sid and eg_sid not in (None, "", rec_sid):
+                continue
+            if rec_cid and eg_sid and sid_to_cid.get(str(eg_sid)) not in (None, rec_cid):
+                continue
             eg_segs = {str(s) for s in (eg.get("segment_ids") or [])}
             if (
-                (rec_cid and eg.get("candidate_id") == rec_cid)
-                or (rec_sid and eg.get("suggestion_id") == rec_sid)
+                (rec_cid and eg_cid == rec_cid)
+                or (rec_sid and eg_sid == rec_sid)
                 or (rec_segs and eg_segs and bool(rec_segs & eg_segs))
             ):
                 has_matched_egress = True

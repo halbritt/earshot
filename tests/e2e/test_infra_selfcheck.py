@@ -1326,3 +1326,111 @@ def test_passive_ws_rejection_and_mock_edge_cases(
     cmd = resolve_coach_cmd(fake_wt)
     assert cmd != ["/home/halbritt/git/earshot/.venv/bin/coach"]
     assert cmd[1:] == ["-m", "coach.cli"]
+
+    # 5. Reviewer 2 note: ui_client rejects spaced `< img>` bypass while accepting plain English
+    CardUIClient.assert_card_plain_text({"question": "Who owns the rollback plan?"})
+    with pytest.raises(AssertionError, match="markup/script"):
+        CardUIClient.assert_card_plain_text({"question": "Check < img src=x>?"})
+
+
+def test_db_assertions_iteration3_regression_checks(tmp_path: Path) -> None:
+    # 1. Fix 1: Inv 5 context-segment overlap in egress_log must NOT mask another candidate
+    ctx_overlap_db = tmp_path / "inv5_ctx_overlap.db"
+    _create_m1_style_db(ctx_overlap_db)
+    with sqlite3.connect(str(ctx_overlap_db)) as conn:
+        conn.execute(
+            "UPDATE egress_log SET segment_ids_json = ? WHERE egress_id = 'eg-1'",
+            (json.dumps(["seg-1", "seg-3"]),),
+        )
+        conn.execute(
+            "UPDATE decisions SET outcome = 'ABSTAIN', route = 'generator', "
+            "raw_scores_json = ?, terminal_state = 'ABSTAIN', terminal_reason = 'score_in_band' "
+            "WHERE candidate_id = 'cand-ret'",
+            (json.dumps({"opportunity": 0.4}),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 5"):
+        assert_six_conservation_invariants(ctx_overlap_db, "s1", run_id="r1")
+
+    # Also verify suggestion_id mismatch prevents segment-overlap fallback
+    sid_mismatch_db = tmp_path / "inv5_sid_mismatch.db"
+    _create_m1_style_db(sid_mismatch_db)
+    with sqlite3.connect(str(sid_mismatch_db)) as conn:
+        conn.execute("ALTER TABLE egress_log ADD COLUMN suggestion_id TEXT")
+        conn.execute(
+            "UPDATE egress_log SET candidate_id = NULL, suggestion_id = 'sug-1', "
+            "segment_ids_json = ? WHERE egress_id = 'eg-1'",
+            (json.dumps(["seg-1", "seg-3"]),),
+        )
+        conn.execute(
+            "UPDATE decisions SET outcome = 'ABSTAIN', route = 'generator', "
+            "raw_scores_json = ?, terminal_state = 'ABSTAIN', terminal_reason = 'score_in_band' "
+            "WHERE candidate_id = 'cand-ret'",
+            (json.dumps({"opportunity": 0.4}),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 5"):
+        assert_six_conservation_invariants(sid_mismatch_db, "s1", run_id="r1")
+
+    # 2. Fix 2: Inv 5 rejects non-discarded egress_log with empty usage and complete_ms=None,
+    # while allowing discarded=1 (timed-out/cancelled) or non-null complete_ms
+    empty_usage_db = tmp_path / "inv5_empty_usage.db"
+    _create_m1_style_db(empty_usage_db)
+    with sqlite3.connect(str(empty_usage_db)) as conn:
+        conn.execute("ALTER TABLE egress_log ADD COLUMN complete_ms INTEGER")
+        conn.execute("ALTER TABLE egress_log ADD COLUMN discarded INTEGER DEFAULT 0")
+        conn.execute(
+            "UPDATE egress_log SET usage_json = '{}', complete_ms = NULL, discarded = 0 "
+            "WHERE egress_id = 'eg-1'"
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 5"):
+        assert_six_conservation_invariants(empty_usage_db, "s1", run_id="r1")
+
+    with sqlite3.connect(str(empty_usage_db)) as conn:
+        conn.execute("UPDATE egress_log SET discarded = 1 WHERE egress_id = 'eg-1'")
+        conn.commit()
+    assert_six_conservation_invariants(empty_usage_db, "s1", run_id="r1")
+
+    with sqlite3.connect(str(empty_usage_db)) as conn:
+        conn.execute(
+            "UPDATE egress_log SET discarded = 0, complete_ms = 1650 WHERE egress_id = 'eg-1'"
+        )
+        conn.commit()
+    assert_six_conservation_invariants(empty_usage_db, "s1", run_id="r1")
+
+    # 3. Fix 3: Inv 3 rejects a second suggestion row lacking a terminal ReasonCode
+    inv3_multi_sug_db = tmp_path / "inv3_multi_sug.db"
+    _create_m1_style_db(inv3_multi_sug_db)
+    with sqlite3.connect(str(inv3_multi_sug_db)) as conn:
+        conn.execute(
+            "INSERT INTO suggestions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "sug-2",
+                "cand-1",
+                "generator",
+                "used",
+                None,
+                "[]",
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 3"):
+        assert_six_conservation_invariants(inv3_multi_sug_db, "s1", run_id="r1")
+
+    # 4. Fix 4: §14.2 assert_session_text_deleted rejects flat string values in grounded_slots
+    slots_str_db = tmp_path / "slots_str_leak.db"
+    _create_m1_style_db(slots_str_db)
+    with sqlite3.connect(str(slots_str_db)) as conn:
+        conn.execute(
+            "UPDATE suggestions SET grounded_slots = ? WHERE suggestion_id = 'sug-1'",
+            (json.dumps({"action": "leaked plain string"}),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="grounded_slots"):
+        assert_session_text_deleted(slots_str_db, "s1")
