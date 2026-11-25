@@ -52,22 +52,27 @@ class CliResult:
 
 def resolve_coach_cmd(repo_root: Path | None = None) -> list[str]:
     """Locate the coach CLI executable or module entrypoint."""
-    root = repo_root or default_repo_root()
+    root = (repo_root or default_repo_root()).resolve()
+    main_repo = Path("/home/halbritt/git/earshot").resolve()
     candidates: list[Path] = []
     uv_env = os.environ.get("UV_PROJECT_ENVIRONMENT", "").strip()
     if uv_env:
         candidates.append(Path(uv_env) / "bin" / "coach")
     candidates.append(root / ".venv" / "bin" / "coach")
-    candidates.append(Path("/home/halbritt/git/earshot/.venv/bin/coach"))
+    if root == main_repo:
+        candidates.append(main_repo / ".venv" / "bin" / "coach")
     for cand in candidates:
         if cand.is_file() and os.access(cand, os.X_OK):
             return [str(cand)]
-    which_coach = shutil.which("coach")
-    if which_coach:
-        return [which_coach]
     venv_py = root / ".venv" / "bin" / "python"
     if venv_py.is_file() and os.access(venv_py, os.X_OK):
         return [str(venv_py), "-m", "coach.cli"]
+    main_venv_py = main_repo / ".venv" / "bin" / "python"
+    if main_venv_py.is_file() and os.access(main_venv_py, os.X_OK):
+        return [str(main_venv_py), "-m", "coach.cli"]
+    which_coach = shutil.which("coach")
+    if which_coach and root == main_repo:
+        return [which_coach]
     return [sys.executable, "-m", "coach.cli"]
 
 
@@ -128,6 +133,20 @@ def run_cli(
     )
 
 
+def _coach_env(repo_root: Path | None, env: Mapping[str, str] | None) -> dict[str, str]:
+    root = (repo_root or default_repo_root()).resolve()
+    out = dict(env) if env else {}
+    existing_pp = out.get("PYTHONPATH", os.environ.get("PYTHONPATH", "")).strip()
+    root_str = str(root)
+    if existing_pp:
+        parts = existing_pp.split(os.pathsep)
+        if root_str not in parts:
+            out["PYTHONPATH"] = f"{root_str}{os.pathsep}{existing_pp}"
+    else:
+        out["PYTHONPATH"] = root_str
+    return out
+
+
 def run_coach(
     subcommand: str,
     args: Sequence[str] = (),
@@ -139,8 +158,15 @@ def run_coach(
     timeout: float = 30.0,
 ) -> CliResult:
     """Run a coach CLI subcommand (serve, replay, diff, report, explain, bench, ...)."""
-    cmd = [*resolve_coach_cmd(repo_root), subcommand, *args]
-    return run_cli(cmd, env=env, cwd=cwd or repo_root, input_text=input_text, timeout=timeout)
+    root = (repo_root or default_repo_root()).resolve()
+    cmd = [*resolve_coach_cmd(root), subcommand, *args]
+    return run_cli(
+        cmd,
+        env=_coach_env(root, env),
+        cwd=cwd or root,
+        input_text=input_text,
+        timeout=timeout,
+    )
 
 
 def run_earshot_beam(
@@ -360,11 +386,12 @@ def start_coach_process(
     startup_timeout: float = 10.0,
 ) -> ManagedProcess:
     """Create a ManagedProcess for a long-running coach subcommand (serve/annotate)."""
-    cmd = [*resolve_coach_cmd(repo_root), subcommand, *args]
+    root = (repo_root or default_repo_root()).resolve()
+    cmd = [*resolve_coach_cmd(root), subcommand, *args]
     return ManagedProcess(
         cmd,
-        env=env,
-        cwd=cwd or repo_root,
+        env=_coach_env(root, env),
+        cwd=cwd or root,
         ready_url=ready_url,
         ready_headers=ready_headers,
         ready_regex=ready_regex,

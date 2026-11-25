@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from tests.e2e.helpers.fixtures import REASON_CODES
+from tests.e2e.helpers.fixtures import REASON_CODES, TERMINAL_REASON_CODES
 
 _JSON_COLUMNS: frozenset[str] = frozenset(
     {
@@ -25,9 +25,15 @@ _JSON_COLUMNS: frozenset[str] = frozenset(
         "context_refs_json",
         "input_refs_json",
         "reason_codes_json",
+        "abstain_reasons_json",
+        "thresholds_json",
         "segment_ids_json",
         "usage_json",
         "grounded_slots_json",
+        "grounded_slots",
+        "transitions_json",
+        "label_json",
+        "output_json",
     }
 )
 
@@ -38,6 +44,12 @@ _ROUTING_OUTCOMES: frozenset[str] = frozenset({"NONE", "ABSTAIN", "SUPPRESS", "R
 _SCORED_OUTCOMES: frozenset[str] = _ROUTING_OUTCOMES
 _PREFILTER_OUTCOMES: frozenset[str] = frozenset({"dropped", "prefilter_dropped"})
 _RETIRED_OUTCOMES: frozenset[str] = frozenset({"retired", "expired_unevaluated"})
+_DECISION_TERMINAL_STATES: frozenset[str] = (
+    _PREFILTER_OUTCOMES
+    | _RETIRED_OUTCOMES
+    | {"NONE", "ABSTAIN", "SUPPRESS", "unrendered"}
+    | _CLOSING_TRANSITIONS
+)
 
 
 def open_db(db_path: Path, *, readonly: bool = True) -> sqlite3.Connection:
@@ -132,18 +144,30 @@ def fetch_normalized_rows(
     conn: sqlite3.Connection,
     table: str,
     session_id: str | None = None,
+    *,
+    run_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch rows from table, unpacking JSON columns and optionally filtering by session_id."""
+    """Fetch rows from table, unpacking JSON columns and optionally filtering."""
     if table not in list_tables(conn):
         return []
     cols = get_table_columns(conn, table)
+    clauses: list[str] = []
+    params: list[Any] = []
     if session_id is not None and "session_id" in cols:
-        cursor = conn.execute(f'SELECT * FROM "{table}" WHERE session_id = ?', (session_id,))
-    else:
-        cursor = conn.execute(f'SELECT * FROM "{table}"')
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if run_id is not None and "run_id" in cols:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    sql = f'SELECT * FROM "{table}"'
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    cursor = conn.execute(sql, params)
     rows = [_unpack_row(r) for r in cursor.fetchall()]
     if session_id is not None and "session_id" not in cols:
         rows = [r for r in rows if r.get("session_id") == session_id]
+    if run_id is not None and "run_id" not in cols:
+        rows = [r for r in rows if r.get("run_id") == run_id]
     return rows
 
 
@@ -229,10 +253,13 @@ def assert_session_text_deleted(
                     raise AssertionError(
                         f"Suggestion {row.get('suggestion_id')} still retains {key!r}"
                     )
-            if isinstance(row.get("grounded_slots"), dict):
-                for slot_val in row["grounded_slots"].values():
+            slots_val = row.get("grounded_slots")
+            if isinstance(slots_val, dict):
+                for slot_val in slots_val.values():
                     if isinstance(slot_val, dict) and slot_val.get("text") is not None:
                         raise AssertionError("Suggestion grounded_slots still retains slot text")
+            elif slots_val not in (None, ""):
+                raise AssertionError("Suggestion grounded_slots still retains unredacted text")
 
         fb_rows = fetch_normalized_rows(conn, "feedback", session_id)
         for row in fb_rows:
@@ -240,10 +267,20 @@ def assert_session_text_deleted(
                 val = row.get(key)
                 if val not in (None, "", []):
                     raise AssertionError(f"Feedback row still retains {key!r}")
+            lbl_val = row.get("label")
+            if isinstance(lbl_val, dict):
+                for key in _FEEDBACK_TEXT_KEYS:
+                    val = lbl_val.get(key)
+                    if val not in (None, "", []):
+                        raise AssertionError(f"Feedback label_json still retains {key!r}")
 
         if forbidden_substrings:
             for table in list_tables(conn):
-                for row in fetch_normalized_rows(conn, table, session_id):
+                tbl_cols = get_table_columns(conn, table)
+                filter_sid = (
+                    None if table == "model_cache" and "session_id" not in tbl_cols else session_id
+                )
+                for row in fetch_normalized_rows(conn, table, filter_sid):
                     bad = _contains_forbidden(row, forbidden_substrings)
                     if bad is not None:
                         raise AssertionError(
@@ -263,11 +300,12 @@ def assert_egress_records_valid(
     db_path: Path,
     session_id: str,
     *,
+    run_id: str | None = None,
     expected_segment_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Verify §14.3 egress_log records carry segment_ids, provider, model, timestamp, lane."""
     with open_db(db_path, readonly=True) as conn:
-        rows = fetch_normalized_rows(conn, "egress_log", session_id)
+        rows = fetch_normalized_rows(conn, "egress_log", session_id, run_id=run_id)
     if not rows:
         raise AssertionError(f"Expected at least 1 egress_log row for {session_id}")
     seen_segments: set[str] = set()
@@ -276,13 +314,13 @@ def assert_egress_records_valid(
         if not isinstance(seg_ids, list) or not seg_ids:
             raise AssertionError(f"egress_log row missing non-empty segment_ids: {row}")
         seen_segments.update(str(s) for s in seg_ids)
-        for req_key in ("provider", "model", "lane"):
+        for req_key in ("provider", "lane"):
             if not row.get(req_key):
                 raise AssertionError(f"egress_log row missing {req_key!r}: {row}")
-        if (
-            row.get("timestamp_ms") is None
-            and row.get("created_at") is None
-            and row.get("ts") is None
+        if not (row.get("model") or row.get("model_id")):
+            raise AssertionError(f"egress_log row missing 'model'/'model_id': {row}")
+        if all(
+            row.get(ts_key) is None for ts_key in ("timestamp_ms", "created_at", "ts", "sent_at_ms")
         ):
             raise AssertionError(f"egress_log row missing timestamp: {row}")
     if expected_segment_ids is not None and not expected_segment_ids.issubset(seen_segments):
@@ -324,21 +362,44 @@ def _extract_segment_revisions(
         seg_id = ev.get("segment_id")
         if not isinstance(seg_id, str) or not seg_id:
             continue
+        canon_rev = ev.get("canonical_revision")
+        has_canon_rev = (
+            isinstance(canon_rev, int) and not isinstance(canon_rev, bool) and canon_rev >= 1
+        )
         if kind == "segment" and ev.get("stability") == "committed":
-            rev = int(ev.get("source_revision") or 1)
+            src_rev = int(ev.get("source_revision") or 1)
             prev = committed.get(seg_id)
-            if prev is None or rev >= int(prev.get("source_revision") or 0):
+            if prev is None:
                 committed[seg_id] = dict(ev)
-                material_counts[seg_id] = max(material_counts.get(seg_id, 0) + 1, rev)
-                valid_revs.add((seg_id, rev))
-                valid_revs.add((seg_id, material_counts[seg_id]))
+                if has_canon_rev:
+                    assert isinstance(canon_rev, int)
+                    material_counts[seg_id] = max(material_counts.get(seg_id, 0), canon_rev)
+                    valid_revs.add((seg_id, canon_rev))
+                else:
+                    material_counts[seg_id] = 1
+                    valid_revs.add((seg_id, 1))
+            elif has_canon_rev or src_rev > int(prev.get("source_revision") or 0):
+                committed[seg_id] = dict(ev)
+                if has_canon_rev:
+                    assert isinstance(canon_rev, int)
+                    material_counts[seg_id] = max(material_counts.get(seg_id, 0), canon_rev)
+                    valid_revs.add((seg_id, canon_rev))
+                else:
+                    next_rev = material_counts[seg_id] + 1
+                    material_counts[seg_id] = next_rev
+                    valid_revs.add((seg_id, next_rev))
         elif kind == "speaker_update" and seg_id in committed:
-            rev = int(ev.get("source_revision") or (material_counts[seg_id] + 1))
+            src_rev = int(ev.get("source_revision") or (material_counts[seg_id] + 1))
             committed[seg_id]["speaker_id"] = ev.get("speaker_id")
-            committed[seg_id]["source_revision"] = rev
-            material_counts[seg_id] = max(material_counts[seg_id] + 1, rev)
-            valid_revs.add((seg_id, rev))
-            valid_revs.add((seg_id, material_counts[seg_id]))
+            committed[seg_id]["source_revision"] = src_rev
+            if has_canon_rev:
+                assert isinstance(canon_rev, int)
+                material_counts[seg_id] = max(material_counts.get(seg_id, 0), canon_rev)
+                valid_revs.add((seg_id, canon_rev))
+            else:
+                next_rev = material_counts[seg_id] + 1
+                material_counts[seg_id] = next_rev
+                valid_revs.add((seg_id, next_rev))
 
     non_recipient = {
         sid
@@ -383,53 +444,74 @@ def assert_six_conservation_invariants(
     db_path: Path,
     session_id: str,
     *,
+    run_id: str | None = None,
     recipient_ids: frozenset[str] = frozenset({"me", "ME"}),
 ) -> dict[str, Any]:
     """Verify all six §13.2 end-of-session conservation invariants on SQLite WAL DB."""
     with open_db(db_path, readonly=True) as conn:
-        events = fetch_normalized_rows(conn, "events", session_id)
-        decisions = fetch_normalized_rows(conn, "decisions", session_id)
-        suggestions = fetch_normalized_rows(conn, "suggestions", session_id)
-        feedback = fetch_normalized_rows(conn, "feedback", session_id)
-        egress = fetch_normalized_rows(conn, "egress_log", session_id)
+        assert_tables_exist(conn)
+        events = fetch_normalized_rows(conn, "events", session_id, run_id=run_id)
+        decisions = fetch_normalized_rows(conn, "decisions", session_id, run_id=run_id)
+        suggestions = fetch_normalized_rows(conn, "suggestions", session_id, run_id=run_id)
+        feedback = fetch_normalized_rows(conn, "feedback", session_id, run_id=run_id)
+        egress = fetch_normalized_rows(conn, "egress_log", session_id, run_id=run_id)
 
     non_recip_segments, valid_revs = _extract_segment_revisions(events, recipient_ids)
-    anchored_segments: set[str] = set()
+    anchor_cids_by_seg: dict[str, set[str]] = {}
     by_candidate: dict[str, list[dict[str, Any]]] = {}
     for dec in decisions:
         cid = dec.get("candidate_id")
-        if cid:
-            by_candidate.setdefault(str(cid), []).append(dec)
+        if not isinstance(cid, str) or not cid.strip():
+            raise AssertionError(f"Inv 1 violated: decision row missing candidate_id: {dec}")
+        by_candidate.setdefault(cid, []).append(dec)
+        seen_in_row: set[str] = set()
         for seg_id, _rev in _iter_ref_pairs(dec.get("anchor_refs")):
-            anchored_segments.add(seg_id)
+            if seg_id in seen_in_row:
+                raise AssertionError(
+                    f"Inv 1 violated: segment {seg_id} repeated in anchor_refs for {cid}"
+                )
+            seen_in_row.add(seg_id)
+            anchor_cids_by_seg.setdefault(seg_id, set()).add(cid)
 
-    # Inv 1: Every committed non-recipient segment in >=1 anchor; every candidate in 1 partition.
-    unanchored = non_recip_segments - anchored_segments
-    if unanchored:
-        raise AssertionError(
-            f"Inv 1 violated: unanchored non-recipient segments {sorted(unanchored)}"
-        )
+    # Inv 1: Every committed non-recipient segment in exactly 1 anchor; every candidate in 1 part.
+    for seg_id in sorted(non_recip_segments):
+        owners = anchor_cids_by_seg.get(seg_id, set())
+        if len(owners) != 1:
+            raise AssertionError(
+                f"Inv 1 violated: non-recipient segment {seg_id} in {len(owners)} anchors "
+                f"({sorted(owners)}), expected 1"
+            )
 
     scored_cids: set[str] = set()
     for cid, rows in by_candidate.items():
         partitions: set[str] = set()
         for row in rows:
             outcome = str(row.get("outcome") or row.get("partition") or row.get("stage") or "")
-            has_scores = (
-                row.get("raw_scores") is not None
-                or row.get("calibrated_scores") is not None
-                or outcome in _SCORED_OUTCOMES
+            term_state = str(row.get("terminal_state") or "")
+            has_raw_or_cal = (
+                row.get("raw_scores") is not None or row.get("calibrated_scores") is not None
             )
-            if outcome in _PREFILTER_OUTCOMES:
+            has_scores = has_raw_or_cal or outcome in _SCORED_OUTCOMES
+            is_dropped = outcome in _PREFILTER_OUTCOMES or term_state in _PREFILTER_OUTCOMES
+            is_retired = outcome in _RETIRED_OUTCOMES or term_state in _RETIRED_OUTCOMES
+            if is_dropped:
+                if has_raw_or_cal or outcome in _SCORED_OUTCOMES:
+                    raise AssertionError(
+                        f"Inv 1 violated: dropped candidate {cid} carries scores/routing: {row}"
+                    )
                 partitions.add("dropped")
-            elif outcome in _RETIRED_OUTCOMES:
+            elif is_retired:
+                if has_raw_or_cal or outcome in _SCORED_OUTCOMES:
+                    raise AssertionError(
+                        f"Inv 1 violated: retired candidate {cid} carries scores/routing: {row}"
+                    )
                 partitions.add("retired")
             elif has_scores:
                 partitions.add("scored")
                 scored_cids.add(cid)
-            elif outcome:
+            elif outcome or term_state:
                 raise AssertionError(
-                    f"Inv 1 violated: unknown partition/outcome {outcome!r} for {cid}"
+                    f"Inv 1 violated: unknown partition {(outcome, term_state)!r} for {cid}"
                 )
         if len(partitions) != 1:
             raise AssertionError(
@@ -448,62 +530,127 @@ def assert_six_conservation_invariants(
                 f"Inv 2 violated: scored candidate {cid} has routing outcomes {routing_outcomes}"
             )
 
-    # Inv 3: Every formed candidate reaches a terminal state with a valid Appendix C ReasonCode.
+    # Inv 3: Every formed candidate reaches 1 terminal state with terminal Appendix C ReasonCode.
     sug_by_cid: dict[str, list[dict[str, Any]]] = {}
     for sug in suggestions:
-        if sug.get("candidate_id"):
-            sug_by_cid.setdefault(str(sug["candidate_id"]), []).append(sug)
+        scid = sug.get("candidate_id")
+        if not isinstance(scid, str) or not scid.strip():
+            raise AssertionError(f"Inv 3 violated: suggestion row missing candidate_id: {sug}")
+        sug_by_cid.setdefault(scid, []).append(sug)
 
-    for cid, rows in by_candidate.items():
+    all_cids = set(by_candidate.keys()) | set(sug_by_cid.keys())
+    for cid in sorted(all_cids):
+        rows = by_candidate.get(cid, [])
+        sugs = sug_by_cid.get(cid, [])
         codes: list[str] = []
-        has_terminal = False
+        sug_codes: list[str] = []
+        terminal_states: set[str] = set()
+        has_non_terminal_sug = False
         for r in rows:
             codes.extend(_row_reason_codes(r))
-            if r.get("terminal_state") or str(r.get("outcome") or "") in (
+            tr = r.get("terminal_reason")
+            if isinstance(tr, str) and tr and tr not in TERMINAL_REASON_CODES:
+                raise AssertionError(
+                    f"Inv 3 violated: candidate {cid} non-terminal decision terminal_reason {tr!r}"
+                )
+            d_term = r.get("terminal_state")
+            d_out = str(r.get("outcome") or "")
+            if isinstance(d_term, str) and d_term in _DECISION_TERMINAL_STATES:
+                terminal_states.add(d_term)
+            elif d_out in (
                 _PREFILTER_OUTCOMES | _RETIRED_OUTCOMES | {"NONE", "ABSTAIN", "SUPPRESS"}
             ):
-                has_terminal = True
-        for s in sug_by_cid.get(cid, []):
-            codes.extend(_row_reason_codes(s))
-            if s.get("terminal_state") or s.get("state") in _CLOSING_TRANSITIONS | {
-                "unrendered",
-                "withdrawn",
-                "expired",
-            }:
-                has_terminal = True
-        if not has_terminal:
-            raise AssertionError(f"Inv 3 violated: candidate {cid} has no terminal state")
+                terminal_states.add(d_out)
+        for s in sugs:
+            sc = _row_reason_codes(s)
+            codes.extend(sc)
+            sug_codes.extend(sc)
+            tr = s.get("terminal_reason")
+            if isinstance(tr, str) and tr and tr not in TERMINAL_REASON_CODES:
+                raise AssertionError(
+                    f"Inv 3 violated: candidate {cid} non-terminal suggestion reason {tr!r}"
+                )
+            s_state = s.get("terminal_state") or s.get("current_state") or s.get("state")
+            if isinstance(s_state, str) and s_state in (_CLOSING_TRANSITIONS | {"unrendered"}):
+                terminal_states.add(s_state)
+            elif s_state is not None:
+                has_non_terminal_sug = True
+        if has_non_terminal_sug or len(terminal_states) != 1:
+            raise AssertionError(
+                f"Inv 3 violated: candidate {cid} terminal_states={sorted(terminal_states)} "
+                f"(non_terminal_sug={has_non_terminal_sug}, expected exactly 1)"
+            )
         if not codes:
             raise AssertionError(f"Inv 3 violated: candidate {cid} has no ReasonCode")
         unknown = [c for c in codes if c not in REASON_CODES]
         if unknown:
             raise AssertionError(f"Inv 3 violated: candidate {cid} has unknown codes {unknown}")
+        if not any(c in TERMINAL_REASON_CODES for c in codes):
+            raise AssertionError(
+                f"Inv 3 violated: candidate {cid} lacks terminal ReasonCode ({codes})"
+            )
+        if sugs and not any(c in TERMINAL_REASON_CODES for c in sug_codes):
+            raise AssertionError(
+                f"Inv 3 violated: suggestion for {cid} lacks terminal ReasonCode ({sug_codes})"
+            )
 
-    # Inv 4: Every displayed suggestion has a closing transition.
-    transitions_by_sid: dict[str, list[str]] = {}
+    # Inv 4: Every displayed suggestion has a closing transition (allowing used -> resolved).
+    trans_events_by_sid: dict[str, list[tuple[str, str | None]]] = {}
     for ev in events:
         if ev.get("kind") == "ledger" and ev.get("suggestion_id"):
-            transitions_by_sid.setdefault(str(ev["suggestion_id"]), []).append(
-                str(ev.get("transition") or "")
+            sid_str = str(ev["suggestion_id"])
+            eid = str(ev["event_id"]) if ev.get("event_id") else None
+            trans_events_by_sid.setdefault(sid_str, []).append(
+                (str(ev.get("transition") or ""), eid)
             )
     for sug in suggestions:
         sid = sug.get("suggestion_id")
         if not sid:
             continue
         sid_str = str(sid)
-        if sug.get("displayed_at_ms") is not None or sug.get("state") == "displayed":
-            transitions_by_sid.setdefault(sid_str, []).append("displayed")
-        closing = sug.get("terminal_state") or sug.get("closing_transition")
-        if isinstance(closing, str) and closing in _CLOSING_TRANSITIONS:
-            transitions_by_sid.setdefault(sid_str, []).append(closing)
+        entries = trans_events_by_sid.setdefault(sid_str, [])
+        seen_eids = {eid for _, eid in entries if eid is not None}
+        sug_trans = sug.get("transitions")
+        if isinstance(sug_trans, list):
+            for item in sug_trans:
+                if isinstance(item, dict):
+                    t_name = str(item.get("transition") or "")
+                    eid = str(item["event_id"]) if item.get("event_id") else None
+                    if eid is not None and eid in seen_eids:
+                        continue
+                    if eid is not None:
+                        seen_eids.add(eid)
+                    if t_name:
+                        entries.append((t_name, eid))
+                elif isinstance(item, str) and item:
+                    entries.append((item, None))
+        names_so_far = [t for t, _ in entries]
+        cur_state = sug.get("current_state") or sug.get("state")
+        if "displayed" not in names_so_far and (
+            sug.get("displayed_at_ms") is not None or cur_state == "displayed"
+        ):
+            entries.append(("displayed", None))
+        closing = sug.get("terminal_state") or sug.get("closing_transition") or cur_state
+        if (
+            isinstance(closing, str)
+            and closing in _CLOSING_TRANSITIONS
+            and not any(t in _CLOSING_TRANSITIONS for t, _ in entries)
+        ):
+            entries.append((closing, None))
 
-    for sid_str, trans in transitions_by_sid.items():
-        if "displayed" in trans and not any(t in _CLOSING_TRANSITIONS for t in trans):
-            raise AssertionError(
-                f"Inv 4 violated: displayed suggestion {sid_str} lacks closing transition ({trans})"
-            )
+    displayed_count = 0
+    for sid_str, entries in trans_events_by_sid.items():
+        trans = [t for t, _ in entries]
+        if "displayed" in trans:
+            displayed_count += 1
+            closing_list = [t for t in trans if t in _CLOSING_TRANSITIONS]
+            if not (len(closing_list) == 1 or closing_list == ["used", "resolved"]):
+                raise AssertionError(
+                    f"Inv 4 violated: displayed suggestion {sid_str} has closing transitions "
+                    f"{closing_list} (all={trans})"
+                )
 
-    # Inv 5: Every generator invocation has a recorded usage entry.
+    # Inv 5: Every generator invocation has a recorded usage entry (no session-wide fallback).
     gen_records = [
         r
         for r in [*decisions, *suggestions]
@@ -511,21 +658,60 @@ def assert_six_conservation_invariants(
     ]
     for rec in gen_records:
         usage = rec.get("usage") or rec.get("generator_usage")
-        has_usage = isinstance(usage, dict) and (
-            usage.get("model") is not None or usage.get("latency_ms") is not None
+        has_usage = isinstance(usage, dict) and any(
+            usage.get(k) is not None
+            for k in ("model", "model_id", "latency_ms", "prompt_tokens", "completion_tokens")
         )
-        has_flat = rec.get("model") is not None and (
+        has_flat = (rec.get("model") is not None or rec.get("model_id") is not None) and (
             rec.get("prompt_tokens") is not None or rec.get("latency_ms") is not None
         )
-        if not (has_usage or has_flat or egress):
+        rec_cid = rec.get("candidate_id")
+        rec_sid = rec.get("suggestion_id")
+        rec_segs = {
+            s
+            for s, _ in _iter_ref_pairs(
+                rec.get("anchor_refs") or rec.get("evidence_refs") or rec.get("grounded_slots")
+            )
+        }
+        has_matched_egress = False
+        for eg in egress:
+            eg_has_metrics = bool(eg.get("model") or eg.get("model_id")) and (
+                isinstance(eg.get("usage"), dict)
+                or eg.get("complete_ms") is not None
+                or eg.get("sent_at_ms") is not None
+                or eg.get("timestamp_ms") is not None
+            )
+            if not eg_has_metrics:
+                continue
+            eg_segs = {str(s) for s in (eg.get("segment_ids") or [])}
+            if (
+                (rec_cid and eg.get("candidate_id") == rec_cid)
+                or (rec_sid and eg.get("suggestion_id") == rec_sid)
+                or (rec_segs and eg_segs and bool(rec_segs & eg_segs))
+            ):
+                has_matched_egress = True
+                break
+        if not (has_usage or has_flat or has_matched_egress):
             raise AssertionError(f"Inv 5 violated: generator invocation lacks usage record: {rec}")
 
     # Inv 6: Every (segment_id, revision) reference across tables exists in canonical history.
-    ref_tables = [("decisions", decisions), ("suggestions", suggestions), ("feedback", feedback)]
-    ref_keys = ("anchor_refs", "context_refs", "input_refs", "evidence_refs", "grounded_slots")
-    for tbl_name, rows in ref_tables:
+    ref_tables: list[tuple[str, list[dict[str, Any]], tuple[str, ...]]] = [
+        (
+            "decisions",
+            decisions,
+            ("anchor_refs", "context_refs", "input_refs", "evidence_refs", "grounded_slots"),
+        ),
+        (
+            "suggestions",
+            suggestions,
+            ("anchor_refs", "context_refs", "input_refs", "evidence_refs", "grounded_slots"),
+        ),
+        ("feedback", feedback, ("evidence_refs",)),
+        ("events", events, ("evidence_refs",)),
+    ]
+    for tbl_name, rows, keys in ref_tables:
         for row in rows:
-            for key in ref_keys:
+            for key in keys:
                 if key not in row or row[key] is None:
                     continue
                 for seg_id, rev in _iter_ref_pairs(row[key]):
@@ -540,6 +726,6 @@ def assert_six_conservation_invariants(
         "non_recipient_segments": len(non_recip_segments),
         "candidates": len(by_candidate),
         "suggestions": len(suggestions),
-        "displayed_suggestions": sum(1 for t in transitions_by_sid.values() if "displayed" in t),
+        "displayed_suggestions": displayed_count,
         "valid_revisions": len(valid_revs),
     }

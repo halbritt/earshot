@@ -17,13 +17,24 @@ from websockets.exceptions import InvalidHandshake, WebSocketException
 from tests.e2e.helpers.fixtures import FEEDBACK_REASONS
 
 _DANGEROUS_DOM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("innerHTML", re.compile(r"\.innerHTML\b")),
-    ("outerHTML", re.compile(r"\.outerHTML\b")),
+    ("innerHTML", re.compile(r"\binnerHTML\b|['\"]inner['\"]\s*\+\s*['\"]HTML['\"]")),
+    ("outerHTML", re.compile(r"\bouterHTML\b|['\"]outer['\"]\s*\+\s*['\"]HTML['\"]")),
     ("insertAdjacentHTML", re.compile(r"\binsertAdjacentHTML\b")),
-    ("document.write", re.compile(r"\bdocument\.write\s*\(")),
-    ("Notification(", re.compile(r"\bNotification\s*\(")),
+    ("document.write", re.compile(r"\bdocument\.writeln?\s*\(")),
+    ("eval", re.compile(r"\beval\s*\(")),
+    ("Function", re.compile(r"\bFunction\s*\(")),
+    ("Notification", re.compile(r"\bNotification\b")),
 )
-_HTML_TAG_RE = re.compile(r"<\s*/?\s*(script|img|iframe|svg|body|on\w+)\b", re.IGNORECASE)
+_UNSAFE_BODY_HTML_RE = re.compile(
+    r"<\s*(img|svg|iframe|details|object|embed)\b"
+    r"|<\s*a\b[^>]*href\s*=\s*['\"]?\s*javascript:"
+    r"|\bon[a-z]+\s*=",
+    re.IGNORECASE,
+)
+_BODY_RE = re.compile(r"<\s*body\b[^>]*>(.*)</\s*body\s*>", re.IGNORECASE | re.DOTALL)
+_ANY_HTML_TAG_RE = re.compile(r"<\s*/?\s*[a-zA-Z!/?]")
+_JS_URI_RE = re.compile(r"javascript\s*:", re.IGNORECASE)
+_INLINE_HANDLER_RE = re.compile(r"\bon[a-z]+\s*=", re.IGNORECASE)
 
 
 def assert_loopback_url(url: str, *, allow_localhost: bool = False) -> None:
@@ -161,8 +172,11 @@ class CardUIClient:
                 rejected = False
                 try:
                     async with connect(target_url, open_timeout=3.0) as ws:
-                        await asyncio.wait_for(ws.recv(), timeout=1.0)
-                except InvalidHandshake, WebSocketException, OSError, TimeoutError:
+                        try:
+                            await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except TimeoutError:
+                            rejected = False
+                except InvalidHandshake, WebSocketException, OSError:
                     rejected = True
                 if not rejected:
                     raise AssertionError(f"Expected WS rejection for {label} ({target_url})")
@@ -189,6 +203,13 @@ class CardUIClient:
         for label, pattern in _DANGEROUS_DOM_PATTERNS:
             if pattern.search(html):
                 raise AssertionError(f"Unsafe DOM/API pattern {label!r} found in Card UI HTML")
+        body_match = _BODY_RE.search(html)
+        body_html = body_match.group(1) if body_match is not None else html
+        unsafe_tag = _UNSAFE_BODY_HTML_RE.search(body_html)
+        if unsafe_tag is not None:
+            raise AssertionError(
+                f"Unsafe HTML tag/handler {unsafe_tag.group(0)!r} found in Card UI body"
+            )
         for needle in forbidden_substrings:
             if needle and needle in html:
                 raise AssertionError(f"Unescaped forbidden substring {needle!r} in Card UI HTML")
@@ -207,8 +228,12 @@ class CardUIClient:
         words = question.split()
         if len(words) > max_words:
             raise AssertionError(f"Card exceeds {max_words} words ({len(words)}): {question!r}")
-        if _HTML_TAG_RE.search(question):
-            raise AssertionError(f"Unescaped HTML markup in card question: {question!r}")
+        if (
+            _ANY_HTML_TAG_RE.search(question)
+            or _JS_URI_RE.search(question)
+            or _INLINE_HANDLER_RE.search(question)
+        ):
+            raise AssertionError(f"Unescaped HTML markup/script in card question: {question!r}")
         if (
             raw_adversarial_text
             and "<script" in raw_adversarial_text.lower()

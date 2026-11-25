@@ -271,7 +271,7 @@ def build_brief_update_event(
     *,
     session_id: str = "session-001",
     event_id: str = "event-0004",
-    changes: dict[str, Any] | None = None,
+    brief_patch: dict[str, Any] | None = None,
     received_ms: int = 6000,
     source_sequence: int = 4,
 ) -> dict[str, Any]:
@@ -280,7 +280,7 @@ def build_brief_update_event(
         "session_id": session_id,
         "event_id": event_id,
         "kind": "brief_update",
-        "changes": changes or {"objective": "Focus exclusively on rollback verification."},
+        "brief_patch": brief_patch or {"objective": "Focus exclusively on rollback verification."},
         "received_ms": received_ms,
         "source_sequence": source_sequence,
     }
@@ -297,6 +297,7 @@ def build_ledger_event(
     evidence_refs: list[dict[str, Any]] | None = None,
     feedback: str | None = None,
     received_ms: int | None = None,
+    source_sequence: int = 0,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -308,6 +309,7 @@ def build_ledger_event(
         "cause": cause,
         "at_ms": at_ms,
         "received_ms": received_ms if received_ms is not None else at_ms,
+        "source_sequence": source_sequence,
     }
     if evidence_refs is not None:
         event["evidence_refs"] = evidence_refs
@@ -322,6 +324,7 @@ def build_control_event(
     event_id: str = "event-0006",
     subtype: str = "session_start",
     received_ms: int = 0,
+    source_sequence: int = 0,
     start_ms: int | None = None,
     end_ms: int | None = None,
     seq_start: int | None = None,
@@ -335,6 +338,7 @@ def build_control_event(
         "kind": "control",
         "subtype": subtype,
         "received_ms": received_ms,
+        "source_sequence": source_sequence,
     }
     if start_ms is not None:
         event["start_ms"] = start_ms
@@ -507,7 +511,7 @@ def build_policy_dict(
             "t_display": 0.75,
             "route": "template",
             "template": "confirm_owner_v1",
-            "required_lookback_s": 120,
+            "required_lookback_s": 300,
         },
         "CONFIRM_TIME": {
             "t_low": 0.20,
@@ -515,7 +519,7 @@ def build_policy_dict(
             "t_display": 0.75,
             "route": "template",
             "template": "confirm_time_v1",
-            "required_lookback_s": 120,
+            "required_lookback_s": 300,
         },
         "SUCCESS_CRITERION": {
             "t_low": 0.20,
@@ -578,90 +582,126 @@ def write_policy_yaml(path: Path, **overrides: Any) -> Path:
 
 _TEMPLATES_SPEC: dict[str, dict[str, Any]] = {
     "confirm_owner_v1": {
-        "template_id": "confirm_owner_v1",
+        "id": "confirm_owner_v1",
         "category": "CONFIRM_OWNER",
         "max_words": 12,
-        "grounded": "Who will own {action}?",
-        "generic": "Who owns that next step?",
-        "slots": {
-            "action": {"extractor": "span_rules_v0", "max_words": 8, "must_be_substring": True}
+        "grounded": {
+            "text": "Who will own {action}?",
+            "slots": {
+                "action": {
+                    "extractor": "span_rules_v0",
+                    "max_words": 8,
+                    "must_be_substring": True,
+                }
+            },
         },
-        "generic_allowed_when": {
-            "anchor_is_latest_other_speech": True,
-            "max_anchor_age_ms": 6000,
+        "generic": {
+            "text": "Who owns that next step?",
+            "allowed_when": {
+                "anchor_is_latest_other_speech": True,
+                "max_anchor_age_ms": 6000,
+            },
         },
         "resolution_cues": ["named_assignment", "first_person_commitment"],
         "invalidate_on": ["evidence_revision_changed", "objective_changed", "possibly_resolved"],
     },
     "confirm_time_v1": {
-        "template_id": "confirm_time_v1",
+        "id": "confirm_time_v1",
         "category": "CONFIRM_TIME",
         "max_words": 12,
-        "grounded": "When does {action} need to be finished?",
-        "generic": "When does that need to be finished?",
-        "slots": {
-            "action": {"extractor": "span_rules_v0", "max_words": 8, "must_be_substring": True}
+        "grounded": {
+            "text": "When does {action} need to be finished?",
+            "slots": {
+                "action": {
+                    "extractor": "span_rules_v0",
+                    "max_words": 8,
+                    "must_be_substring": True,
+                }
+            },
         },
-        "generic_allowed_when": {
-            "anchor_is_latest_other_speech": True,
-            "max_anchor_age_ms": 6000,
+        "generic": {
+            "text": "When does that need to be finished?",
+            "allowed_when": {
+                "anchor_is_latest_other_speech": True,
+                "max_anchor_age_ms": 6000,
+            },
         },
         "resolution_cues": ["explicit_date", "explicit_deadline"],
         "invalidate_on": ["evidence_revision_changed", "objective_changed", "possibly_resolved"],
     },
     "success_criterion_v1": {
-        "template_id": "success_criterion_v1",
+        "id": "success_criterion_v1",
         "category": "SUCCESS_CRITERION",
         "max_words": 12,
-        "grounded": "How will we know {proposal} worked?",
-        "generic": "What would count as success?",
-        "slots": {
-            "proposal": {"extractor": "span_rules_v0", "max_words": 8, "must_be_substring": True}
+        "grounded": {
+            "text": "How will we know {proposal} worked?",
+            "slots": {
+                "proposal": {
+                    "extractor": "span_rules_v0",
+                    "max_words": 8,
+                    "must_be_substring": True,
+                }
+            },
         },
-        "generic_allowed_when": {
-            "anchor_is_latest_other_speech": True,
-            "max_anchor_age_ms": 6000,
+        "generic": {
+            "text": "What would count as success?",
+            "allowed_when": {
+                "anchor_is_latest_other_speech": True,
+                "max_anchor_age_ms": 6000,
+            },
         },
         "resolution_cues": ["metric_criterion", "pass_fail_threshold"],
         "invalidate_on": ["evidence_revision_changed", "objective_changed", "possibly_resolved"],
     },
     "clarify_scope_v1": {
-        "template_id": "clarify_scope_v1",
+        "id": "clarify_scope_v1",
         "category": "CLARIFY_SCOPE",
         "max_words": 12,
-        "grounded": "Does {proposal} include {explicitly_mentioned_boundary}?",
-        "generic": "What is included in that?",
-        "slots": {
-            "proposal": {"extractor": "span_rules_v0", "max_words": 8, "must_be_substring": True},
-            "explicitly_mentioned_boundary": {
-                "extractor": "span_rules_v0",
-                "max_words": 8,
-                "must_be_substring": True,
+        "grounded": {
+            "text": "Does {proposal} include {explicitly_mentioned_boundary}?",
+            "slots": {
+                "proposal": {
+                    "extractor": "span_rules_v0",
+                    "max_words": 8,
+                    "must_be_substring": True,
+                },
+                "explicitly_mentioned_boundary": {
+                    "extractor": "span_rules_v0",
+                    "max_words": 8,
+                    "must_be_substring": True,
+                },
             },
         },
-        "generic_allowed_when": {
-            "anchor_is_latest_other_speech": True,
-            "max_anchor_age_ms": 6000,
+        "generic": {
+            "text": "What is included in that?",
+            "allowed_when": {
+                "anchor_is_latest_other_speech": True,
+                "max_anchor_age_ms": 6000,
+            },
         },
         "resolution_cues": ["explicit_inclusion_exclusion"],
         "invalidate_on": ["evidence_revision_changed", "objective_changed", "possibly_resolved"],
     },
     "request_evidence_v1": {
-        "template_id": "request_evidence_v1",
+        "id": "request_evidence_v1",
         "category": "REQUEST_EVIDENCE",
         "max_words": 12,
-        "grounded": "What evidence supports {stated_claim}?",
-        "generic": "What evidence supports that?",
-        "slots": {
-            "stated_claim": {
-                "extractor": "span_rules_v0",
-                "max_words": 8,
-                "must_be_substring": True,
-            }
+        "grounded": {
+            "text": "What evidence supports {stated_claim}?",
+            "slots": {
+                "stated_claim": {
+                    "extractor": "span_rules_v0",
+                    "max_words": 8,
+                    "must_be_substring": True,
+                }
+            },
         },
-        "generic_allowed_when": {
-            "anchor_is_latest_other_speech": True,
-            "max_anchor_age_ms": 6000,
+        "generic": {
+            "text": "What evidence supports that?",
+            "allowed_when": {
+                "anchor_is_latest_other_speech": True,
+                "max_anchor_age_ms": 6000,
+            },
         },
         "resolution_cues": ["source_cited", "measurement_cited"],
         "invalidate_on": ["evidence_revision_changed", "objective_changed", "possibly_resolved"],
@@ -783,7 +823,9 @@ class AppendixBFixture:
 
 def _b01() -> AppendixBFixture:
     base = [
-        build_control_event(session_id="b01", event_id="b01-c0", subtype="session_start"),
+        build_control_event(
+            session_id="b01", event_id="b01-c0", subtype="session_start", source_sequence=0
+        ),
         build_segment_event(
             session_id="b01",
             event_id="b01-e1",
@@ -997,6 +1039,7 @@ def _b06() -> AppendixBFixture:
             event_id="b06-gap",
             subtype="gap",
             received_ms=15000,
+            source_sequence=2,
             start_ms=4500,
             end_ms=19500,
             seq_start=2,
@@ -1008,6 +1051,7 @@ def _b06() -> AppendixBFixture:
             event_id="b06-reconn",
             subtype="reconnect",
             received_ms=19600,
+            source_sequence=3,
         ),
         pre_seg,
         tail_seg,
@@ -1203,6 +1247,7 @@ def _b11() -> AppendixBFixture:
             cause="user_action",
             at_ms=7000,
             feedback="not_relevant",
+            source_sequence=2,
         ),
         build_segment_event(
             session_id="b11",
@@ -1212,7 +1257,7 @@ def _b11() -> AppendixBFixture:
             start_ms=65000,
             end_ms=68000,
             received_ms=68200,
-            source_sequence=2,
+            source_sequence=3,
         ),
     ]
     return AppendixBFixture(
@@ -1328,8 +1373,9 @@ def _b14() -> AppendixBFixture:
         brief=build_session_brief(session_id="b14"),
         events=events,
         expected_reason_codes=("deferred_released", "display_by_passed"),
-        expected_terminal_states=("displayed", "expired"),
+        expected_terminal_states=("expired",),
         policy_overrides={"cooldown_ms": 20000, "settle_ms": 200},
+        notes={"expected_observed_states": ("deferred", "displayed")},
     )
 
 
@@ -1348,7 +1394,7 @@ def _b15() -> AppendixBFixture:
         build_brief_update_event(
             session_id="b15",
             event_id="b15-u1",
-            changes={"objective": "Review post-incident monitoring thresholds only."},
+            brief_patch={"objective": "Review post-incident monitoring thresholds only."},
             received_ms=4800,
             source_sequence=2,
         ),
@@ -1396,7 +1442,9 @@ def _b16() -> AppendixBFixture:
 
 def _b17() -> AppendixBFixture:
     events = [
-        build_control_event(session_id="b17", event_id="b17-c1", subtype="session_start"),
+        build_control_event(
+            session_id="b17", event_id="b17-c1", subtype="session_start", source_sequence=0
+        ),
         build_segment_event(
             session_id="b17",
             event_id="b17-e1",
@@ -1438,6 +1486,7 @@ def _b18() -> AppendixBFixture:
             event_id="b18-c1",
             subtype="off_record_start",
             received_ms=4000,
+            source_sequence=2,
         ),
         build_segment_event(
             session_id="b18",
@@ -1447,19 +1496,21 @@ def _b18() -> AppendixBFixture:
             start_ms=5000,
             end_ms=8000,
             received_ms=8100,
-            source_sequence=2,
+            source_sequence=3,
         ),
         build_control_event(
             session_id="b18",
             event_id="b18-c2",
             subtype="off_record_end",
             received_ms=12000,
+            source_sequence=4,
         ),
         build_control_event(
             session_id="b18",
             event_id="b18-c3",
             subtype="gap",
             received_ms=12001,
+            source_sequence=5,
             start_ms=4000,
             end_ms=12000,
             reason="off_record",
@@ -1472,7 +1523,7 @@ def _b18() -> AppendixBFixture:
             start_ms=13000,
             end_ms=16000,
             received_ms=16200,
-            source_sequence=3,
+            source_sequence=6,
         ),
     ]
     return AppendixBFixture(
@@ -1556,8 +1607,8 @@ def _b20() -> AppendixBFixture:
         brief=build_session_brief(session_id="b20"),
         events=events,
         expected_reason_codes=("manual_request",),
-        expected_terminal_states=("displayed",),
-        notes={"manual_budget_ms": 2000},
+        expected_terminal_states=("used", "dismissed", "resolved", "expired", "withdrawn"),
+        notes={"manual_budget_ms": 2000, "expected_observed_states": ("displayed",)},
     )
 
 
@@ -1573,7 +1624,7 @@ def _b21() -> AppendixBFixture:
             end_ms=2500,
             received_ms=2700,
             source_sequence=1,
-            extra={"asr_confidence": 0.25, "gate_silent": True},
+            extra={"asr_confidence": 0.25, "low_quality_gate": True},
         ),
         build_segment_event(
             session_id="b21",
@@ -1585,7 +1636,7 @@ def _b21() -> AppendixBFixture:
             end_ms=5500,
             received_ms=5700,
             source_sequence=2,
-            extra={"asr_confidence": 0.20, "gate_silent": True},
+            extra={"asr_confidence": 0.20, "low_quality_gate": True},
         ),
     ]
     return AppendixBFixture(
@@ -1739,8 +1790,9 @@ def _b24() -> AppendixBFixture:
         brief=build_session_brief(session_id="b24"),
         events=events,
         expected_reason_codes=("interim_resolution_hint", "deferred_released"),
-        expected_terminal_states=("displayed",),
+        expected_terminal_states=("used", "dismissed", "resolved", "expired", "withdrawn"),
         policy_overrides={"settle_ms": 500},
+        notes={"expected_observed_states": ("deferred", "displayed")},
     )
 
 

@@ -235,7 +235,9 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        model_name = spec.model or str(body.get("model") or self._owner.get_models()[0])
+        models = self._owner.get_models()
+        fallback_model = models[0] if models else "mock-model"
+        model_name = spec.model or str(body.get("model") or fallback_model)
         usage = {
             "prompt_tokens": spec.prompt_tokens,
             "completion_tokens": spec.completion_tokens,
@@ -264,21 +266,29 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             "finish_reason": spec.finish_reason,
         }
         if spec.top_logprobs is not None or body.get("logprobs"):
-            lp_map = (
-                spec.top_logprobs[0] if spec.top_logprobs else {"CONFIRM_OWNER": -0.2, "NONE": -1.8}
+            lp_list = (
+                spec.top_logprobs
+                if spec.top_logprobs is not None
+                else [{"CONFIRM_OWNER": -0.2, "NONE": -1.8}]
             )
-            top_tok = max(lp_map, key=lambda k: lp_map[k])
-            choice["logprobs"] = {
-                "content": [
+            content_items: list[dict[str, Any]] = []
+            for lp_map in lp_list:
+                if lp_map:
+                    top_tok = max(lp_map, key=lambda k: lp_map[k])
+                    top_score = lp_map[top_tok]
+                else:
+                    top_tok = ""
+                    top_score = 0.0
+                content_items.append(
                     {
                         "token": top_tok,
-                        "logprob": lp_map[top_tok],
+                        "logprob": top_score,
                         "top_logprobs": [
                             {"token": tok, "logprob": score} for tok, score in lp_map.items()
                         ],
                     }
-                ]
-            }
+                )
+            choice["logprobs"] = {"content": content_items}
         return {
             "id": "chatcmpl-mock-001",
             "object": "chat.completion",
@@ -302,10 +312,14 @@ class _MockOpenAIHandler(BaseHTTPRequestHandler):
             "finish_reason": spec.finish_reason,
         }
         if spec.top_logprobs is not None or body.get("logprobs") is not None:
-            lp_list = spec.top_logprobs or [{"CONFIRM_OWNER": -0.15, "NONE": -2.1}]
+            lp_list = (
+                spec.top_logprobs
+                if spec.top_logprobs is not None
+                else [{"CONFIRM_OWNER": -0.15, "NONE": -2.1}]
+            )
             choice["logprobs"] = {
-                "tokens": [max(m, key=lambda k: m[k]) for m in lp_list],
-                "token_logprobs": [max(m.values()) for m in lp_list],
+                "tokens": [max(m, key=lambda k: m[k]) if m else "" for m in lp_list],
+                "token_logprobs": [max(m.values()) if m else 0.0 for m in lp_list],
                 "top_logprobs": lp_list,
             }
         return {

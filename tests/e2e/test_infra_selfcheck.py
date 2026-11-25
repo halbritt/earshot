@@ -29,6 +29,7 @@ from websockets.http11 import Request, Response
 
 from tests.e2e.helpers.cli_runner import (
     ManagedProcess,
+    resolve_coach_cmd,
     resolve_earshot_cmd,
     run_cli,
     run_earshot_beam,
@@ -229,9 +230,11 @@ def test_mock_peecee_speech_exit75_stream_json_and_sigterm(
             proc.kill()
             proc.wait(timeout=2.0)
 
-    # 4. Offline WAV --stream --json transcription
+    # 4. Offline WAV transcription (strict args: RECORDING.wav [LANGUAGE|auto])
     wav_path = write_wav_mono16(tmp_path / "sample.wav", generate_pcm16_sine(duration_ms=800))
-    res_wav = run_cli([str(mock_peecee_bin), str(wav_path), "en-US", "--stream", "--json"])
+    res_bad_flags = run_cli([str(mock_peecee_bin), str(wav_path), "en-US", "--stream", "--json"])
+    assert res_bad_flags.returncode == 2
+    res_wav = run_cli([str(mock_peecee_bin), str(wav_path), "en-US"])
     assert res_wav.returncode == 0
     payload = res_wav.json()
     assert payload["file"] == str(wav_path)
@@ -359,6 +362,12 @@ def test_fixture_builders_contracts_templates_wav_and_appendix_b(
 
     policy = build_policy_dict()
     assert policy["generator"]["breaker"]["consecutive_failures"] == 3
+    assert policy["categories"]["CONFIRM_OWNER"]["required_lookback_s"] == 300
+    assert policy["categories"]["CONFIRM_TIME"]["required_lookback_s"] == 300
+    assert policy["categories"]["SUCCESS_CRITERION"]["required_lookback_s"] == 120
+    assert "brief_patch" in events[3] and "changes" not in events[3]
+    assert isinstance(events[4]["source_sequence"], int)
+    assert isinstance(events[5]["source_sequence"], int)
     for tpl_name in (
         "confirm_owner_v1",
         "confirm_time_v1",
@@ -367,7 +376,12 @@ def test_fixture_builders_contracts_templates_wav_and_appendix_b(
         "request_evidence_v1",
     ):
         tpl = build_template_dict(tpl_name)
+        assert tpl["id"] == tpl_name
         assert tpl["max_words"] == 12
+        assert isinstance(tpl["grounded"]["text"], str)
+        assert isinstance(tpl["grounded"]["slots"], dict)
+        assert isinstance(tpl["generic"]["text"], str)
+        assert isinstance(tpl["generic"]["allowed_when"], dict)
         assert (e2e_workspace["templates_dir"] / f"{tpl_name}.yaml").is_file()
 
     pcm = generate_pcm16_sine(duration_ms=320)
@@ -384,6 +398,12 @@ def test_fixture_builders_contracts_templates_wav_and_appendix_b(
         fid = f"B{num:02d}"
         assert fid in all_b
         assert set(all_b[fid].expected_reason_codes).issubset(REASON_CODES)
+        assert "displayed" not in all_b[fid].expected_terminal_states
+    for fid in ("B14", "B20", "B24"):
+        assert "displayed" in all_b[fid].notes.get("expected_observed_states", ())
+    for ev in all_b["B21"].events:
+        assert "gate_silent" not in ev
+        assert ev.get("low_quality_gate") is True
 
 
 def _create_synthetic_coach_db(db_path: Path, *, journal_mode: str = "WAL") -> None:
@@ -454,6 +474,7 @@ def _create_synthetic_coach_db(db_path: Path, *, journal_mode: str = "WAL") -> N
             "reason_code": "user_action",
             "question_text": "Who will own the rollback plan?",
             "evidence_refs": [{"segment_id": "seg-1", "revision": 1}],
+            "usage": {"model": "mock-gen", "prompt_tokens": 90, "latency_ms": 35},
         }
         conn.execute(
             "INSERT INTO suggestions VALUES (?, ?, ?)",
@@ -729,10 +750,30 @@ def test_ui_client_security_xss_ws_and_annotation_lock() -> None:
 
         html = httpx.get(f"{base_url}/", headers={"Authorization": f"Bearer {token}"}).text
         client.inspect_html_xss_safety(html, forbidden_substrings=("<script>alert",))
-        with pytest.raises(AssertionError, match="innerHTML"):
-            client.inspect_html_xss_safety("<script>el.innerHTML = x;</script>")
-        with pytest.raises(AssertionError, match="Notification"):
-            client.inspect_html_xss_safety("<script>new Notification('hi');</script>")
+        for bad_html, pat in (
+            ("<script>el.innerHTML = x;</script>", "innerHTML"),
+            ("<script>el['innerHTML'] = x;</script>", "innerHTML"),
+            ("<script>el['inner' + 'HTML'] = x;</script>", "innerHTML"),
+            ("<script>document.writeln('x');</script>", "document.write"),
+            ("<script>new Notification('hi');</script>", "Notification"),
+            ("<script>Notification.requestPermission();</script>", "Notification"),
+            ("<script>Reflect.construct(Notification, ['hi']);</script>", "Notification"),
+            ("<script>eval('1+1');</script>", "eval"),
+            ("<script>new Function('return 1')();</script>", "Function"),
+            ("<body><div><img src=x onerror=alert(1)></div></body>", "Unsafe HTML"),
+            ("<body><div><svg onload=alert(1)></svg></div></body>", "Unsafe HTML"),
+            ("<body><details open ontoggle=alert(1)></details></body>", "Unsafe HTML"),
+            ("<body><a href='javascript:alert(1)'>x</a></body>", "Unsafe HTML"),
+        ):
+            with pytest.raises(AssertionError, match=pat):
+                client.inspect_html_xss_safety(bad_html)
+        for bad_card in (
+            {"question": "<details open ontoggle=alert(1)>?"},
+            {"question": "<a href='javascript:alert(1)'>click</a>?"},
+            {"question": "Who owns onclick=alert(1)?"},
+        ):
+            with pytest.raises(AssertionError, match="markup/script"):
+                client.assert_card_plain_text(bad_card)
 
         async def _exercise_ws() -> None:
             async with client.ws_session() as ws:
@@ -827,3 +868,461 @@ def test_cli_runner_earshot_beam_and_direction(repo_root: Path, tmp_path: Path) 
     assert "from 0.00 s the beam looks at 0 degrees" in beam_res.stderr
     with wave.open(str(out_wav), "rb") as wf:
         assert (wf.getnchannels(), wf.getsampwidth(), wf.getframerate()) == (1, 2, 16000)
+
+
+def _create_m1_style_db(db_path: Path) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executescript(
+            """
+            CREATE TABLE raw_events (session_id TEXT, run_id TEXT, payload_json TEXT);
+            CREATE TABLE events (
+                session_id TEXT, run_id TEXT, event_id TEXT, kind TEXT, segment_id TEXT,
+                source_revision INTEGER, canonical_revision INTEGER, speaker_id TEXT,
+                received_ms INTEGER, source_sequence INTEGER, stability TEXT,
+                text TEXT, payload_json TEXT
+            );
+            CREATE TABLE decisions (
+                session_id TEXT, run_id TEXT, candidate_id TEXT, anchor_refs_json TEXT,
+                raw_scores_json TEXT, calibrated_scores_json TEXT, outcome TEXT, route TEXT,
+                reason_codes_json TEXT, terminal_state TEXT, terminal_reason TEXT,
+                serialized_text TEXT
+            );
+            CREATE TABLE suggestions (
+                session_id TEXT, run_id TEXT, suggestion_id TEXT, candidate_id TEXT,
+                route TEXT, current_state TEXT, terminal_reason TEXT, transitions_json TEXT,
+                evidence_refs_json TEXT, text TEXT, grounded_slots TEXT
+            );
+            CREATE TABLE feedback (
+                session_id TEXT, run_id TEXT, label_id TEXT, label_json TEXT
+            );
+            CREATE TABLE model_cache (
+                serialized_sha256 TEXT, model_version TEXT, output_json TEXT
+            );
+            CREATE TABLE egress_log (
+                egress_id TEXT, session_id TEXT, run_id TEXT, candidate_id TEXT,
+                lane TEXT, provider TEXT, model_id TEXT, segment_ids_json TEXT,
+                sent_at_ms INTEGER, usage_json TEXT
+            );
+            """
+        )
+        for seg_id, src_rev in (("seg-1", 3), ("seg-2", 1), ("seg-3", 1)):
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "s1",
+                    "r1",
+                    f"ev-{seg_id}",
+                    "segment",
+                    seg_id,
+                    src_rev,
+                    1,
+                    "participant-b",
+                    1000,
+                    1,
+                    "committed",
+                    None,
+                    None,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "cand-drop",
+                json.dumps([{"segment_id": "seg-2", "revision": 1}]),
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                "dropped",
+                "too_short",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "cand-ret",
+                json.dumps([{"segment_id": "seg-3", "revision": 1}]),
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                "retired",
+                "expired_unevaluated",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "cand-1",
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+                json.dumps({"opportunity": 0.9}),
+                json.dumps({"opportunity": 0.88}),
+                "ROUTE",
+                "generator",
+                json.dumps(["above_t_display"]),
+                "routed",
+                None,
+                None,
+            ),
+        )
+        transitions = [
+            {"event_id": "l1", "transition": "displayed", "cause": "settle_timeout", "at_ms": 2000},
+            {"event_id": "l2", "transition": "used", "cause": "user_action", "at_ms": 3000},
+            {"event_id": "l3", "transition": "resolved", "cause": "resolution_cue", "at_ms": 4000},
+        ]
+        conn.execute(
+            "INSERT INTO suggestions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "sug-1",
+                "cand-1",
+                "generator",
+                "resolved",
+                "resolution_cue",
+                json.dumps(transitions),
+                json.dumps([{"segment_id": "seg-1", "revision": 1}]),
+                None,
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO egress_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "eg-1",
+                "s1",
+                "r1",
+                "cand-1",
+                "proactive",
+                "mock",
+                "mock-gen",
+                json.dumps(["seg-1"]),
+                1500,
+                json.dumps({"prompt_tokens": 50}),
+            ),
+        )
+        conn.commit()
+
+
+def test_db_assertions_adversarial_false_negatives(tmp_path: Path) -> None:
+    # 1. Empty DB with 0 tables must fail
+    empty_db = tmp_path / "empty.db"
+    with sqlite3.connect(str(empty_db)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    with pytest.raises(AssertionError, match="Missing required SQLite tables"):
+        assert_six_conservation_invariants(empty_db, "s1")
+
+    # 2. M1-style SQLiteStore schema passes (dropped/retired, canonical_revision, used->resolved)
+    m1_db = tmp_path / "m1.db"
+    _create_m1_style_db(m1_db)
+    summary = assert_six_conservation_invariants(m1_db, "s1", run_id="r1")
+    assert summary["candidates"] == 3
+    assert_egress_records_valid(m1_db, "s1", run_id="r1", expected_segment_ids={"seg-1"})
+
+    # 3. Inv 1: duplicate anchor across two candidates
+    dup_anchor_db = tmp_path / "dup_anchor.db"
+    _create_m1_style_db(dup_anchor_db)
+    with sqlite3.connect(str(dup_anchor_db)) as conn:
+        conn.execute(
+            "UPDATE decisions SET anchor_refs_json = ? WHERE candidate_id = 'cand-drop'",
+            (json.dumps([{"segment_id": "seg-1", "revision": 1}]),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 1"):
+        assert_six_conservation_invariants(dup_anchor_db, "s1", run_id="r1")
+
+    # 4. Inv 1: dropped candidate illegally holding raw_scores
+    drop_scores_db = tmp_path / "drop_scores.db"
+    _create_m1_style_db(drop_scores_db)
+    with sqlite3.connect(str(drop_scores_db)) as conn:
+        conn.execute(
+            "UPDATE decisions SET raw_scores_json = ? WHERE candidate_id = 'cand-drop'",
+            (json.dumps({"opportunity": 0.5}),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 1"):
+        assert_six_conservation_invariants(drop_scores_db, "s1", run_id="r1")
+
+    # 5. Inv 1: null/empty candidate_id
+    null_cid_db = tmp_path / "null_cid.db"
+    _create_m1_style_db(null_cid_db)
+    with sqlite3.connect(str(null_cid_db)) as conn:
+        conn.execute("UPDATE decisions SET candidate_id = '' WHERE candidate_id = 'cand-drop'")
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 1"):
+        assert_six_conservation_invariants(null_cid_db, "s1", run_id="r1")
+
+    # 6. Inv 3: non-terminal code on terminal candidate & orphan suggestion
+    non_term_db = tmp_path / "non_term.db"
+    _create_m1_style_db(non_term_db)
+    with sqlite3.connect(str(non_term_db)) as conn:
+        conn.execute(
+            "UPDATE suggestions SET terminal_reason = 'settling' WHERE suggestion_id = 'sug-1'"
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 3"):
+        assert_six_conservation_invariants(non_term_db, "s1", run_id="r1")
+
+    orphan_db = tmp_path / "orphan.db"
+    _create_m1_style_db(orphan_db)
+    with sqlite3.connect(str(orphan_db)) as conn:
+        conn.execute(
+            "INSERT INTO suggestions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "sug-orphan",
+                "cand-missing",
+                "template",
+                "unrendered",
+                "bogus_code",
+                "[]",
+                "[]",
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 3"):
+        assert_six_conservation_invariants(orphan_db, "s1", run_id="r1")
+
+    # 7. Inv 4: double-closing (used + dismissed) & unclosed transitions_json
+    double_close_db = tmp_path / "double_close.db"
+    _create_m1_style_db(double_close_db)
+    with sqlite3.connect(str(double_close_db)) as conn:
+        bad_trans = [
+            {"event_id": "l1", "transition": "displayed", "cause": "settle_timeout", "at_ms": 2000},
+            {"event_id": "l2", "transition": "used", "cause": "user_action", "at_ms": 3000},
+            {"event_id": "l3", "transition": "dismissed", "cause": "user_action", "at_ms": 4000},
+        ]
+        conn.execute(
+            "UPDATE suggestions SET transitions_json = ? WHERE suggestion_id = 'sug-1'",
+            (json.dumps(bad_trans),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 4"):
+        assert_six_conservation_invariants(double_close_db, "s1", run_id="r1")
+
+    unclosed_db = tmp_path / "unclosed.db"
+    _create_m1_style_db(unclosed_db)
+    with sqlite3.connect(str(unclosed_db)) as conn:
+        conn.execute(
+            "UPDATE suggestions SET current_state = 'displayed', terminal_reason = NULL, "
+            "transitions_json = ? WHERE suggestion_id = 'sug-1'",
+            (json.dumps([{"event_id": "l1", "transition": "displayed", "at_ms": 2000}]),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 4|Inv 3"):
+        assert_six_conservation_invariants(unclosed_db, "s1", run_id="r1")
+
+    # 8. Inv 5: unrelated egress_log row must not mask missing usage on another generator candidate
+    inv5_db = tmp_path / "inv5.db"
+    _create_m1_style_db(inv5_db)
+    with sqlite3.connect(str(inv5_db)) as conn:
+        conn.execute(
+            "UPDATE decisions SET outcome = 'ABSTAIN', route = 'generator', "
+            "raw_scores_json = ?, terminal_state = 'ABSTAIN', terminal_reason = 'score_in_band' "
+            "WHERE candidate_id = 'cand-ret'",
+            (json.dumps({"opportunity": 0.4}),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 5"):
+        assert_six_conservation_invariants(inv5_db, "s1", run_id="r1")
+
+    # 9. Inv 6: source_revision=3 + canonical_revision=1 rejects rev 3; checks events.evidence_refs
+    inv6_canon_db = tmp_path / "inv6_canon.db"
+    _create_m1_style_db(inv6_canon_db)
+    with sqlite3.connect(str(inv6_canon_db)) as conn:
+        conn.execute(
+            "UPDATE suggestions SET evidence_refs_json = ? WHERE suggestion_id = 'sug-1'",
+            (json.dumps([{"segment_id": "seg-1", "revision": 3}]),),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 6"):
+        assert_six_conservation_invariants(inv6_canon_db, "s1", run_id="r1")
+
+    inv6_ledger_db = tmp_path / "inv6_ledger.db"
+    _create_m1_style_db(inv6_ledger_db)
+    with sqlite3.connect(str(inv6_ledger_db)) as conn:
+        bad_ledger = build_ledger_event(
+            session_id="s1",
+            event_id="l2",
+            suggestion_id="sug-1",
+            transition="used",
+            cause="user_action",
+            at_ms=3000,
+            evidence_refs=[{"segment_id": "seg-bogus", "revision": 42}],
+            source_sequence=9,
+        )
+        conn.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "s1",
+                "r1",
+                "l2",
+                "ledger",
+                None,
+                None,
+                None,
+                None,
+                3000,
+                9,
+                None,
+                None,
+                json.dumps(bad_ledger),
+            ),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="Inv 6"):
+        assert_six_conservation_invariants(inv6_ledger_db, "s1", run_id="r1")
+
+    # 10. §14.2: leaked text in model_cache (no session_id) and flat grounded_slots
+    cache_leak_db = tmp_path / "cache_leak.db"
+    _create_m1_style_db(cache_leak_db)
+    with sqlite3.connect(str(cache_leak_db)) as conn:
+        conn.execute(
+            "INSERT INTO model_cache VALUES (?, ?, ?)",
+            ("sha-1", "gen-v1", json.dumps({"question": "Leaked secret phrase?"})),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="model_cache"):
+        assert_session_text_deleted(
+            cache_leak_db, "s1", forbidden_substrings=("Leaked secret phrase",)
+        )
+
+    slots_leak_db = tmp_path / "slots_leak.db"
+    _create_m1_style_db(slots_leak_db)
+    with sqlite3.connect(str(slots_leak_db)) as conn:
+        conn.execute(
+            "UPDATE suggestions SET grounded_slots = ? WHERE suggestion_id = 'sug-1'",
+            (
+                json.dumps(
+                    {"action": {"text": "rollback plan", "segment_id": "seg-1", "revision": 1}}
+                ),
+            ),
+        )
+        conn.commit()
+    with pytest.raises(AssertionError, match="grounded_slots"):
+        assert_session_text_deleted(slots_leak_db, "s1")
+
+
+def test_passive_ws_rejection_and_mock_edge_cases(
+    mock_nemo_ws: MockNemoServer,
+    mock_openai: MockOpenAIServer,
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    # 1. Passive unauthenticated WS (accepts handshake & waits without sending) MUST fail auth check
+    token = "tok-passive-check"
+    ready = threading.Event()
+    port_holder = [0]
+    loop_holder: list[asyncio.AbstractEventLoop] = []
+    stop_holder: list[asyncio.Event] = []
+
+    def _process_req(_conn: ServerConnection, req: Request) -> Response | None:
+        path = urlsplit(req.path).path
+        if path == "/":
+            auth = req.headers.get("Authorization", "")
+            qs = parse_qs(urlsplit(req.path).query)
+            if auth == f"Bearer {token}" or qs.get("token", [None])[0] == token:
+                return Response(
+                    200, "OK", Headers([("Content-Type", "text/html")]), b"<html></html>"
+                )
+            return Response(401, "Unauthorized", Headers(), b"Unauthorized")
+        if path == "/ws":
+            return None  # Buggy: forgets auth check on /ws!
+        return Response(404, "Not Found", Headers(), b"Not Found")
+
+    async def _passive_ws(ws: ServerConnection) -> None:
+        try:
+            async for _ in ws:
+                pass
+        except ConnectionClosed:
+            return
+
+    async def _serve_passive() -> None:
+        stop_ev = asyncio.Event()
+        stop_holder.append(stop_ev)
+        async with serve(_passive_ws, "127.0.0.1", 0, process_request=_process_req) as srv:
+            port_holder[0] = int(next(iter(srv.sockets)).getsockname()[1])
+            ready.set()
+            await stop_ev.wait()
+
+    def _run_passive() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_holder.append(loop)
+        loop.run_until_complete(_serve_passive())
+        loop.close()
+
+    t = threading.Thread(target=_run_passive, daemon=True)
+    t.start()
+    assert ready.wait(timeout=5.0)
+    try:
+        client = CardUIClient(f"http://127.0.0.1:{port_holder[0]}", token)
+        with pytest.raises(AssertionError, match="Expected WS rejection"):
+            client.assert_auth_enforced()
+    finally:
+        if loop_holder and stop_holder:
+            loop_holder[0].call_soon_threadsafe(stop_holder[0].set)
+        t.join(timeout=5.0)
+
+    # 2. MockNemoServer emits deltas before drop_connection closes
+    mock_nemo_ws.set_config(
+        MockNemoConfig(
+            script=[
+                ScriptedTurn(
+                    trigger_after_frames=1,
+                    deltas=["partial-before-drop"],
+                    drop_connection=True,
+                )
+            ]
+        )
+    )
+    frame = generate_pcm16_silence(duration_ms=160)
+
+    async def _check_deltas_before_drop() -> None:
+        async with connect(mock_nemo_ws.url) as ws:
+            _ = json.loads(await ws.recv())  # session.created
+            await ws.send(frame)
+            delta = json.loads(await ws.recv())
+            assert delta["delta"] == "partial-before-drop"
+            with pytest.raises(ConnectionClosed):
+                await asyncio.wait_for(ws.recv(), timeout=2.0)
+
+    asyncio.run(_check_deltas_before_drop())
+
+    # 3. MockOpenAIServer handles empty models, empty top_logprobs dict, and multi-pos chat logprobs
+    mock_openai.set_models([])
+    mock_openai.enqueue(
+        MockCompletionSpec(content="ab", top_logprobs=[{}]),
+        MockCompletionSpec(
+            content="ab",
+            top_logprobs=[{"A": -0.1, "B": -2.0}, {"C": -0.2, "D": -1.5}],
+        ),
+    )
+    with httpx.Client(timeout=3.0) as hc:
+        r_empty_lp = hc.post(f"{mock_openai.base_url}/chat/completions", json={"messages": []})
+        assert r_empty_lp.status_code == 200
+        r_multi_lp = hc.post(f"{mock_openai.base_url}/chat/completions", json={"messages": []})
+        assert r_multi_lp.status_code == 200
+        assert len(r_multi_lp.json()["choices"][0]["logprobs"]["content"]) == 2
+
+    # 4. resolve_coach_cmd on a secondary worktree does not resolve to main repo .venv/bin/coach
+    fake_wt = tmp_path / "worktree"
+    fake_wt.mkdir()
+    cmd = resolve_coach_cmd(fake_wt)
+    assert cmd != ["/home/halbritt/git/earshot/.venv/bin/coach"]
+    assert cmd[1:] == ["-m", "coach.cli"]

@@ -54,6 +54,7 @@ class ScriptedTurn:
     transcript: str = ""
     words: list[MockWord] = field(default_factory=list)
     drop_connection: bool = False
+    abrupt: bool = False
     error: tuple[str, str, str] | None = None
     delay_s: float = 0.0
 
@@ -147,17 +148,22 @@ class MockNemoServer:
             self.received_events.clear()
             self.session_configs.clear()
 
-    def drop_active_clients(self) -> None:
+    def drop_active_clients(self, *, abrupt: bool = False) -> None:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
         with self._lock:
             clients = list(self._active_clients)
         for ws in clients:
-            loop.call_soon_threadsafe(self._schedule_close, ws)
+            loop.call_soon_threadsafe(self._schedule_close, ws, abrupt)
 
     @staticmethod
-    def _schedule_close(ws: ServerConnection) -> None:
+    def _schedule_close(ws: ServerConnection, abrupt: bool = False) -> None:
+        if abrupt:
+            transport = getattr(ws, "transport", None)
+            if isinstance(transport, asyncio.Transport):
+                transport.abort()
+                return
         asyncio.create_task(ws.close(1011, "drop"))
 
     def _next_event_id(self) -> str:
@@ -246,9 +252,6 @@ class MockNemoServer:
         if turn.error is not None:
             err_type, code, message = turn.error
             await self._send_error(ws, err_type=err_type, code=code, message=message)
-        if turn.drop_connection:
-            await ws.close(1011, "scripted_drop")
-            return False
         for delta in turn.deltas:
             await ws.send(
                 json.dumps(
@@ -260,6 +263,14 @@ class MockNemoServer:
                     }
                 )
             )
+        if turn.drop_connection:
+            if turn.abrupt:
+                transport = getattr(ws, "transport", None)
+                if isinstance(transport, asyncio.Transport):
+                    transport.abort()
+                    return False
+            await ws.close(1011, "scripted_drop")
+            return False
         if turn.transcript or turn.words:
             payload: dict[str, Any] = {
                 "event_id": self._next_event_id(),
@@ -621,11 +632,12 @@ def _serve(args: list[str]) -> int:
 
 
 def _transcribe_wav(args: list[str]) -> int:
-    positional = [a for a in args if a not in {"--stream", "--json"}]
-    if not (1 <= len(positional) <= 2):
+    if not (1 <= len(args) <= 2):
         return _usage()
-    wav_path = Path(positional[0])
-    lang = positional[1] if len(positional) == 2 else "auto"
+    if args[0].startswith("-") or (len(args) == 2 and args[1].startswith("-")):
+        return _usage()
+    wav_path = Path(args[0])
+    lang = args[1] if len(args) == 2 else "auto"
     if not LANG_RE.match(lang):
         return _usage()
     if not wav_path.is_file() or not os.access(wav_path, os.R_OK):
