@@ -10,6 +10,7 @@ design, a fixed beam over a recording, and direction finding. Echo cancellation,
 detection and live capture are not built yet. See [docs/plan.md](docs/plan.md).
 
 - `docs/plan.md`: why, the design rules, the stages, the interfaces and the order of work.
+- `docs/design.md`: live conversation coach — classifier architecture, `peecee` streaming transcription adapter, and implementation plan.
 - `crates/earshot-bench/`: the replay bench, which scores any front-end variant on a recorded
   take by word error rate and CPU time. See its [README](crates/earshot-bench/README.md).
 - `crates/earshot-core/`: the processing core, `no_std`: the array as data, delay-and-sum and
