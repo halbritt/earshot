@@ -95,16 +95,22 @@ _WEEKDAYS = (
     r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
 )
 _MONTH_WRAP = r"""[_*`"'~“‘”’]*"""
+_MONTH_WRAP_END_GUARD = r"""(?![_*`"'~“‘”’])"""
 _DATE_EXPR_RE = re.compile(
-    rf"(?<![^\W_])(?:(?P<month_day>{_MONTH_WRAP}(?P<month_day_month>{_MONTHS}){_MONTH_WRAP}\s+"
-    rf"(?P<month_day_day>\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?))|"
-    rf"(?P<month_year>{_MONTH_WRAP}(?P<month_year_month>{_MONTHS}){_MONTH_WRAP},?\s+"
-    rf"(?P<month_year_year>\d{{4}})(?![^\W_]))|"
-    rf"(?P<day_month>(?P<day_month_day>\d{{1,2}}(?:st|nd|rd|th)?)\s+"
-    rf"{_MONTH_WRAP}(?P<day_month_month>{_MONTHS}){_MONTH_WRAP}"
-    rf"(?:,?\s+(?P<day_month_year>\d{{4}}))?(?![^\W_]))|"
+    rf"(?<![^\W_])(?:(?P<month_day>{_MONTH_WRAP}(?P<month_day_month>{_MONTHS})"
+    rf"{_MONTH_WRAP}{_MONTH_WRAP_END_GUARD}\s+"
+    rf"{_MONTH_WRAP}(?P<month_day_day>\d{{1,2}}(?:st|nd|rd|th)?){_MONTH_WRAP}{_MONTH_WRAP_END_GUARD}"
+    rf"(?:,?\s+{_MONTH_WRAP}(?P<month_day_year>\d{{4}}){_MONTH_WRAP}{_MONTH_WRAP_END_GUARD})?)|"
+    rf"(?P<month_year>{_MONTH_WRAP}(?P<month_year_month>{_MONTHS})"
+    rf"{_MONTH_WRAP}{_MONTH_WRAP_END_GUARD},?\s+"
+    rf"{_MONTH_WRAP}(?P<month_year_year>\d{{4}}){_MONTH_WRAP}{_MONTH_WRAP_END_GUARD}(?![^\W_]))|"
+    rf"(?P<day_month>{_MONTH_WRAP}(?P<day_month_day>\d{{1,2}}(?:st|nd|rd|th)?)"
+    rf"{_MONTH_WRAP}{_MONTH_WRAP_END_GUARD}\s+"
+    rf"{_MONTH_WRAP}(?P<day_month_month>{_MONTHS}){_MONTH_WRAP}{_MONTH_WRAP_END_GUARD}"
+    rf"(?:,?\s+{_MONTH_WRAP}(?P<day_month_year>\d{{4}}){_MONTH_WRAP}{_MONTH_WRAP_END_GUARD})"
+    rf"?(?![^\W_]))|"
     rf"(?:in|by|before|after|until|on|since)\s+{_MONTH_WRAP}(?P<prep_month>{_MONTHS})"
-    rf"{_MONTH_WRAP}(?![^\W_])(?!,?\s+\d)|"
+    rf"{_MONTH_WRAP}{_MONTH_WRAP_END_GUARD}(?![^\W_])(?!,?\s+{_MONTH_WRAP}\d)|"
     rf"(?:{_MONTHS_STANDALONE})|"
     rf"(?:{_WEEKDAYS})|"
     rf"\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?|"
@@ -377,7 +383,10 @@ def _check_premise_grounding(
     # 2. Date / time expressions (word-boundary matched; no leading preposition captured)
     for m in _DATE_EXPR_RE.finditer(question):
         if m.group("month_day") is not None:
-            raw_expr = f"{m.group('month_day_month')} {m.group('month_day_day')}"
+            month_yr = m.group("month_day_year")
+            raw_expr = f"{m.group('month_day_month')} {m.group('month_day_day')}" + (
+                f", {month_yr}" if month_yr is not None else ""
+            )
         elif m.group("month_year") is not None:
             raw_expr = f"{m.group('month_year_month')} {m.group('month_year_year')}"
         elif m.group("day_month") is not None:

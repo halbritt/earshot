@@ -1124,6 +1124,95 @@ def test_check4_date_wrappers_comma_and_day_month() -> None:
         assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
 
 
+def test_check4_prep_month_no_backtrack_and_wrapped_day_year() -> None:
+    brief = SessionBrief(
+        schema_version=1,
+        session_id="sess-gen",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="me-1", role="reviewer"),
+        objective="Review Q4 rollout.",
+        participants=(Participant(participant_id="spk-1", label="S1", role="owner"),),
+        agenda=("Rollout",),
+        known_facts=(),
+    )
+    state = CanonicalState(brief)
+    state.apply(
+        _seg(
+            "s1",
+            "We provisioned 12 servers for the March 30 rollout and may ship in 2026.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    snap = state.snapshot()
+
+    def _val(question: str, s: Any = snap, seg_ids: list[str] | None = None) -> Any:
+        return validate_generated_candidate(
+            json.dumps(
+                {
+                    "question": question,
+                    "evidence_segment_ids": seg_ids or ["s1"],
+                    "decline_reason": None,
+                }
+            ),
+            finish_reason="stop",
+            category=Category.CONFIRM_TIME,
+            snapshot=s,
+            supplied_segment_ids=seg_ids or ["s1"],
+        )
+
+    for bad_q in [
+        "Should we ship by _may_, 2026?",
+        "Should we ship by _may_ 2026?",
+        "Should we ship in *may*, 2026?",
+        "Should we ship by `may`, 2026?",
+        "Should we ship by _March_, 2026?",
+        "Should we ship by _March_ 12?",
+        "Should we ship on _May_ 12?",
+        "Will we finish by _12_ March?",
+        "Will we finish by March _12_?",
+        "Is may *2026* our target?",
+        "Should we ship by *may* *2026*?",
+    ]:
+        res = _val(bad_q)
+        assert not res.valid and res.failed_check == 4, (
+            f"Expected Check 4 reject for {bad_q!r}, got {res}"
+        )
+
+    grounded_brief = SessionBrief(
+        schema_version=1,
+        session_id="sess-gen",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="me-1", role="reviewer"),
+        objective="Review Q4 plan.",
+        participants=(Participant(participant_id="spk-1", label="S1", role="owner"),),
+        agenda=("Rollout",),
+        known_facts=(KnownFact(key="target", value="May, 2026"),),
+    )
+    grounded_state = CanonicalState(grounded_brief)
+    grounded_state.apply(
+        _seg(
+            "s1",
+            "We plan to finish by 12 March for the Q4 plan and may ship on 12th March, 2026.",
+            start_ms=1000,
+            end_ms=2000,
+            received_ms=2050,
+            seq=1,
+        )
+    )
+    grounded_snap = grounded_state.snapshot()
+    for ok_q in [
+        "Should we ship by _may_, 2026?",
+        "May we review the Q4 plan?",
+        "Will we finish by _12_ March?",
+        "Should we ship by *may* *2026*?",
+    ]:
+        res = _val(ok_q, grounded_snap, ["s1"])
+        assert res.valid is True, f"Expected Check 4 pass for {ok_q!r}, got {res}"
+
+
 def test_check5_do_not_suggest_underscore_bypass_blocked() -> None:
     brief = _make_brief(do_not_suggest=("salary", "secret project", "cat"))
     state = CanonicalState(brief)
