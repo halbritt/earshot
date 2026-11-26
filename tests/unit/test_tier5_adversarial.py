@@ -1728,3 +1728,179 @@ async def test_replay_sim_pinned_card_off_record_start_and_invariant_ledger_tran
     assert bad_inv.checks["inv_4_displayed_has_closing"] is False
     assert any("illegal ledger transition" in v.detail for v in bad_inv.violations)
     bad_db.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_sim_used_ledger_frees_active_and_allows_resolved_and_otr() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        display=replace(base_pol.display, cooldown_ms=1000, display_ttl_ms=60_000),
+    )
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="used-act",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    clf = _FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96)
+    ev1 = _seg_ev(
+        "used-act",
+        "e1",
+        "seg1",
+        "Someone needs to own the deployment checklist.",
+        rx_ms=1000,
+        start_ms=100,
+        end_ms=900,
+        seq=1,
+    )
+    r0 = await async_simulate_replay(brief, [ev1], policy, clf, cache_classifier=False)
+    assert len(r0.displayed_cards) == 1
+    card1 = r0.displayed_cards[0]
+
+    used_ev = LedgerEvent(
+        schema_version=SCHEMA_VERSION,
+        event_id="use-1",
+        suggestion_id=card1.suggestion_id,
+        transition=LedgerState.USED,
+        cause=ReasonCode.USER_ACTION,
+        at_ms=card1.display_ms + 50,
+        evidence_refs=card1.evidence_refs,
+    ).to_canonical_event(brief.session_id, received_ms=card1.display_ms + 50)
+    otr_ev = CanonicalEvent(
+        schema_version=SCHEMA_VERSION,
+        event_id="otr-1",
+        session_id=brief.session_id,
+        kind=EventKind.CONTROL,
+        subtype=ControlSubtype.OFF_RECORD_START,
+        received_ms=card1.display_ms + 100,
+        source_sequence=2,
+        reason="off_record",
+    )
+    resolved_ev = LedgerEvent(
+        schema_version=SCHEMA_VERSION,
+        event_id="res-1",
+        suggestion_id=card1.suggestion_id,
+        transition=LedgerState.RESOLVED,
+        cause=ReasonCode.RESOLUTION_CUE,
+        at_ms=card1.display_ms + 2500,
+        evidence_refs=card1.evidence_refs,
+    ).to_canonical_event(brief.session_id, received_ms=card1.display_ms + 2500)
+
+    for run_id, stream, exp_states, exp_reason in [
+        ("r-used", [ev1, used_ev], ["displayed", "used"], ReasonCode.USER_ACTION.value),
+        ("r-used-otr", [ev1, used_ev, otr_ev], ["displayed", "used"], ReasonCode.USER_ACTION.value),
+        (
+            "r-used-res",
+            [ev1, used_ev, resolved_ev],
+            ["displayed", "used", "resolved"],
+            ReasonCode.RESOLUTION_CUE.value,
+        ),
+    ]:
+        db = SQLiteStore(":memory:")
+        await async_simulate_replay(
+            brief, stream, policy, clf, store=db, run_id=run_id, cache_classifier=False
+        )
+        sugs = db.get_suggestions(brief.session_id, run_id)
+        assert len(sugs) == 1
+        assert sugs[0]["current_state"] == exp_states[-1]
+        assert [t["transition"] for t in json.loads(sugs[0]["transitions_json"])] == exp_states
+        decs = db.get_decisions(brief.session_id, run_id)
+        assert len(decs) == 1
+        assert decs[0]["terminal_state"] == exp_states[-1]
+        assert decs[0]["terminal_reason"] == exp_reason
+        sess = db.get_session(brief.session_id, run_id)
+        assert sess is not None
+        assert json.loads(sess["reducer_counters_json"]).get("invalid_ledger_transition", 0) == 0
+        inv = check_conservation_invariants(db, brief.session_id, run_id)
+        assert inv.passed, inv.violations
+        db.close()
+
+    # Verify self.active is freed on USED so a follow-up card displays before TTL (no CARD_ACTIVE)
+    # and later RESOLVED for card1 still updates card1's decision even while card2 is active.
+    ev2 = _seg_ev(
+        "used-act",
+        "e2",
+        "seg2",
+        "Someone needs to own the rollback runbook.",
+        rx_ms=card1.display_ms + 1500,
+        start_ms=card1.display_ms + 1100,
+        end_ms=card1.display_ms + 1450,
+        seq=2,
+    )
+    db2 = SQLiteStore(":memory:")
+    res2 = await async_simulate_replay(
+        brief,
+        [ev1, used_ev, ev2, resolved_ev],
+        policy,
+        clf,
+        store=db2,
+        run_id="r-used-next",
+        cache_classifier=False,
+    )
+    assert len(res2.displayed_cards) == 2
+    assert res2.displayed_cards[1].display_ms < card1.display_ms + policy.display.display_ttl_ms
+    decs2 = {d["candidate_id"]: d for d in db2.get_decisions(brief.session_id, "r-used-next")}
+    assert decs2[card1.candidate_id]["terminal_state"] == LedgerState.RESOLVED.value
+    assert decs2[card1.candidate_id]["terminal_reason"] == ReasonCode.RESOLUTION_CUE.value
+    inv2 = check_conservation_invariants(db2, brief.session_id, "r-used-next")
+    assert inv2.passed, inv2.violations
+    db2.close()
+
+
+def test_candidate_validator_multi_boolean_attrs_and_spaced_comparisons() -> None:
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="val-bool",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Check x < a or b > c and x < 5 or y > 3",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    st = CanonicalState(brief)
+    st.apply(
+        _seg_ev(
+            "val-bool",
+            "vb1",
+            "seg1",
+            "Compare x < a or b > c, x < 5 or y > 3, and x < a/b > c.",
+            rx_ms=1000,
+        )
+    )
+    snap = st.snapshot()
+
+    for bad_q in [
+        "Should we render <div hidden disabled>?",
+        "Should we use <input readonly disabled>?",
+        "Should we use <input readonly disabled />?",
+    ]:
+        assert _check_generated_safety(bad_q) is not None
+        res = validate_generated_candidate(
+            json.dumps(
+                {"question": bad_q, "evidence_segment_ids": ["seg1"], "decline_reason": None}
+            ),
+            finish_reason="stop",
+            category=Category.CLARIFY_SCOPE,
+            snapshot=snap,
+            supplied_segment_ids=["seg1"],
+        )
+        assert not res.valid, f"Expected rejection for {bad_q!r}"
+        assert res.failed_check == 2
+        assert res.reason_code is ReasonCode.GENERATOR_INVALID_OUTPUT
+
+    for ok_q in [
+        "Is x < a or b > c?",
+        "Is x < 5 or y > 3?",
+        "Is x < a/b > c?",
+    ]:
+        assert _check_generated_safety(ok_q) is None
+        res = validate_generated_candidate(
+            json.dumps(
+                {"question": ok_q, "evidence_segment_ids": ["seg1"], "decline_reason": None}
+            ),
+            finish_reason="stop",
+            category=Category.CLARIFY_SCOPE,
+            snapshot=snap,
+            supplied_segment_ids=["seg1"],
+        )
+        assert res.valid is True, f"Unexpected rejection for {ok_q!r}: {res}"

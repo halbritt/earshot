@@ -762,6 +762,7 @@ class _ReplaySim:
         self.settling: list[_ReplayPendingItem] = []
         self.deferred: _ReplayPendingItem | None = None
         self.active: _ReplayActiveItem | None = None
+        self.used_active_items: dict[str, _ReplayActiveItem] = {}
         self.last_proactive_display_ms: int | None = None
         self.displayed_times: list[int] = []
         self.displayed_cards: list[DisplayedCardEvent] = []
@@ -919,8 +920,9 @@ class _ReplaySim:
                 self.active.pinned = True
             elif is_closing:
                 act = self.active
-                if ev.transition is not LedgerState.USED:
-                    self.active = None
+                self.active = None
+                if ev.transition is LedgerState.USED:
+                    self.used_active_items[ev.suggestion_id] = act
                 self.upsert_decision(
                     context=act.context,
                     terminal_state=str(ev.transition),
@@ -929,6 +931,16 @@ class _ReplaySim:
                     routing=act.routing,
                     serialized_text=act.serialized_text,
                 )
+        elif ev.transition is LedgerState.RESOLVED and ev.suggestion_id in self.used_active_items:
+            used_act = self.used_active_items.pop(ev.suggestion_id)
+            self.upsert_decision(
+                context=used_act.context,
+                terminal_state=str(ev.transition),
+                terminal_reason=ev.cause,
+                classifier=used_act.classifier,
+                routing=used_act.routing,
+                serialized_text=used_act.serialized_text,
+            )
         if (
             self.deferred is not None
             and self.deferred.cand.suggestion_id == ev.suggestion_id

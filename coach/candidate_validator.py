@@ -43,7 +43,7 @@ _BENIGN_DOT_RE = re.compile(
 )
 _HTML_TAG_RE = re.compile(
     r"</[a-zA-Z][a-zA-Z0-9-]*\s*>"
-    r"|<[a-zA-Z][a-zA-Z0-9-]*(?:\s*/\s*>|\s*>|/[^<>]*>|\s+[^<>=]*=[^<>]*>|\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*\s*/?>)"
+    r"|<[a-zA-Z][a-zA-Z0-9-]*(?:\s*/\s*>|\s*>|/[^<>]*>|\s+[^<>=]*=[^<>]*>|(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*)+\s*/?>)"
     r"|<!--[\s\S]*?-->"
 )
 _MARKDOWN_LINK_RE = re.compile(
