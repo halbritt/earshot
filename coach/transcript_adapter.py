@@ -2505,8 +2505,8 @@ class ReplayPlayer:
         clock: ManualClock | None = None,
     ) -> AsyncIterator[CanonicalEvent]:
         """Yield events under recorded, scaled, or stepped timing."""
-        if speed <= 0.0:
-            raise ValueError(f"speed must be > 0, got {speed}")
+        if not math.isfinite(speed) or speed <= 0.0:
+            raise ValueError(f"speed must be a finite value > 0, got {speed}")
         eff_speed = 1.0 if mode is ReplayTimingMode.RECORDED else speed
         prev_rx: int | None = None
 

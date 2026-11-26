@@ -1717,14 +1717,17 @@ class ValidityInterval:
 
     def __post_init__(self) -> None:
         open_ms = _require_int(self.open_ms, "ValidityInterval.open_ms", minimum=0)
+        ideal_int: int | None = None
         if self.ideal_ms is not None:
-            ideal = _require_int(self.ideal_ms, "ValidityInterval.ideal_ms", minimum=0)
-            if ideal < open_ms:
+            ideal_int = _require_int(self.ideal_ms, "ValidityInterval.ideal_ms", minimum=0)
+            if ideal_int < open_ms:
                 raise ContractValidationError("ValidityInterval.ideal_ms < open_ms")
         if self.close_ms is not None:
             close = _require_int(self.close_ms, "ValidityInterval.close_ms", minimum=0)
             if close < open_ms:
                 raise ContractValidationError("ValidityInterval.close_ms < open_ms")
+            if ideal_int is not None and ideal_int > close:
+                raise ContractValidationError("ValidityInterval.ideal_ms > close_ms")
         if self.closed_by is not None:
             _require_enum(ClosedBy, self.closed_by, "ValidityInterval.closed_by")
 

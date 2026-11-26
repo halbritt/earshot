@@ -41,6 +41,18 @@ _BENIGN_DOT_RE = re.compile(
     r"(?:\d+\.\d+|v\d+(?:\.\d+)*|(?<![^\W_])(?:e\.g\.|i\.e\.|U\.S\.))",
     re.I,
 )
+_HTML_TAG_RE = re.compile(r"<\s*/?\s*[a-zA-Z][a-zA-Z0-9-]*(?:\s+[^<>]*)?\s*/?>")
+_MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]+\]\([^)]+\)")
+_PROMPT_INJECTION_RE = re.compile(
+    r"\b(?:"
+    r"ignore\s+(?:all\s+|your\s+|the\s+)?(?:previous|prior|above)\s+instructions"
+    r"|ignore\s+your\s+instructions"
+    r"|disregard\s+(?:all\s+|previous\s+)?instructions"
+    r"|override\s+(?:the\s+)?(?:system|policy)\s+(?:prompt|instructions)"
+    r"|reveal\s+(?:the\s+|your\s+)?system\s+prompt"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _NUMBER_TOKEN_RE = re.compile(
     r"(?<![^\W_])[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?(?![^\W_])"
@@ -334,6 +346,16 @@ def _check_single_question_format(question: str, max_words: int) -> str | None:
     return None
 
 
+def _check_generated_safety(question: str) -> str | None:
+    if _HTML_TAG_RE.search(question):
+        return "Question must not contain HTML tags"
+    if _MARKDOWN_LINK_RE.search(question):
+        return "Question must not contain markdown links"
+    if _PROMPT_INJECTION_RE.search(question):
+        return "Question must not contain prompt-injection phrases"
+    return None
+
+
 def _strip_possessive(tok: str) -> str:
     if tok.endswith("'s") or tok.endswith("’s") or tok.endswith("'S") or tok.endswith("’S"):
         return tok[:-2]
@@ -533,8 +555,10 @@ def validate_generated_candidate(
             parsed=parsed,
         )
 
-    # Check 2: single sentence, ends '?', within word cap
+    # Check 2: single sentence, ends '?', within word cap, no HTML/markdown/injection
     fmt_err = _check_single_question_format(parsed.question, max_words=max_words)
+    if fmt_err is None:
+        fmt_err = _check_generated_safety(parsed.question)
     if fmt_err is not None:
         return ValidationResult(
             valid=False,

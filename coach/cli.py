@@ -946,8 +946,8 @@ def _pace_replay_events(events: Sequence[CanonicalEvent], speed_arg: str | None)
     if speed_arg is None or str(speed_arg).strip().lower() == "stepped":
         return
     speed = float(speed_arg)
-    if speed <= 0.0:
-        raise SystemExit(f"--speed must be > 0 or 'stepped', got {speed_arg!r}")
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise SystemExit(f"--speed must be finite and > 0 or 'stepped', got {speed_arg!r}")
     ordered = sorted(events, key=lambda ev: (ev.received_ms, ev.source_sequence, ev.event_id))
     prev_ms: int | None = None
     for ev in ordered:
@@ -1153,7 +1153,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             ]
             all_inv_passed = all(i.passed for i in invs)
             inv = invs[0]
-            report = build_session_report(store, brief.session_id, run_id)
+            report = build_session_report(store, res.session_id, run_id)
 
             payload = {
                 "session_id": res.session_id,
@@ -1210,16 +1210,25 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                 payload["eval_look_count"] = looks
                 payload["look_count"] = looks
             if t_vals is not None:
-                sweep_res = sweep_t_display(
-                    session_briefs,
-                    labels,
-                    policy,
-                    clf,
-                    t_vals,
-                    calibration=cal_obj,
-                    store=store,
-                    simulated_latency_ms=args.simulated_latency_ms,
-                )
+                if provider is not None:
+                    provider._cancel_recovery_task()
+                sweep_provider = provider.clone_isolated() if provider is not None else None
+                try:
+                    sweep_res = sweep_t_display(
+                        session_briefs,
+                        labels,
+                        policy,
+                        clf,
+                        t_vals,
+                        calibration=cal_obj,
+                        mode=mode,
+                        provider=sweep_provider,
+                        simulated_latency_ms=args.simulated_latency_ms,
+                        cache_classifier=not args.no_cache,
+                    )
+                finally:
+                    if sweep_provider is not None:
+                        sweep_provider._cancel_recovery_task()
                 payload["sweep"] = sweep_res
                 payload["sweep_curve"] = sweep_res
     finally:
@@ -1734,6 +1743,7 @@ def _cmd_annotate(args: argparse.Namespace) -> int:
                                     existing = by_cand[rit.candidate_id]
                                     existing.suggested_question = rit.suggested_question
                                     existing.suggested_category = rit.suggested_category
+                                    existing.sample_source = rit.sample_source
                                     review_queue_ids.append(rit.candidate_id)
                                 else:
                                     items.append(rit)

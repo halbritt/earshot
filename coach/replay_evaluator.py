@@ -1026,10 +1026,22 @@ class _ReplaySim:
         if apply_res.material_change and apply_res.affected_segment_id is not None:
             self.cursor.note_material_segment(apply_res.affected_segment_id)
 
+    def _open_tail_wake_ms(self, anchor: AnchorSpan) -> int:
+        lat_margin = int(self.simulated_latency_ms or 0)
+        if self.latency_distribution_ms:
+            lat_margin = max(lat_margin, int(max(self.latency_distribution_ms)))
+        classify_margin = max(50, lat_margin + 1)
+        latest_eval_ms = anchor.display_by_ms - self.policy.display.settle_ms - classify_margin
+        if latest_eval_ms <= anchor.anchor_received_ms:
+            return anchor.display_by_ms
+        return min(anchor.anchor_received_ms + 2000, latest_eval_ms)
+
     def is_open_tail_anchor(self, anchor: AnchorSpan, snap: StateSnapshot) -> bool:
         if self.next_ev_idx >= len(self.ordered) or snap.off_record:
             return False
         if anchor.display_by_ms <= self.sim_now_ms:
+            return False
+        if self.sim_now_ms >= self._open_tail_wake_ms(anchor):
             return False
         if self.tok.count_tokens(anchor.joined_text) >= DEFAULT_ANCHOR_MAX_TOKENS:
             return False
@@ -1257,6 +1269,8 @@ class _ReplaySim:
 
     def close_pending(self, item: _ReplayPendingItem, reason: ReasonCode, *, at_ms: int) -> None:
         if reason is ReasonCode.GENERIC_REFERENT_UNCLEAR:
+            self.state.unregister_suggestion(item.cand.suggestion_id)
+            self.suggestions_by_id.pop(item.cand.suggestion_id, None)
             if self.store is not None:
                 self.store.record_suggestion(
                     session_id=self.brief.session_id,
@@ -1625,7 +1639,7 @@ class _ReplaySim:
         )
         open_tail_wake_ms: int | None = None
         if anchors and self.is_open_tail_anchor(anchors[-1], eff_snap):
-            open_tail_wake_ms = anchors[-1].display_by_ms
+            open_tail_wake_ms = self._open_tail_wake_ms(anchors[-1])
             anchors = anchors[:-1]
         return (eff_snap, anchors, open_tail_wake_ms)
 
@@ -2833,53 +2847,68 @@ async def async_sweep_t_display(
     calibration: CalibrationModel | CalibrationRegistry | None = None,
     templates: Mapping[str, TemplateSpec] | None = None,
     store: SQLiteStore | None = None,
+    mode: Mode = Mode.PROACTIVE,
+    provider: ProviderAdapter | None = None,
+    health: HealthState | None = None,
     simulated_latency_ms: float | None = None,
     latency_distribution_ms: Sequence[float] | None = None,
+    cache_classifier: bool = True,
 ) -> list[dict[str, Any]]:
-    """Sweep `t_display` through policy-level replay under effective_max_cards_per_10_min (§12.8)."""
+    """Sweep `t_display` through policy-level replay using an isolated store (§12.8)."""
     if not t_display_values:
         raise ValueError("t_display_values must be non-empty")
+    _ = store  # Isolation: sweep runs never pollute caller's persistent DB.
     curve: list[dict[str, Any]] = []
-    for t_disp in sorted(float(v) for v in t_display_values):
-        swept_policy = _policy_with_t_display(policy, t_disp)
-        all_cards: list[DisplayedCardEvent] = []
-        total_dur_ms = 0
-        max_cap_10m = 0
-        for idx, (brief, events) in enumerate(sessions):
-            res = await async_simulate_replay(
-                brief,
-                events,
-                swept_policy,
-                classifier,
-                calibration=calibration,
-                templates=templates,
-                store=store,
-                run_id=f"sweep-{t_disp:.4f}-{idx}",
-                simulated_latency_ms=simulated_latency_ms,
-                latency_distribution_ms=latency_distribution_ms,
-            )
-            all_cards.extend(res.displayed_cards)
-            total_dur_ms += max(600_000, res.duration_ms)
-            max_cap_10m = max(max_cap_10m, effective_max_cards_per_10_min(brief, swept_policy))
+    with SQLiteStore(":memory:") as sweep_store:
+        for t_disp in sorted(float(v) for v in t_display_values):
+            swept_policy = _policy_with_t_display(policy, t_disp)
+            all_cards: list[DisplayedCardEvent] = []
+            total_dur_ms = 0
+            max_cap_10m = 0
+            for idx, (brief, events) in enumerate(sessions):
+                iter_provider = provider.clone_isolated() if provider is not None else None
+                try:
+                    res = await async_simulate_replay(
+                        brief,
+                        events,
+                        swept_policy,
+                        classifier,
+                        calibration=calibration,
+                        templates=templates,
+                        store=sweep_store if cache_classifier else None,
+                        run_id=f"sweep-{t_disp:.4f}-{idx}",
+                        mode=mode,
+                        provider=iter_provider,
+                        health=health,
+                        simulated_latency_ms=simulated_latency_ms,
+                        latency_distribution_ms=latency_distribution_ms,
+                        cache_classifier=cache_classifier,
+                    )
+                finally:
+                    if iter_provider is not None:
+                        await iter_provider.cancel_recovery()
+                all_cards.extend(res.displayed_cards)
+                total_dur_ms += max(600_000, res.duration_ms)
+                max_cap_10m = max(max_cap_10m, effective_max_cards_per_10_min(brief, swept_policy))
 
-        summary = match_opportunities(
-            all_cards,
-            labels,
-            settle_ms=swept_policy.display.settle_ms,
-            duration_ms=total_dur_ms if sessions else None,
-        )
-        curve.append(
-            {
-                "t_display": t_disp,
-                "useful_count": summary["useful_count"],
-                "distracting_count": summary["distracting_count"],
-                "displayed_count": summary["displayed_count"],
-                "useful_per_10_min": summary["useful_per_10_min"],
-                "distracting_per_10_min": summary["distracting_per_10_min"],
-                "cards_per_10_min": summary["cards_per_10_min"],
-                "effective_max_cards_per_10_min": max_cap_10m,
-            }
-        )
+            summary = match_opportunities(
+                all_cards,
+                labels,
+                settle_ms=swept_policy.display.settle_ms,
+                duration_ms=total_dur_ms if sessions else None,
+            )
+            curve.append(
+                {
+                    "t_display": t_disp,
+                    "useful_count": summary["useful_count"],
+                    "distracting_count": summary["distracting_count"],
+                    "displayed_count": summary["displayed_count"],
+                    "useful_per_10_min": summary["useful_per_10_min"],
+                    "distracting_per_10_min": summary["distracting_per_10_min"],
+                    "cards_per_10_min": summary["cards_per_10_min"],
+                    "effective_max_cards_per_10_min": max_cap_10m,
+                }
+            )
     return curve
 
 

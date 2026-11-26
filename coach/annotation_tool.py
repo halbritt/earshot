@@ -73,17 +73,7 @@ def load_labels_jsonl(path: str | Path) -> list[LabelRecord]:
             obj = json.loads(stripped)
             if not isinstance(obj, Mapping):
                 raise AnnotationValidationError(f"Line {line_no} in {src} must be a JSON object")
-            row_obj = dict(obj)
-            val = row_obj.get("validity")
-            if isinstance(val, Mapping) and val.get("ideal_ms") is not None:
-                try:
-                    if int(val["ideal_ms"]) < int(val["open_ms"]):
-                        val_copy = dict(val)
-                        val_copy["ideal_ms"] = None
-                        row_obj["validity"] = val_copy
-                except KeyError, TypeError, ValueError:
-                    pass
-            labels.append(LabelRecord.from_dict(row_obj))
+            labels.append(LabelRecord.from_dict(obj))
     return labels
 
 
@@ -740,7 +730,6 @@ class Pass2Session:
                     example_questions=step1_payload.get("example_questions") or (),
                     none_reason=step1_payload.get("none_reason"),
                     confidence=str(step1_payload.get("confidence", "sure")),
-                    sample_source=step1_payload.get("sample_source"),
                 )
             if item.worthwhile is None:
                 raise AnnotationValidationError(
@@ -1415,7 +1404,6 @@ class AnnotationServer:
                                 example_questions=body.get("example_questions") or (),
                                 none_reason=body.get("none_reason"),
                                 confidence=str(body.get("confidence", "sure")),
-                                sample_source=body.get("sample_source"),
                             )
                             self._send_json(HTTPStatus.OK, view)
                         elif rest.endswith("/step2/unlock"):

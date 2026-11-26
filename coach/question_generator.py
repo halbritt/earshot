@@ -338,9 +338,14 @@ async def generate_question(
     )
     prompt_sha256 = blocks.full_sha256()
     model_version = f"{provider.config.provider}:{provider.config.model_id}"
+    allow_text_cache = store is not None and snapshot.brief.retention.store_transcript
 
-    if store is not None and breaker_state is not BreakerState.HALF_OPEN:
-        cached = store.get_cached_model_output(prompt_sha256, model_version)
+    if allow_text_cache and store is not None and breaker_state is not BreakerState.HALF_OPEN:
+        cached = store.get_cached_model_output(
+            prompt_sha256,
+            model_version,
+            session_id=snapshot.session_id,
+        )
         if cached is not None and isinstance(cached.get("text"), str):
             cache_egress_id = f"eg-cache-{uuid.uuid4().hex[:16]}"
             if provider.egress_sink is not None:
@@ -455,7 +460,7 @@ async def generate_question(
             candidate=None, terminal_reason=ReasonCode.GENERATOR_TIMEOUT, fallback_used=False
         )
 
-    if store is not None:
+    if allow_text_cache and store is not None:
         store.put_cached_model_output(
             serialized_sha256=prompt_sha256,
             model_version=model_version,
@@ -466,6 +471,7 @@ async def generate_question(
             },
             contains_text=True,
             created_ms=resp.complete_ms,
+            session_id=snapshot.session_id,
         )
 
     val = validate_generated_candidate(

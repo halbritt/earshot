@@ -358,6 +358,8 @@ class SuggestionController:
         self._speaker_boundary_end_ms: dict[str, int] = {}
         self._speaker_boundary_rx_ms: dict[str, int] = {}
         self._prev_anchor_norm_text: str | None = None
+        self._prev_anchor_seg_revs: dict[str, int] = {}
+        self._prev_anchor_rx_ms: int | None = None
         self._consecutive_clf_errors = 0
         self._gen_latencies_ms: deque[int] = deque(maxlen=64)
         self._gen_p95_ms: int | None = None
@@ -1019,17 +1021,31 @@ class SuggestionController:
             selected = live_anchors[-max_per_job:]
 
             batch_prev_norm = self._prev_anchor_norm_text
-            norm_by_cand: dict[str, str] = {}
+            batch_prev_seg_ids = set(self._prev_anchor_seg_revs)
+            batch_prev_rx_ms = self._prev_anchor_rx_ms
+            norm_by_cand: dict[str, tuple[str, dict[str, int], int]] = {}
             surviving: list[ContextBuildResult] = []
             for anchor in selected:
+                seg_ids = {s.segment_id for s in anchor.segments}
+                seg_revs = {s.segment_id: s.revision for s in anchor.segments}
+                same_seg_rev = bool(seg_ids & batch_prev_seg_ids)
+                gap_exceeded = (
+                    batch_prev_rx_ms is not None
+                    and (anchor.anchor_received_ms - batch_prev_rx_ms) > 30_000
+                )
+                eff_prev = None if (same_seg_rev or gap_exceeded) else batch_prev_norm
                 pf = run_prefilter(
                     anchor,
                     state_version=snap.state_version,
-                    previous_anchor_norm_text=batch_prev_norm,
+                    previous_anchor_norm_text=eff_prev,
                 )
                 batch_prev_norm = pf.normalized_text
+                batch_prev_seg_ids = seg_ids
+                batch_prev_rx_ms = anchor.anchor_received_ms
                 if not pf.passed and pf.drop_record is not None:
                     self._prev_anchor_norm_text = pf.normalized_text
+                    self._prev_anchor_seg_revs = seg_revs
+                    self._prev_anchor_rx_ms = anchor.anchor_received_ms
                     drop = pf.drop_record
                     dummy_ctx = DecisionContext(
                         schema_version=SCHEMA_VERSION,
@@ -1066,7 +1082,11 @@ class SuggestionController:
                         suggestion_catalog=self._suggestions_by_id,
                     )
                     if built.context is not None:
-                        norm_by_cand[built.context.candidate_id] = pf.normalized_text
+                        norm_by_cand[built.context.candidate_id] = (
+                            pf.normalized_text,
+                            seg_revs,
+                            anchor.anchor_received_ms,
+                        )
                     surviving.append(built)
 
         if not surviving:
@@ -1159,10 +1179,16 @@ class SuggestionController:
                         )
                         self._cursor.mark_covered(built.anchor.segments)
                         if ctx.candidate_id in norm_by_cand:
-                            self._prev_anchor_norm_text = norm_by_cand[ctx.candidate_id]
+                            p_norm, p_revs, p_rx = norm_by_cand[ctx.candidate_id]
+                            self._prev_anchor_norm_text = p_norm
+                            self._prev_anchor_seg_revs = p_revs
+                            self._prev_anchor_rx_ms = p_rx
                         continue
                 if ctx.candidate_id in norm_by_cand:
-                    self._prev_anchor_norm_text = norm_by_cand[ctx.candidate_id]
+                    p_norm, p_revs, p_rx = norm_by_cand[ctx.candidate_id]
+                    self._prev_anchor_norm_text = p_norm
+                    self._prev_anchor_seg_revs = p_revs
+                    self._prev_anchor_rx_ms = p_rx
                 eff_health = (
                     HealthState.OK if (probe_ready and not probe_reserved) else self._health
                 )
@@ -1387,6 +1413,13 @@ class SuggestionController:
         if cand is None:
             t_reason = fail_reason or ReasonCode.SLOT_UNAVAILABLE
             t_state = "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
+            if t_state == "suppressed":
+                eff_routing = replace(
+                    eff_routing,
+                    outcome=Outcome.SUPPRESS,
+                    route=None,
+                    reason_codes=(t_reason,),
+                )
             self._enqueue_recorder(
                 "decision",
                 context=ctx,
@@ -1699,7 +1732,7 @@ class SuggestionController:
             finally:
                 self._manual_queue.task_done()
 
-    async def trigger_manual(self) -> ManualResult:
+    def _manual_unavailable_reason(self) -> ManualResult | None:
         if self._mode in {Mode.SHADOW, Mode.PAUSED, Mode.OFF_THE_RECORD}:
             return ManualResult(
                 status="unavailable",
@@ -1710,6 +1743,14 @@ class SuggestionController:
                 status="unavailable",
                 message="Manual requests unavailable while no_transcript.",
             )
+        return None
+
+    async def trigger_manual(self) -> ManualResult:
+        unavail = self._manual_unavailable_reason()
+        if unavail is not None:
+            self._manual_status = {"status": "unavailable", "message": unavail.message}
+            self._schedule_ui_broadcast()
+            return unavail
         if self._manual_in_flight:
             self._manual_ignored_count += 1
             self._emit_tel(
@@ -1898,6 +1939,8 @@ class SuggestionController:
         valid_built_pairs = list(built_pairs)
         brief_invalidated = False
         rejected_cand_ids: set[str] = set()
+        recorded_manual_decision = False
+        non_routed_manual: list[tuple[ContextBuildResult, ClassifierResult, RoutingDecision]] = []
 
         if built_pairs and self._health is not HealthState.MANUAL_ONLY:
             c_inputs = [ClassifierInput.from_build_result(b) for b, _ in built_pairs]
@@ -1988,6 +2031,8 @@ class SuggestionController:
                             )
                         )
                         scored_cands.append((s_val, built, clf_res, routing, a_txt))
+                    else:
+                        non_routed_manual.append((built, clf_res, routing))
                 valid_built_pairs = fresh_valid_pairs
                 scored_cands.sort(key=lambda x: x[0], reverse=True)
 
@@ -1996,7 +2041,7 @@ class SuggestionController:
                 assert built.context is not None and built.serialized_text is not None
                 assert routing.category is not None
                 if routing.route is Route.GENERATOR:
-                    if self._provider is None:
+                    if self._provider is None or not self._policy.generator.enabled:
                         async with self._state_lock:
                             if (
                                 self._mode in {Mode.SHADOW, Mode.PAUSED, Mode.OFF_THE_RECORD}
@@ -2033,7 +2078,7 @@ class SuggestionController:
                                 if self._clock.now_ms() >= deadline_ms:
                                     break
                                 continue
-                            cand, eff_rt, _ = self._render_fallback_sync(
+                            cand, eff_rt, fail_r = self._render_fallback_sync(
                                 built.context, routing, fresh_snap
                             )
                             if cand is not None:
@@ -2047,10 +2092,16 @@ class SuggestionController:
                                         terminal_state="suppressed",
                                         terminal_reason=ReasonCode.DO_NOT_SUGGEST,
                                         classifier=clf_res,
-                                        routing=eff_rt,
+                                        routing=replace(
+                                            eff_rt,
+                                            outcome=Outcome.SUPPRESS,
+                                            route=None,
+                                            reason_codes=(ReasonCode.DO_NOT_SUGGEST,),
+                                        ),
                                         serialized_text=built.serialized_text,
                                         retention=fresh_snap.brief.retention,
                                     )
+                                    recorded_manual_decision = True
                                     rejected_cand_ids.add(built.context.candidate_id)
                                     continue
                                 cand = replace(
@@ -2065,6 +2116,33 @@ class SuggestionController:
                                     a_txt,
                                     brief_snapshot=fresh_snap.brief,
                                 )
+                            t_reason = fail_r or ReasonCode.INSUFFICIENT_BUDGET
+                            t_state = (
+                                "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
+                            )
+                            rec_rt = (
+                                replace(
+                                    eff_rt,
+                                    outcome=Outcome.SUPPRESS,
+                                    route=None,
+                                    reason_codes=(t_reason,),
+                                )
+                                if t_state == "suppressed"
+                                else _downgrade_unexecuted_generator_routing(
+                                    eff_rt, terminal_reason=t_reason
+                                )
+                            )
+                            self._enqueue_recorder(
+                                "decision",
+                                context=built.context,
+                                terminal_state=t_state,
+                                terminal_reason=t_reason,
+                                classifier=clf_res,
+                                routing=rec_rt,
+                                serialized_text=built.serialized_text,
+                                retention=fresh_snap.brief.retention,
+                            )
+                            recorded_manual_decision = True
                         continue
                     async with self._state_lock:
                         if (
@@ -2236,7 +2314,7 @@ class SuggestionController:
                             if self._clock.now_ms() >= deadline_ms:
                                 break
                             continue
-                        cand, eff_rt, _ = self._render_template_sync(
+                        cand, eff_rt, fail_r = self._render_template_sync(
                             built.context, routing, fresh_snap
                         )
                         if cand is not None:
@@ -2250,6 +2328,31 @@ class SuggestionController:
                                 a_txt,
                                 brief_snapshot=fresh_snap.brief,
                             )
+                        t_reason = fail_r or ReasonCode.SLOT_UNAVAILABLE
+                        t_state = (
+                            "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
+                        )
+                        rec_rt = (
+                            replace(
+                                eff_rt,
+                                outcome=Outcome.SUPPRESS,
+                                route=None,
+                                reason_codes=(t_reason,),
+                            )
+                            if t_state == "suppressed"
+                            else eff_rt
+                        )
+                        self._enqueue_recorder(
+                            "decision",
+                            context=built.context,
+                            terminal_state=t_state,
+                            terminal_reason=t_reason,
+                            classifier=clf_res,
+                            routing=rec_rt,
+                            serialized_text=built.serialized_text,
+                            retention=fresh_snap.brief.retention,
+                        )
+                        recorded_manual_decision = True
 
         # Fallback to direct generator call on manual lane if enabled (§3.7, §8.6 manual_only)
         fb_candidate: tuple[ContextBuildResult, str] | None = None
@@ -2419,6 +2522,28 @@ class SuggestionController:
                     brief_snapshot=fresh_snap.brief,
                 )
 
+        if not recorded_manual_decision and non_routed_manual:
+            b0, clf0, rt0 = non_routed_manual[0]
+            assert b0.context is not None and b0.serialized_text is not None
+            state_map = {
+                Outcome.NONE: "no_opportunity",
+                Outcome.ABSTAIN: "abstained",
+                Outcome.SUPPRESS: "suppressed",
+            }
+            t_state = state_map.get(rt0.outcome, "abstained")
+            t_reason = rt0.reason_codes[0] if rt0.reason_codes else ReasonCode.BELOW_T_LOW
+            async with self._state_lock:
+                self._enqueue_recorder(
+                    "decision",
+                    context=b0.context,
+                    terminal_state=t_state,
+                    terminal_reason=t_reason,
+                    classifier=clf0,
+                    routing=rt0,
+                    serialized_text=b0.serialized_text,
+                    retention=self._state.snapshot().brief.retention,
+                )
+
         return self._manual_empty_result(fb_empty_reason)
 
     @staticmethod
@@ -2467,16 +2592,6 @@ class SuggestionController:
         )
         self._state.apply(disp_ev.to_canonical_event(snap.session_id, received_ms=now_ms))
         self._enqueue_recorder("ledger_event", event=disp_ev)
-        self._enqueue_recorder(
-            "decision",
-            context=ctx,
-            terminal_state="expired",
-            terminal_reason=ReasonCode.DISPLAY_TTL_PASSED,
-            classifier=clf_res,
-            routing=routing,
-            serialized_text=serialized_text,
-            retention=snap.brief.retention,
-        )
         self._ledger_texts[cand.suggestion_id] = cand.text
         self._ledger_categories[cand.suggestion_id] = cand.category
         if anchor_text:
@@ -2528,6 +2643,12 @@ class SuggestionController:
         act = str(action.get("action") or "").strip().lower()
         now_ms = self._clock.now_ms()
         if act == "manual":
+            unavail = self._manual_unavailable_reason()
+            if unavail is not None:
+                self._manual_status = {"status": "unavailable", "message": unavail.message}
+                self._schedule_ui_broadcast()
+                await self._flush_ui_broadcast()
+                return None
             if self._started and not self._stopping:
                 if self._manual_in_flight:
                     await self.trigger_manual()
@@ -3160,6 +3281,8 @@ class SuggestionController:
         at_ms: int,
     ) -> None:
         if reason is ReasonCode.GENERIC_REFERENT_UNCLEAR:
+            self._state.unregister_suggestion(item.cand.suggestion_id)
+            self._suggestions_by_id.pop(item.cand.suggestion_id, None)
             self._enqueue_recorder(
                 "suggestion",
                 suggestion=item.cand,

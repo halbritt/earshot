@@ -358,7 +358,10 @@ def build_openai_payload(
     if caps.supports_prefix_cache_marker:
         payload["prompt_cache_key"] = blocks.cache_prefix_sha256()[:32]
     if config.reasoning_setting is not None:
-        if config.model_id.startswith("qwen3") and config.reasoning_setting in {"none", "off"}:
+        if "qwen3" in config.model_id.lower() and config.reasoning_setting.strip().lower() in {
+            "none",
+            "off",
+        }:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
             payload["reasoning_effort"] = config.reasoning_setting

@@ -169,6 +169,13 @@ CREATE TABLE IF NOT EXISTS model_cache (
     PRIMARY KEY (serialized_sha256, model_version)
 );
 
+CREATE TABLE IF NOT EXISTS model_cache_sessions (
+    serialized_sha256 TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (serialized_sha256, model_version, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS egress_log (
     egress_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
@@ -725,7 +732,11 @@ class SQLiteStore:
         return [dict(r) for r in rows]
 
     def get_cached_model_output(
-        self, serialized_sha256: str, model_version: str
+        self,
+        serialized_sha256: str,
+        model_version: str,
+        *,
+        session_id: str | None = None,
     ) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT output_json FROM model_cache WHERE serialized_sha256 = ? AND model_version = ?",
@@ -733,6 +744,16 @@ class SQLiteStore:
         ).fetchone()
         if row is None:
             return None
+        if session_id is not None:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO model_cache_sessions (
+                        serialized_sha256, model_version, session_id
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (serialized_sha256, model_version, session_id),
+                )
         loaded = json.loads(row["output_json"])
         if not isinstance(loaded, dict):
             return {"value": loaded}
@@ -746,6 +767,7 @@ class SQLiteStore:
         output: Mapping[str, Any],
         contains_text: bool = False,
         created_ms: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         ts = int(time.monotonic() * 1000) if created_ms is None else created_ms
         with self._conn:
@@ -767,6 +789,15 @@ class SQLiteStore:
                     ts,
                 ),
             )
+            if session_id is not None:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO model_cache_sessions (
+                        serialized_sha256, model_version, session_id
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (serialized_sha256, model_version, session_id),
+                )
 
     def record_egress(self, *, run_id: str, record: EgressRecord) -> None:
         usage_payload = dict(record.usage)
@@ -948,12 +979,32 @@ class SQLiteStore:
                       serialized_sha256 IN (
                           SELECT serialized_sha256 FROM decisions WHERE session_id = ?
                       )
-                      OR NOT EXISTS (
+                      OR EXISTS (
                           SELECT 1
-                          FROM decisions d
-                          JOIN sessions s ON d.session_id = s.session_id AND d.run_id = s.run_id
-                          WHERE d.serialized_sha256 = model_cache.serialized_sha256
-                            AND s.deleted_at_ms IS NULL
+                          FROM model_cache_sessions mcs
+                          WHERE mcs.serialized_sha256 = model_cache.serialized_sha256
+                            AND mcs.model_version = model_cache.model_version
+                            AND mcs.session_id = ?
+                      )
+                      OR (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM decisions d
+                              JOIN sessions s ON d.session_id = s.session_id AND d.run_id = s.run_id
+                              WHERE d.serialized_sha256 = model_cache.serialized_sha256
+                                AND s.deleted_at_ms IS NULL
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM model_cache_sessions mcs
+                              WHERE mcs.serialized_sha256 = model_cache.serialized_sha256
+                                AND mcs.model_version = model_cache.model_version
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM sessions s
+                                    WHERE s.session_id = mcs.session_id
+                                      AND s.deleted_at_ms IS NOT NULL
+                                )
+                          )
                       )
                   )
                   AND serialized_sha256 NOT IN (
@@ -962,8 +1013,24 @@ class SQLiteStore:
                       JOIN sessions s ON d.session_id = s.session_id AND d.run_id = s.run_id
                       WHERE d.session_id != ? AND s.deleted_at_ms IS NULL
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM model_cache_sessions mcs
+                      WHERE mcs.serialized_sha256 = model_cache.serialized_sha256
+                        AND mcs.model_version = model_cache.model_version
+                        AND mcs.session_id != ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM sessions s
+                            WHERE s.session_id = mcs.session_id
+                              AND s.deleted_at_ms IS NOT NULL
+                        )
+                  )
                 """,
-                (session_id, session_id),
+                (session_id, session_id, session_id, session_id),
+            )
+            self._conn.execute(
+                "DELETE FROM model_cache_sessions WHERE session_id = ?",
+                (session_id,),
             )
             tel_rows = self._conn.execute(
                 "SELECT run_id, record_id, payload_json FROM telemetry_records WHERE session_id = ?",

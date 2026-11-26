@@ -272,6 +272,11 @@ class CanonicalState:
             (ref.segment_id for ref in candidate.evidence_refs),
         )
 
+    def unregister_suggestion(self, suggestion_id: str) -> None:
+        """Remove an unrendered suggestion that never transitioned in the ledger."""
+        self._ledger.pop(suggestion_id, None)
+        self.unregister_dependent("suggestion", suggestion_id)
+
     def snapshot(self) -> StateSnapshot:
         ordered = tuple(
             sorted(

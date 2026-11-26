@@ -836,7 +836,7 @@ def test_area_e_validity_interval_matcher_and_unlabeled_review_queue(
             categories=("CONFIRM_OWNER",),
             evidence_refs=({"segment_id": "seg-em-4", "revision": 1},),
             open_ms=10100,
-            ideal_ms=10300,
+            ideal_ms=10120,
             close_ms=10150,
             closed_by="answered",
         ),
@@ -990,6 +990,7 @@ def test_area_e_paired_conversation_bootstrap_and_low_n_flagging(
                 categories=("CONFIRM_OWNER",),
                 evidence_refs=({"segment_id": f"seg-b-{c_idx}-1", "revision": 1},),
                 open_ms=2600 + c_idx * 20000,
+                ideal_ms=None,
                 close_ms=12000 + c_idx * 20000,
                 closed_by="answered",
             )
@@ -1018,6 +1019,7 @@ def test_area_e_paired_conversation_bootstrap_and_low_n_flagging(
                     categories=("SUCCESS_CRITERION",),
                     evidence_refs=({"segment_id": f"seg-b-{c_idx}-2", "revision": 1},),
                     open_ms=7600 + c_idx * 20000,
+                    ideal_ms=None,
                     close_ms=17000 + c_idx * 20000,
                     closed_by="answered",
                 )
