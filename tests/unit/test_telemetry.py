@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from coach.calibration import default_calibration_metadata
+from coach.canonical_state import CanonicalState
 from coach.cli import _try_load_dataset_rows, main
+from coach.context_builder import build_decision_contexts
 from coach.contracts import (
     CanonicalEvent,
     Category,
@@ -884,3 +889,126 @@ def test_try_load_dataset_rows_and_cli_replay_peecee_pretty_json(
     out = json.loads(capsys.readouterr().out)
     assert out["decisions_count"] >= 1
     assert out["invariants"]["passed"] is True
+
+
+def test_cli_replay_subprocess_nested_context_jsonl_and_pretty_json(tmp_path: Path) -> None:
+    from coach.contracts import Participant
+    from coach.routing_policy import load_policy
+
+    repo_root = Path(__file__).resolve().parents[2]
+    policy_path = repo_root / "policies" / "policy-v0-a.yaml"
+    policy = load_policy(policy_path, calibration_metadata=default_calibration_metadata())
+    sid = "s-nested-2party"
+    brief = SessionBrief(
+        schema_version=1,
+        session_id=sid,
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="ME", role="reviewer"),
+        objective="Confirm rollback owner.",
+        participants=(
+            Participant(participant_id="S1", label="S1", role="eng"),
+            Participant(participant_id="S2", label="S2", role="ops"),
+        ),
+    )
+    state = CanonicalState(brief)
+    for seg_id, spk, ch, start_ms, seq, txt in (
+        ("me1", "ME", 0, 100, 1, "Let us confirm rollback readiness."),
+        ("s_short", "S1", 1, 300, 2, "Okay."),
+        ("s_ctx", "S2", 1, 500, 3, "Staging checks passed."),
+        ("s_anchor", "S1", 1, 700, 4, "Someone should own the rollback plan."),
+    ):
+        state.apply(
+            CanonicalEvent(
+                schema_version=1,
+                session_id=sid,
+                event_id=f"ev-{seg_id}",
+                kind=EventKind.SEGMENT,
+                segment_id=seg_id,
+                source_revision=1,
+                channel=ch,
+                speaker_id=spk,
+                start_ms=start_ms,
+                end_ms=start_ms + 90,
+                received_ms=start_ms + 100,
+                text=txt,
+                stability=Stability.COMMITTED,
+                source_sequence=seq,
+                boundary="utterance_end",
+            )
+        )
+    built = [
+        b
+        for b in build_decision_contexts(state.snapshot(), policy=policy)
+        if not b.dropped and b.context is not None and b.serialized_text is not None
+    ]
+    assert len(built) == 1
+    ctx = built[0].context
+    assert ctx is not None
+    assert {"me1", "s_short", "s_ctx"}.issubset({r.segment_id for r in ctx.context_refs})
+    nested_row = {
+        "context": ctx.to_dict(),
+        "serialized_text": built[0].serialized_text,
+    }
+    brief_path = tmp_path / "brief.json"
+    brief_path.write_text(json.dumps(brief.to_dict(), indent=2), encoding="utf-8")
+
+    for fmt, split_by, filename, payload_text in (
+        ("jsonl", "conversation", "nested.jsonl", json.dumps(nested_row) + "\n"),
+        ("json", "series", "nested.json", json.dumps([nested_row], indent=2)),
+    ):
+        ds_path = tmp_path / filename
+        ds_path.write_text(payload_text, encoding="utf-8")
+        db_path = tmp_path / f"nested_{fmt}.db"
+        run_id = f"r-nested-{fmt}"
+        rep_proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "coach.cli",
+                "replay",
+                "--session",
+                str(ds_path),
+                "--brief",
+                str(brief_path),
+                "--policy",
+                str(policy_path),
+                "--db",
+                str(db_path),
+                "--run-id",
+                run_id,
+                "--split-by",
+                split_by,
+                "--json",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert rep_proc.returncode == 0, rep_proc.stderr
+        rep_out = json.loads(rep_proc.stdout)
+        assert rep_out["decisions_count"] == 1
+        assert len(rep_out["displayed_cards"]) == 1
+
+        rpt_proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "coach.cli",
+                "report",
+                "--db",
+                str(db_path),
+                "--session",
+                sid,
+                "--run-id",
+                run_id,
+                "--json",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert rpt_proc.returncode == 0, rpt_proc.stderr
+        rpt_out = json.loads(rpt_proc.stdout)
+        assert rpt_out["invariants"]["passed"] is True

@@ -230,7 +230,7 @@ class DatasetSplits[T]:
         }
 
 
-def _get_field(item: Any, *names: str) -> str | None:
+def _get_direct_field(item: Any, *names: str) -> str | None:
     if isinstance(item, Mapping):
         for n in names:
             v = item.get(n)
@@ -241,6 +241,16 @@ def _get_field(item: Any, *names: str) -> str | None:
             v = getattr(item, n, None)
             if v is not None and str(v):
                 return str(v)
+    return None
+
+
+def _get_field(item: Any, *names: str) -> str | None:
+    direct = _get_direct_field(item, *names)
+    if direct is not None:
+        return direct
+    ctx = item.get("context") if isinstance(item, Mapping) else getattr(item, "context", None)
+    if ctx is not None:
+        return _get_direct_field(ctx, *names)
     return None
 
 

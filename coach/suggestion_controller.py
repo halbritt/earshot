@@ -599,8 +599,12 @@ class SuggestionController:
     async def _flush_ui_broadcast(self) -> None:
         while self._ui_broadcast_task is not None and not self._ui_broadcast_task.done():
             task = self._ui_broadcast_task
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cur = asyncio.current_task()
+                if not task.cancelled() or (cur is not None and cur.cancelling() > 0):
+                    raise
 
     def set_recipient_speaking(self, speaking: bool) -> None:
         self._recipient_speaking = speaking

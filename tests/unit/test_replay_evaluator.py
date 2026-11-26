@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import httpx
+import pytest
 
 from coach.calibration import default_calibration_metadata
 from coach.canonical_state import CanonicalState
@@ -972,3 +973,73 @@ def test_simulate_dataset_replay_2party_context_refs_preserves_invariants_and_gr
             assert sess_brk is not None
             tl = json.loads(sess_brk["health_timeline_json"])
             assert [e["state"] for e in tl] == ["ok", "template_only"]
+
+
+def test_splitters_support_nested_context_rows_and_objects() -> None:
+    policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    nested_dict_rows: list[dict[str, object]] = []
+    ctx_results = []
+    clf_inputs = []
+    for i in range(6):
+        sid = f"conv-nested-{i}"
+        state = CanonicalState(_brief(sid))
+        state.apply(
+            _seg(
+                f"s-{i}",
+                "Someone should own the rollback plan.",
+                session_id=sid,
+                speaker_id="spk-1",
+                start_ms=100,
+                end_ms=900,
+                received_ms=950,
+                seq=1,
+                boundary="utterance_end",
+            )
+        )
+        built = [
+            b for b in build_decision_contexts(state.snapshot(), policy=policy) if not b.dropped
+        ]
+        assert len(built) == 1
+        res = built[0]
+        assert res.context is not None and res.serialized_text is not None
+        ctx_results.append(res)
+        clf_inputs.append(ClassifierInput.from_build_result(res))
+        ctx_map = res.context.to_dict()
+        row_dict: dict[str, object] = {
+            "context": ctx_map,
+            "serialized_text": res.serialized_text,
+        }
+        if i % 2 == 0:
+            row_dict["series_id"] = f"ser-{i % 2}"
+        else:
+            ctx_map["series_id"] = f"ser-{i % 2}"
+        nested_dict_rows.append(row_dict)
+
+    conv_s = split_by_conversation(nested_dict_rows, seed=3)
+    assert sum(conv_s.to_dict()["counts"].values()) == 6
+    assert (
+        len(
+            set(conv_s.train_conversations)
+            | set(conv_s.cal_conversations)
+            | set(conv_s.eval_conversations)
+        )
+        == 6
+    )
+    assert not (set(conv_s.train_conversations) & set(conv_s.eval_conversations))
+
+    ser_s = split_by_series(nested_dict_rows, seed=3)
+    assert set(ser_s.train_series) | set(ser_s.cal_series) | set(ser_s.eval_series) == {
+        "ser-0",
+        "ser-1",
+    }
+    assert not (set(ser_s.train_series) & set(ser_s.eval_series))
+
+    res_s = split_by_conversation(ctx_results, seed=5)
+    assert sum(res_s.to_dict()["counts"].values()) == 6
+    cin_s = split_by_series(clf_inputs, seed=5)
+    assert sum(cin_s.to_dict()["counts"].values()) == 6
+
+    with pytest.raises(ValueError, match="session_id/conversation_id"):
+        split_by_conversation([{"context": {"candidate_id": "c1"}, "serialized_text": "x"}])
+    with pytest.raises(ValueError, match="session_id/conversation_id"):
+        split_by_conversation([{"context": None, "serialized_text": "x"}])

@@ -1512,3 +1512,61 @@ async def test_next_display_wake_ms_and_live_retirement_in_no_transcript(tmp_pat
             live_release.set()
             await ctrl2.stop()
         assert check_conservation_invariants(store2, "sess-no-tx-live", "run-no-tx-live").passed
+
+
+async def test_flush_ui_broadcast_cancellation_distinguishes_external_and_stop(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(POLICY_PATH)
+    clock = ManualClock(100)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    sent_states: list[dict[str, Any]] = []
+
+    class _SlowUI:
+        def set_action_handler(self, _handler: Any) -> None:
+            pass
+
+        async def broadcast_state(self, state: Any) -> None:
+            entered.set()
+            await release.wait()
+            sent_states.append(state.to_dict() if hasattr(state, "to_dict") else dict(state))
+
+        def update_state(self, state: Any) -> None:
+            sent_states.append(state.to_dict() if hasattr(state, "to_dict") else dict(state))
+
+    with SQLiteStore(tmp_path / "flush_cancel.db") as store:
+        ctrl = SuggestionController(
+            brief=_brief("sess-flush"),
+            policy=policy,
+            classifier=create_classifier("rules_v0"),
+            clock=clock,
+            store=store,
+            run_id="run-flush",
+            ui_server=_SlowUI(),  # type: ignore[arg-type]
+        )
+        ctrl._schedule_ui_broadcast()
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+        ext_flusher = asyncio.create_task(ctrl._flush_ui_broadcast())
+        await asyncio.sleep(0)
+        ext_flusher.cancel()
+        try:
+            await ext_flusher
+            raise AssertionError("Expected external caller cancellation to propagate")
+        except asyncio.CancelledError:
+            pass
+        assert ctrl._ui_broadcast_task is not None and not ctrl._ui_broadcast_task.done()
+        release.set()
+        await ctrl._flush_ui_broadcast()
+        assert len(sent_states) == 1
+
+        # stop() cancelling _ui_broadcast_task does not raise CancelledError in flusher
+        entered.clear()
+        release.clear()
+        ctrl._schedule_ui_broadcast()
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        stop_flusher = asyncio.create_task(ctrl._flush_ui_broadcast())
+        await asyncio.sleep(0)
+        await ctrl.stop()
+        await asyncio.wait_for(stop_flusher, timeout=2.0)
