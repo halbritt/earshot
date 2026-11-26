@@ -1,0 +1,416 @@
+{
+  "schema_version": 1,
+  "title": "Checkout Edge-Cache Cutover Readiness Review",
+  "session_id": "conv-5min-cutover-001",
+  "target_seconds": 300.0,
+  "characters": {
+    "ME": {
+      "name": "Alex",
+      "role": "engineering_lead",
+      "voice": "Charon",
+      "azimuth_deg": 0.0,
+      "style": "Calm, thoughtful male engineering lead in a live technical meeting. Natural conversational pace, clear diction."
+    },
+    "S1": {
+      "name": "Maya",
+      "role": "platform_engineer",
+      "voice": "Kore",
+      "azimuth_deg": 95.0,
+      "style": "Direct, articulate female platform engineer in a technical working discussion. Brisk, clear conversational pace."
+    },
+    "S2": {
+      "name": "Sam",
+      "role": "product_manager",
+      "voice": "Puck",
+      "azimuth_deg": 200.0,
+      "style": "Upbeat, engaged male product manager in a working meeting. Natural, slightly energetic conversational delivery."
+    },
+    "S3": {
+      "name": "Priya",
+      "role": "sre_lead",
+      "voice": "Sulafat",
+      "azimuth_deg": 290.0,
+      "style": "Warm, measured female site reliability engineer in a technical meeting. Composed, clear conversational pace."
+    }
+  },
+  "turns": [
+    {
+      "turn_id": 1,
+      "act": 1,
+      "speaker_id": "ME",
+      "text": "Thanks for joining. Let us lock down the remaining pieces for the checkout edge-cache rollout.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_speech_context"
+    },
+    {
+      "turn_id": 2,
+      "act": 1,
+      "speaker_id": "S1",
+      "text": "Staging dual-write handled overnight burst traffic cleanly with zero dropped cache invalidations.",
+      "pause_after_ms": 800,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_status_update"
+    },
+    {
+      "turn_id": 3,
+      "act": 1,
+      "speaker_id": "S2",
+      "text": "Yeah, totally.",
+      "pause_after_ms": 600,
+      "pinned_pause": false,
+      "coach_expectation": "prefilter_backchannel"
+    },
+    {
+      "turn_id": 4,
+      "act": 1,
+      "speaker_id": "S3",
+      "text": "Cluster memory stayed under seventy percent on our Grafana dashboards throughout the soak test.",
+      "pause_after_ms": 800,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_status_update"
+    },
+    {
+      "turn_id": 5,
+      "act": 1,
+      "speaker_id": "S3",
+      "text": "Makes sense.",
+      "pause_after_ms": 600,
+      "pinned_pause": false,
+      "coach_expectation": "prefilter_too_short"
+    },
+    {
+      "turn_id": 6,
+      "act": 1,
+      "speaker_id": "ME",
+      "text": "Good to hear staging is steady. What operational item is still unresolved?",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_question"
+    },
+    {
+      "turn_id": 7,
+      "act": 1,
+      "speaker_id": "S1",
+      "text": "Most services are ready, though we still have a gap around payment notification retries.",
+      "pause_after_ms": 700,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_context"
+    },
+    {
+      "turn_id": 8,
+      "act": 1,
+      "speaker_id": "S1",
+      "text": "Before we flip production traffic, we still need someone to own the webhook replay backfill runbook for the legacy orders table.",
+      "pause_after_ms": 2300,
+      "pinned_pause": true,
+      "coach_expectation": "display_CONFIRM_OWNER"
+    },
+    {
+      "turn_id": 9,
+      "act": 1,
+      "speaker_id": "S2",
+      "text": "Finance will definitely want an audit trail for every replayed order state during warmup.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "cooldown_active"
+    },
+    {
+      "turn_id": 10,
+      "act": 1,
+      "speaker_id": "S1",
+      "text": "The ops script is merged, it just needs dry-run checks with anonymized payloads.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "cooldown_active"
+    },
+    {
+      "turn_id": 11,
+      "act": 1,
+      "speaker_id": "S3",
+      "text": "Priya will own the webhook replay backfill runbook and test it in staging today.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "resolves_confirm_owner"
+    },
+    {
+      "turn_id": 12,
+      "act": 1,
+      "speaker_id": "ME",
+      "text": "Thanks Priya. Let us check customer-facing readiness next.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_transition"
+    },
+    {
+      "turn_id": 13,
+      "act": 2,
+      "speaker_id": "S2",
+      "text": "Someone should also update the merchant status page maintenance banner prior to launch.",
+      "pause_after_ms": 250,
+      "pinned_pause": true,
+      "coach_expectation": "self_resolving_within_settle_ms"
+    },
+    {
+      "turn_id": 14,
+      "act": 2,
+      "speaker_id": "S2",
+      "text": "Actually, Sam will handle updating the merchant status page banner right after this call.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "ownership_resolved_before_settle"
+    },
+    {
+      "turn_id": 15,
+      "act": 2,
+      "speaker_id": "S3",
+      "text": "Support asked for twenty-four hours of notice on that banner so tickets stay predictable.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_context"
+    },
+    {
+      "turn_id": 16,
+      "act": 2,
+      "speaker_id": "S1",
+      "text": "Sandbox partners also pull checkout schemas from the older staging endpoint for webhook verification.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_context"
+    },
+    {
+      "turn_id": 17,
+      "act": 2,
+      "speaker_id": "ME",
+      "text": "We cannot break sandbox integrations during key rotation. Where do those partner updates stand?",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_question"
+    },
+    {
+      "turn_id": 18,
+      "act": 2,
+      "speaker_id": "S2",
+      "text": "For the partner sandbox migration, we need to ship the token rotation patch before launch, and we still have no target date or deadline on the calendar.",
+      "pause_after_ms": 2300,
+      "pinned_pause": true,
+      "coach_expectation": "display_CONFIRM_TIME"
+    },
+    {
+      "turn_id": 19,
+      "act": 2,
+      "speaker_id": "S1",
+      "text": "DevRel drafted the note, though engineering has not frozen the deprecation window for older HMAC headers.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "cooldown_active"
+    },
+    {
+      "turn_id": 20,
+      "act": 2,
+      "speaker_id": "ME",
+      "text": "Let us freeze that sandbox date with partner engineering right after we check reliability drills.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_transition"
+    },
+    {
+      "turn_id": 21,
+      "act": 3,
+      "speaker_id": "S3",
+      "text": "We simulated a cold cache restart yesterday and recovery finished in forty seconds.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_context"
+    },
+    {
+      "turn_id": 22,
+      "act": 3,
+      "speaker_id": "S3",
+      "text": "We need someone to run the failover chaos drill on the secondary Redis cluster.",
+      "pause_after_ms": 350,
+      "pinned_pause": true,
+      "coach_expectation": "equivalent_question_asked_trigger"
+    },
+    {
+      "turn_id": 23,
+      "act": 3,
+      "speaker_id": "ME",
+      "text": "Who will own running that failover chaos drill on Redis?",
+      "pause_after_ms": 800,
+      "pinned_pause": false,
+      "coach_expectation": "equivalent_question_asked_by_recipient"
+    },
+    {
+      "turn_id": 24,
+      "act": 3,
+      "speaker_id": "S3",
+      "text": "Priya can run the failover chaos drill tomorrow morning with Maya shadowing on call.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "ownership_resolved"
+    },
+    {
+      "turn_id": 25,
+      "act": 3,
+      "speaker_id": "S2",
+      "text": "Awesome, thank you.",
+      "pause_after_ms": 600,
+      "pinned_pause": false,
+      "coach_expectation": "prefilter_backchannel"
+    },
+    {
+      "turn_id": 26,
+      "act": 3,
+      "speaker_id": "S2",
+      "text": "Separately, we still need someone to own renegotiating the vendor contract pricing before next quarter.",
+      "pause_after_ms": 2200,
+      "pinned_pause": true,
+      "coach_expectation": "suppressed_do_not_suggest"
+    },
+    {
+      "turn_id": 27,
+      "act": 3,
+      "speaker_id": "ME",
+      "text": "Let us keep commercial contract discussions separate and track that offline with procurement.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_redirect"
+    },
+    {
+      "turn_id": 28,
+      "act": 4,
+      "speaker_id": "S1",
+      "text": "Our edge nodes are configured for regional sticky routing with automatic fallback to origin.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "below_t_low_context"
+    },
+    {
+      "turn_id": 29,
+      "act": 4,
+      "speaker_id": "ME",
+      "text": "What initial rollout stage are we recommending for the midday traffic window?",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_question"
+    },
+    {
+      "turn_id": 30,
+      "act": 4,
+      "speaker_id": "S3",
+      "text": "I propose we adopt the five percent canary rollout for checkout traffic first, though we have not defined the success criteria or pass condition to promote it.",
+      "pause_after_ms": 2300,
+      "pinned_pause": true,
+      "coach_expectation": "display_SUCCESS_CRITERION"
+    },
+    {
+      "turn_id": 31,
+      "act": 4,
+      "speaker_id": "S1",
+      "text": "We should watch both checkout error rate and stale-hit ratio before expanding traffic.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "cooldown_active"
+    },
+    {
+      "turn_id": 32,
+      "act": 4,
+      "speaker_id": "S3",
+      "text": "If error rate stays under zero point one percent for two hours with zero stale prices, we promote to twenty-five percent.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "resolves_success_criterion"
+    },
+    {
+      "turn_id": 33,
+      "act": 4,
+      "speaker_id": "ME",
+      "text": "Zero point one percent error ceiling gives us a clear promotion gate.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_ack"
+    },
+    {
+      "turn_id": 34,
+      "act": 4,
+      "speaker_id": "S1",
+      "text": "On the cache invalidation worker, our rollout scope covers catalog reads, except we have not decided whether regional tax quotes are in scope or out of scope for phase one.",
+      "pause_after_ms": 2100,
+      "pinned_pause": true,
+      "coach_expectation": "clarify_scope_or_attention_budget_cap"
+    },
+    {
+      "turn_id": 35,
+      "act": 4,
+      "speaker_id": "S2",
+      "text": "Tax quotes depend on postal rules, so keeping regional tax quotes out of scope for phase one is safer.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "scope_boundary_stated"
+    },
+    {
+      "turn_id": 36,
+      "act": 5,
+      "speaker_id": "ME",
+      "text": "Catalog reads are in scope and tax quotes stay on origin. How do latency numbers look?",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_question"
+    },
+    {
+      "turn_id": 37,
+      "act": 5,
+      "speaker_id": "S2",
+      "text": "The edge network team claims checkout tail latency drops by sixty percent under peak load, though nobody has shared what benchmark shows that or what measured data proves it.",
+      "pause_after_ms": 2100,
+      "pinned_pause": true,
+      "coach_expectation": "request_evidence_or_attention_budget_cap"
+    },
+    {
+      "turn_id": 38,
+      "act": 5,
+      "speaker_id": "S1",
+      "text": "I can attach Tuesday's load report and ask the edge team for their raw p99 histogram.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "evidence_follow_up"
+    },
+    {
+      "turn_id": 39,
+      "act": 5,
+      "speaker_id": "S2",
+      "text": "Sounds good.",
+      "pause_after_ms": 600,
+      "pinned_pause": false,
+      "coach_expectation": "prefilter_stock_phrase"
+    },
+    {
+      "turn_id": 40,
+      "act": 5,
+      "speaker_id": "ME",
+      "text": "Quick recap: Priya has the webhook replay runbook and tomorrow's Redis failover drill.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "recipient_recap"
+    },
+    {
+      "turn_id": 41,
+      "act": 5,
+      "speaker_id": "S1",
+      "text": "Maya will post the edge p99 benchmark traces and coordinate the sandbox token rotation schedule.",
+      "pause_after_ms": 900,
+      "pinned_pause": false,
+      "coach_expectation": "summary_update"
+    },
+    {
+      "turn_id": 42,
+      "act": 5,
+      "speaker_id": "ME",
+      "text": "Great, let us reconvene at four o'clock once the staging checklist is green. Thanks everyone.",
+      "pause_after_ms": 500,
+      "pinned_pause": true,
+      "coach_expectation": "session_closing"
+    }
+  ]
+}

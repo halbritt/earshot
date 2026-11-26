@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "session_id": "conv-5min-cutover-001",
+  "objective": "Finalize owners, cutover dates, canary success criteria, scope boundaries, and benchmark evidence for the checkout edge-cache rollout.",
+  "mode": "technical_working_discussion",
+  "recipient": {
+    "participant_id": "ME",
+    "role": "engineering_lead"
+  },
+  "participants": [
+    {
+      "participant_id": "ME",
+      "label": "ME",
+      "role": "engineering_lead"
+    },
+    {
+      "participant_id": "S1",
+      "label": "S1",
+      "role": "platform_engineer"
+    },
+    {
+      "participant_id": "S2",
+      "label": "S2",
+      "role": "product_manager"
+    },
+    {
+      "participant_id": "S3",
+      "label": "S3",
+      "role": "sre_lead"
+    }
+  ],
+  "known_facts": [
+    {
+      "key": "staging_dual_write",
+      "value": "Staging dual-write has been running cleanly since Monday",
+      "source": "brief"
+    }
+  ],
+  "do_not_suggest": [
+    "vendor contract pricing",
+    "compensation"
+  ],
+  "retention": {
+    "store_transcript": true,
+    "store_raw_provider_events": true
+  },
+  "attention": {
+    "max_cards_per_10_min": 5,
+    "proactive": true
+  }
+}

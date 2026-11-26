@@ -12,6 +12,7 @@ Two-layer live conversation audio front end and conversation coach:
 - `crates/earshot-bench/`: replay benchmark scoring front-end variants by WER and CPU time.
 - `coach/`: 14 §15 modules (`transcript_adapter`, `canonical_state` + `contracts` + `storage`, `context_builder`, `opportunity_classifier`, `calibration`, `routing_policy`, `template_renderer`, `question_generator`, `provider_adapter`, `candidate_validator`, `suggestion_controller`, `replay_evaluator`, `annotation_tool`, `telemetry`), `coach/ui/`, and `coach/cli.py` (`coach`).
 - `policies/`: immutable versioned policy (`policies/policy-v0-a.yaml`) and grounded YAML templates (`policies/templates/*.yaml`).
+- `scripts/conversation_5min/`: 5-minute, 4-character test script (`SCRIPT.md`, `script.json`, `brief.json`) and Gemini TTS (`announce --out`) renderer/exporter (`render_announce.py`) outputting private audio/replay fixtures to git-ignored `takes/coach_conversation_5min/`.
 - `arrays/`, `sim/`: array geometry descriptions and acoustic directivity simulations.
 - `docs/plan.md`, `docs/design.md`: front-end architecture and Live Conversation Coach specification (v0.4).
 
