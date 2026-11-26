@@ -53,10 +53,8 @@ _MARKDOWN_LINK_RE = re.compile(
 _PROMPT_INJECTION_RE = re.compile(
     r"\b(?:ignore|disregard|forget|bypass|override|reveal)\s+"
     r"(?:(?:all|any|your|the|of)\s+)*"
-    r"(?:"
-    r"(?:(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden)\s+)*instructions"
-    r"|(?:(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden)\s+)+(?:prompt|rules|constraints)"
-    r")\b",
+    r"(?:(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden)\s+)*"
+    r"(?:instructions|prompt(?:\s+(?:rules|constraints))?|rules|constraints)\b",
     re.IGNORECASE,
 )
 

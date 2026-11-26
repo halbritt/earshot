@@ -811,6 +811,8 @@ class SuggestionController:
                     canonical_revision=can_rev,
                 )
                 self._update_ingest_signals(ev, res, snap)
+                if ev.kind is EventKind.BRIEF_UPDATE and not snap.brief.attention.proactive:
+                    await self._close_pending_proactive_items(at_ms=self._clock.now_ms(), snap=snap)
             return res
 
     def _update_ingest_signals(
@@ -1556,7 +1558,11 @@ class SuggestionController:
                         retention=pre_snap.brief.retention,
                     )
                     return
-                if self._mode in {Mode.PAUSED, Mode.OFF_THE_RECORD} or pre_snap.off_record:
+                if (
+                    self._mode not in {Mode.PROACTIVE, Mode.SHADOW}
+                    or pre_snap.off_record
+                    or not pre_snap.brief.attention.proactive
+                ):
                     self._enqueue_recorder(
                         "decision",
                         context=ctx,
@@ -1663,7 +1669,11 @@ class SuggestionController:
                         retention=fresh_snap.brief.retention,
                     )
                     return
-                if self._mode in {Mode.PAUSED, Mode.OFF_THE_RECORD} or fresh_snap.off_record:
+                if (
+                    self._mode not in {Mode.PROACTIVE, Mode.SHADOW}
+                    or fresh_snap.off_record
+                    or not fresh_snap.brief.attention.proactive
+                ):
                     self._enqueue_recorder(
                         "decision",
                         context=ctx,
@@ -1968,6 +1978,7 @@ class SuggestionController:
 
         valid_built_pairs = list(built_pairs)
         brief_invalidated = False
+        generator_attempted = False
         rejected_cand_ids: set[str] = set()
         recorded_manual_decision = False
         first_fail_reason: ReasonCode | None = None
@@ -2072,7 +2083,11 @@ class SuggestionController:
                 assert built.context is not None and built.serialized_text is not None
                 assert routing.category is not None
                 if routing.route is Route.GENERATOR:
-                    if self._provider is None or not self._policy.generator.enabled:
+                    if (
+                        self._provider is None
+                        or not self._policy.generator.enabled
+                        or generator_attempted
+                    ):
                         async with self._state_lock:
                             if (
                                 self._mode in {Mode.SHADOW, Mode.PAUSED, Mode.OFF_THE_RECORD}
@@ -2217,6 +2232,7 @@ class SuggestionController:
                             probe_used = True
                         call_ledger_texts = dict(self._ledger_texts)
                         call_ledger_cats = dict(self._ledger_categories)
+                    generator_attempted = True
                     gen_out = await self._run_manual_generator_unlocked(
                         ctx=built.context,
                         category=routing.category,
@@ -2391,6 +2407,7 @@ class SuggestionController:
                             retention=fresh_snap.brief.retention,
                         )
                         recorded_manual_decision = True
+                        rejected_cand_ids.add(built.context.candidate_id)
 
         # Fallback to direct generator call on manual lane if enabled (§3.7, §8.6 manual_only)
         fb_candidate: tuple[ContextBuildResult, str] | None = None
@@ -2402,7 +2419,8 @@ class SuggestionController:
             ReasonCode.OBJECTIVE_CHANGED if brief_invalidated else first_fail_reason
         )
         if (
-            not brief_invalidated
+            not generator_attempted
+            and not brief_invalidated
             and self._provider is not None
             and self._policy.generator.enabled
             and valid_built_pairs
@@ -2875,6 +2893,9 @@ class SuggestionController:
             else:
                 self._mode = new_mode
 
+            if self._mode in {Mode.QUIET, Mode.PAUSED}:
+                await self._close_pending_proactive_items(at_ms=now_ms)
+
             if self._mode is Mode.PAUSED:
                 self._set_health(HealthState.PAUSED, "paused")
             elif self._health is HealthState.PAUSED:
@@ -3161,6 +3182,13 @@ class SuggestionController:
         if _brief_material_key(snap.brief) != _brief_material_key(item.brief_snapshot):
             return (ReasonCode.OBJECTIVE_CHANGED, None)
 
+        if not is_active and (
+            self._mode not in {Mode.PROACTIVE, Mode.SHADOW}
+            or snap.off_record
+            or not snap.brief.attention.proactive
+        ):
+            return (ReasonCode.DISPLAY_BY_PASSED, None)
+
         # 4 & 5. Ledger blocking duplicate / near-duplicate against shown/acted-on cards
         ev_ids = {r.segment_id for r in cand.evidence_refs}
         norm_q = normalize_for_matching(cand.text)
@@ -3282,6 +3310,13 @@ class SuggestionController:
         at_ms: int,
         snap: StateSnapshot,
     ) -> None:
+        if (
+            self._mode not in {Mode.PROACTIVE, Mode.SHADOW}
+            or snap.off_record
+            or not snap.brief.attention.proactive
+        ):
+            await self._close_pending(item, ReasonCode.DISPLAY_BY_PASSED, at_ms=at_ms)
+            return
         is_shadow = self._mode is Mode.SHADOW
         disp_ev = LedgerEvent(
             schema_version=SCHEMA_VERSION,
@@ -3472,15 +3507,33 @@ class SuggestionController:
             self._retire_anchor(anchor, state_version=snap.state_version, reason=eff_reason)
             self._cursor.mark_covered(anchor.segments)
 
-    async def _close_open_items_for_halt(self) -> None:
-        now_ms = self._clock.now_ms()
-        for item in self._settling:
-            await self._close_pending(item, ReasonCode.DISPLAY_BY_PASSED, at_ms=now_ms)
+    async def _close_pending_proactive_items(
+        self, *, at_ms: int, snap: StateSnapshot | None = None
+    ) -> None:
+        items = list(self._settling)
         self._settling.clear()
+        for item in items:
+            reason = (
+                ReasonCode.OBJECTIVE_CHANGED
+                if snap is not None
+                and _brief_material_key(snap.brief) != _brief_material_key(item.brief_snapshot)
+                else ReasonCode.DISPLAY_BY_PASSED
+            )
+            await self._close_pending(item, reason, at_ms=at_ms)
         if self._deferred is not None:
             def_item = self._deferred
             self._deferred = None
-            await self._close_pending(def_item, ReasonCode.DISPLAY_BY_PASSED, at_ms=now_ms)
+            reason = (
+                ReasonCode.OBJECTIVE_CHANGED
+                if snap is not None
+                and _brief_material_key(snap.brief) != _brief_material_key(def_item.brief_snapshot)
+                else ReasonCode.DISPLAY_BY_PASSED
+            )
+            await self._close_pending(def_item, reason, at_ms=at_ms)
+
+    async def _close_open_items_for_halt(self) -> None:
+        now_ms = self._clock.now_ms()
+        await self._close_pending_proactive_items(at_ms=now_ms)
         if self._active is not None:
             if self._active.pinned:
                 await self._transition_active(

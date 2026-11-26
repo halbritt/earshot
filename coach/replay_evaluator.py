@@ -874,7 +874,12 @@ class _ReplaySim:
             segments_subset=unproc,
         )
         for anchor in anchors:
-            self.retire_anchor(anchor, state_version=snap.state_version, reason=reason)
+            eff_reason = (
+                ReasonCode.EXPIRED_UNEVALUATED
+                if reason is ReasonCode.SESSION_ENDED and anchor.display_by_ms <= self.sim_now_ms
+                else reason
+            )
+            self.retire_anchor(anchor, state_version=snap.state_version, reason=eff_reason)
             self.cursor.mark_covered(anchor.segments)
 
     def close_open_items_for_halt(self, *, at_ms: int) -> None:
@@ -1142,6 +1147,13 @@ class _ReplaySim:
         ):
             return (ReasonCode.OBJECTIVE_CHANGED, None)
 
+        if not is_active and (
+            self.mode not in {Mode.PROACTIVE, Mode.SHADOW}
+            or snap.off_record
+            or not snap.brief.attention.proactive
+        ):
+            return (ReasonCode.DISPLAY_BY_PASSED, None)
+
         ev_ids = {r.segment_id for r in cand.evidence_refs}
         norm_q = normalize_for_matching(cand.text)
         q_toks = _replay_content_tokens(cand.text)
@@ -1250,6 +1262,14 @@ class _ReplaySim:
         self.deferred = item
 
     def display_pending(self, item: _ReplayPendingItem, *, cause: ReasonCode, at_ms: int) -> None:
+        snap = self.state.snapshot()
+        if (
+            self.mode not in {Mode.PROACTIVE, Mode.SHADOW}
+            or snap.off_record
+            or not snap.brief.attention.proactive
+        ):
+            self.close_pending(item, ReasonCode.DISPLAY_BY_PASSED, at_ms=at_ms)
+            return
         disp_ev = LedgerEvent(
             schema_version=SCHEMA_VERSION,
             event_id=self.next_evt_id("disp"),
@@ -1998,6 +2018,9 @@ class _ReplaySim:
                 break
             self.sim_now_ms = max(self.sim_now_ms, wake)
 
+        end_snap = self.state.snapshot()
+        self.retire_uncovered_segments(end_snap, ReasonCode.SESSION_ENDED)
+        self.close_open_items_for_halt(at_ms=self.sim_now_ms)
         final_snap = self.state.snapshot()
         if self.store is not None:
             sorted_decs = sorted(
