@@ -352,6 +352,7 @@ class SuggestionController:
         self._started_ms: int | None = None
         self._last_transcript_event_ms: int = self._clock.now_ms()
         self._last_gap_ms: int | None = None
+        self._recovery_epoch: int = 0
         self._recipient_speaking = False
         self._recipient_speaking_until_ms: int = 0
         self._otr_start_ms: int | None = None
@@ -621,17 +622,18 @@ class SuggestionController:
         reason: str,
         detail: Mapping[str, Any] | None = None,
     ) -> None:
-        self._emit_tel(
-            level=TelemetryLevel.LIFECYCLE,
-            kind="adapter_health",
-            stage="transcript_adapter",
-            payload={"health": state.value, "reason": reason, **dict(detail or {})},
-        )
-        if state is HealthState.NO_TRANSCRIPT:
-            self._set_health(HealthState.NO_TRANSCRIPT, reason)
-        elif self._health is HealthState.NO_TRANSCRIPT and state is HealthState.OK:
-            await self._recover_from_no_transcript(reason)
-        self._display_wake.set()
+        async with self._state_lock:
+            self._emit_tel(
+                level=TelemetryLevel.LIFECYCLE,
+                kind="adapter_health",
+                stage="transcript_adapter",
+                payload={"health": state.value, "reason": reason, **dict(detail or {})},
+            )
+            if state is HealthState.NO_TRANSCRIPT:
+                self._set_health(HealthState.NO_TRANSCRIPT, reason)
+            elif self._health is HealthState.NO_TRANSCRIPT and state is HealthState.OK:
+                await self._recover_from_no_transcript_locked(reason)
+            self._display_wake.set()
 
     async def start(self) -> None:
         if self._started:
@@ -725,8 +727,14 @@ class SuggestionController:
                 self._ingest_queue.task_done()
 
     async def _recover_from_no_transcript(self, reason: str) -> None:
+        async with self._state_lock:
+            await self._recover_from_no_transcript_locked(reason)
+
+    async def _recover_from_no_transcript_locked(self, reason: str) -> None:
+        self._recovery_epoch += 1
         snap = self._state.snapshot()
         await self._retire_uncovered_segments(snap, ReasonCode.EXPIRED_UNEVALUATED)
+        await self._close_pending_proactive_items(at_ms=self._clock.now_ms(), snap=snap)
         if self._mode is Mode.PAUSED:
             self._set_health(HealthState.PAUSED, "paused")
         elif self._provider is not None and self._provider.breaker_state is BreakerState.OPEN:
@@ -750,6 +758,7 @@ class SuggestionController:
             if ev.kind is EventKind.CONTROL and ev.subtype is ControlSubtype.OFF_RECORD_START:
                 if self._mode is not Mode.OFF_THE_RECORD:
                     self._pre_otr_mode = self._mode
+                    self._recovery_epoch += 1
                     await self._retire_uncovered_segments(
                         self._state.snapshot(), ReasonCode.OFF_RECORD
                     )
@@ -784,6 +793,7 @@ class SuggestionController:
                     self._last_transcript_event_ms, ev.received_ms, self._clock.now_ms()
                 )
                 self._last_gap_ms = ev.received_ms
+                self._recovery_epoch += 1
                 self._schedule_ui_broadcast()
                 self._proactive_wake.set()
                 self._display_wake.set()
@@ -794,7 +804,7 @@ class SuggestionController:
                     self._last_transcript_event_ms, ev.received_ms, self._clock.now_ms()
                 )
                 if self._health is HealthState.NO_TRANSCRIPT:
-                    await self._recover_from_no_transcript("transcript_resumed")
+                    await self._recover_from_no_transcript_locked("transcript_resumed")
 
             res = self._state.apply(ev)
             snap = self._state.snapshot()
@@ -824,6 +834,7 @@ class SuggestionController:
             ControlSubtype.RECONNECT,
         }:
             self._last_gap_ms = ev.received_ms
+            self._recovery_epoch += 1
             self._recipient_speaking = False
         elif ev.kind is EventKind.BOUNDARY:
             if ev.speaker_id is not None and ev.end_ms is not None:
@@ -1014,7 +1025,17 @@ class SuggestionController:
             return False
 
         async with self._state_lock:
+            if (
+                self._mode not in {Mode.PROACTIVE, Mode.QUIET, Mode.SHADOW}
+                or self._health
+                in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED, HealthState.MANUAL_ONLY}
+                or self._state.off_record
+            ):
+                return False
+            start_recovery_epoch = self._recovery_epoch
+            start_gap_ms = self._last_gap_ms
             snap = self._state.snapshot()
+            start_gaps_len = len(snap.gaps)
             unprocessed = self._cursor.unprocessed_segments(snap)
             if not unprocessed:
                 return False
@@ -1133,14 +1154,6 @@ class SuggestionController:
         deadline_ms = self._translate_classifier_deadline(ctrl_deadline_ms)
         clf_results = await self._classifier.classify_batch(c_inputs, deadline_ms=deadline_ms)
 
-        all_err = all(isinstance(r, ClassifierErrorResult) for r in clf_results)
-        if all_err:
-            self._consecutive_clf_errors += 1
-            if self._consecutive_clf_errors >= self._classifier_error_threshold:
-                self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
-        else:
-            self._consecutive_clf_errors = 0
-
         pending_gen: list[
             tuple[
                 DecisionContext,
@@ -1156,12 +1169,38 @@ class SuggestionController:
         ] = []
         retry_pending = False
         async with self._state_lock:
+            all_err = all(isinstance(r, ClassifierErrorResult) for r in clf_results)
+            if all_err:
+                self._consecutive_clf_errors += 1
+                if (
+                    self._consecutive_clf_errors >= self._classifier_error_threshold
+                    and self._health not in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED}
+                    and self._mode not in {Mode.PAUSED, Mode.OFF_THE_RECORD}
+                ):
+                    self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
+            else:
+                self._consecutive_clf_errors = 0
+
             current_snap = self._state.snapshot()
+            cur_health = self.health
+            if (
+                self._is_stopping()
+                or current_snap.off_record
+                or self._mode in {Mode.OFF_THE_RECORD, Mode.PAUSED}
+                or cur_health in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED}
+                or (cur_health is HealthState.MANUAL_ONLY and not all_err)
+                or self._recovery_epoch != start_recovery_epoch
+                or self._last_gap_ms != start_gap_ms
+                or len(current_snap.gaps) > start_gaps_len
+            ):
+                return False
             recipient_ids = {"ME", current_snap.brief.recipient.participant_id}
             probe_ready = self._half_open_probe_ready()
             probe_reserved = False
             for built, clf_raw in zip(surviving, clf_results, strict=True):
                 assert built.context is not None and built.serialized_text is not None
+                if not all(self._cursor.is_uncovered(s) for s in built.anchor.segments):
+                    continue
                 ctx = built.context
                 if self._calibration is not None and not isinstance(clf_raw, ClassifierErrorResult):
                     if isinstance(self._calibration, CalibrationRegistry):
@@ -1337,6 +1376,7 @@ class SuggestionController:
                 ledger_texts_copy=l_texts,
                 ledger_cats_copy=l_cats,
                 is_probe=is_probe,
+                recovery_epoch=start_recovery_epoch,
             )
         return has_overflow or retry_pending
 
@@ -1517,6 +1557,7 @@ class SuggestionController:
         ledger_texts_copy: dict[str, str],
         ledger_cats_copy: dict[str, Category],
         is_probe: bool,
+        recovery_epoch: int | None = None,
     ) -> None:
         assert routing.category is not None
         assert self._provider is not None
@@ -1577,9 +1618,14 @@ class SuggestionController:
                     )
                     return
                 if (
-                    (self._last_gap_ms is not None and ctx.anchor_received_ms < self._last_gap_ms)
+                    (recovery_epoch is not None and self._recovery_epoch != recovery_epoch)
+                    or (
+                        self._last_gap_ms is not None and ctx.anchor_received_ms < self._last_gap_ms
+                    )
                     or len(pre_snap.gaps) > len(snap_at_route.gaps)
                     or self._clock.now_ms() >= ctx.display_by_ms
+                    or self.health
+                    in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED, HealthState.MANUAL_ONLY}
                 ):
                     self._enqueue_recorder(
                         "decision",
@@ -1690,9 +1736,14 @@ class SuggestionController:
                     )
                     return
                 if (
-                    (self._last_gap_ms is not None and ctx.anchor_received_ms < self._last_gap_ms)
+                    (recovery_epoch is not None and self._recovery_epoch != recovery_epoch)
+                    or (
+                        self._last_gap_ms is not None and ctx.anchor_received_ms < self._last_gap_ms
+                    )
                     or len(fresh_snap.gaps) > len(snap_at_route.gaps)
                     or self._clock.now_ms() >= ctx.display_by_ms
+                    or self.health
+                    in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED, HealthState.MANUAL_ONLY}
                 ):
                     self._enqueue_recorder(
                         "decision",
@@ -2816,10 +2867,12 @@ class SuggestionController:
         async with self._state_lock:
             if new_mode is self._mode:
                 return
+            old_mode = self._mode
             now_ms = self._clock.now_ms()
             if new_mode is Mode.OFF_THE_RECORD:
                 self._pre_otr_mode = self._mode
                 self._otr_start_ms = now_ms
+                self._recovery_epoch += 1
                 await self._retire_uncovered_segments(self._state.snapshot(), ReasonCode.OFF_RECORD)
                 await self._close_open_items_for_halt()
                 self._mode = Mode.OFF_THE_RECORD
@@ -2890,13 +2943,30 @@ class SuggestionController:
                     )
                 self._last_transcript_event_ms = max(self._last_transcript_event_ms, now_ms)
                 self._last_gap_ms = now_ms
+                self._recovery_epoch += 1
             else:
                 self._mode = new_mode
+
+            if (
+                old_mode is Mode.SHADOW
+                and new_mode is not Mode.SHADOW
+                and self._active is not None
+                and self._active.shadow
+            ):
+                if self._active.pinned:
+                    await self._transition_active(
+                        LedgerState.OUTDATED, ReasonCode.RESOLUTION_CUE, at_ms=now_ms
+                    )
+                else:
+                    await self._transition_active(
+                        LedgerState.EXPIRED, ReasonCode.DISPLAY_TTL_PASSED, at_ms=now_ms
+                    )
 
             if self._mode in {Mode.QUIET, Mode.PAUSED}:
                 await self._close_pending_proactive_items(at_ms=now_ms)
 
             if self._mode is Mode.PAUSED:
+                self._recovery_epoch += 1
                 self._set_health(HealthState.PAUSED, "paused")
             elif self._health is HealthState.PAUSED:
                 if self._consecutive_clf_errors >= self._classifier_error_threshold:

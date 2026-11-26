@@ -1534,6 +1534,10 @@ class CoverageCursor:
         if seg_id is not None:
             self.pending_exceptions.add(seg_id)
 
+    def is_uncovered(self, seg: SegmentRecord) -> bool:
+        prev_rev = self.covered_revisions.get(seg.segment_id, 0)
+        return prev_rev < seg.revision
+
     def unprocessed_segments(self, snapshot: StateSnapshot) -> list[SegmentRecord]:
         recipient_ids = {"ME", snapshot.brief.recipient.participant_id}
         out: list[SegmentRecord] = []

@@ -52,14 +52,14 @@ _MARKDOWN_LINK_RE = re.compile(
 )
 _PROMPT_INJECTION_RE = re.compile(
     r"\b(?:ignore|disregard|forget|bypass|override|reveal)\s+"
-    r"(?:(?:all|any|your|the|of)\s+)*"
+    r"(?:(?:all|any|your|our|my|this|that|its|their|the|of)\s+)*"
     r"(?:(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden)\s+)*"
-    r"(?:instructions|prompt(?:\s+(?:rules|constraints))?|rules|constraints)\b",
+    r"(?:instructions|(?:system[-_\s]?)?prompt(?:\s+(?:rules|constraints))?|rules|constraints)\b",
     re.IGNORECASE,
 )
 
 _NUMBER_TOKEN_RE = re.compile(
-    r"(?<![^\W_])[$€£]?\d+(?:[.,]\d+)?[kKmMbB%]?(?:st|nd|rd|th)?(?![^\W_])"
+    r"(?<![^\W_])[$€£]?(?:[a-zA-Z]+\d+|\d+)(?:[.,]\d+)*[a-zA-Z0-9%]*(?![^\W_])"
 )
 _NUMBER_WORDS: frozenset[str] = frozenset(
     {
@@ -405,10 +405,10 @@ def _check_premise_grounding(
         _build_grounding_corpus(snapshot, supplied_segment_ids, brief)
     )
 
-    # 1. Numbers & number words (whole-token matching only; no synthetic S1..S9)
+    # 1. Numbers & number words (whole-token matching only; assigned speaker roles allowed)
     for m in _NUMBER_TOKEN_RE.finditer(question):
         num_tok = m.group(0).lower()
-        if num_tok not in corpus_numbers:
+        if num_tok not in corpus_numbers and num_tok not in role_tokens:
             return f"Ungrounded number {m.group(0)!r}"
     for m in _NUMBER_WORD_RE.finditer(question):
         num_word = m.group(0).lower()

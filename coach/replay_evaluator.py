@@ -882,6 +882,33 @@ class _ReplaySim:
             self.retire_anchor(anchor, state_version=snap.state_version, reason=eff_reason)
             self.cursor.mark_covered(anchor.segments)
 
+    def close_pending_proactive_items(
+        self, *, at_ms: int, snap: StateSnapshot | None = None
+    ) -> None:
+        if self.settling:
+            items = list(self.settling)
+            self.settling.clear()
+            for item in items:
+                reason = (
+                    ReasonCode.OBJECTIVE_CHANGED
+                    if snap is not None
+                    and _replay_brief_material_key(snap.brief)
+                    != _replay_brief_material_key(item.brief_snapshot)
+                    else ReasonCode.DISPLAY_BY_PASSED
+                )
+                self.close_pending(item, reason, at_ms=at_ms)
+        if self.deferred is not None:
+            d = self.deferred
+            self.deferred = None
+            reason = (
+                ReasonCode.OBJECTIVE_CHANGED
+                if snap is not None
+                and _replay_brief_material_key(snap.brief)
+                != _replay_brief_material_key(d.brief_snapshot)
+                else ReasonCode.DISPLAY_BY_PASSED
+            )
+            self.close_pending(d, reason, at_ms=at_ms)
+
     def close_open_items_for_halt(self, *, at_ms: int) -> None:
         if self.active is not None:
             if self.active.pinned:
@@ -890,15 +917,7 @@ class _ReplaySim:
                 self.transition_active(
                     LedgerState.EXPIRED, ReasonCode.DISPLAY_TTL_PASSED, at_ms=at_ms
                 )
-        if self.deferred is not None:
-            d = self.deferred
-            self.deferred = None
-            self.close_pending(d, ReasonCode.DISPLAY_BY_PASSED, at_ms=at_ms)
-        if self.settling:
-            items = list(self.settling)
-            self.settling.clear()
-            for item in items:
-                self.close_pending(item, ReasonCode.DISPLAY_BY_PASSED, at_ms=at_ms)
+        self.close_pending_proactive_items(at_ms=at_ms)
 
     def _apply_external_ledger(self, ev: CanonicalEvent) -> None:
         assert ev.suggestion_id is not None and ev.transition is not None and ev.cause is not None
@@ -1059,6 +1078,8 @@ class _ReplaySim:
                 )
         elif ev.kind is EventKind.LEDGER and ev.suggestion_id:
             self._apply_external_ledger(ev)
+        elif ev.kind is EventKind.BRIEF_UPDATE and not snap.brief.attention.proactive:
+            self.close_pending_proactive_items(at_ms=self.sim_now_ms, snap=snap)
 
         if apply_res.material_change and apply_res.affected_segment_id is not None:
             self.cursor.note_material_segment(apply_res.affected_segment_id)
