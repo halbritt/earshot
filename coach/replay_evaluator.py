@@ -1009,6 +1009,7 @@ class _ReplaySim:
             self.prev_anchor_rx_ms = None
             self.prev_anchor_order_key = None
 
+        was_off_record = self.state.off_record
         apply_res = self.state.apply(ev)
         snap = self.state.snapshot()
         if not apply_res.accepted:
@@ -1056,7 +1057,7 @@ class _ReplaySim:
                 self.prev_anchor_seg_ids.clear()
                 self.prev_anchor_rx_ms = None
                 self.prev_anchor_order_key = None
-            elif ev.subtype is ControlSubtype.OFF_RECORD_END:
+            elif ev.subtype is ControlSubtype.OFF_RECORD_END and was_off_record:
                 self.last_gap_ms = ev.received_ms
                 self.recovery_epoch += 1
                 self.recipient_speaking = False

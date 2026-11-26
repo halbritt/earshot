@@ -779,6 +779,7 @@ class SuggestionController:
                 return res
 
             if ev.kind is EventKind.CONTROL and ev.subtype is ControlSubtype.OFF_RECORD_END:
+                was_otr = self._mode is Mode.OFF_THE_RECORD
                 res = self._state.apply(ev)
                 snap = self._state.snapshot()
                 if res.accepted:
@@ -788,15 +789,16 @@ class SuggestionController:
                         retention=snap.brief.retention,
                         canonical_revision=None,
                     )
-                self._mode = self._pre_otr_mode
-                self._last_transcript_event_ms = max(
-                    self._last_transcript_event_ms, ev.received_ms, self._clock.now_ms()
-                )
-                self._last_gap_ms = ev.received_ms
-                self._recovery_epoch += 1
-                self._schedule_ui_broadcast()
-                self._proactive_wake.set()
-                self._display_wake.set()
+                if was_otr:
+                    self._mode = self._pre_otr_mode
+                    self._last_transcript_event_ms = max(
+                        self._last_transcript_event_ms, ev.received_ms, self._clock.now_ms()
+                    )
+                    self._last_gap_ms = ev.received_ms
+                    self._recovery_epoch += 1
+                    self._schedule_ui_broadcast()
+                    self._proactive_wake.set()
+                    self._display_wake.set()
                 return res
 
             if ev.kind in {EventKind.SEGMENT, EventKind.SPEAKER_UPDATE, EventKind.BOUNDARY}:
@@ -2963,7 +2965,8 @@ class SuggestionController:
             if self._mode is Mode.PAUSED:
                 self._recovery_epoch += 1
                 self._set_health(HealthState.PAUSED, "paused")
-            elif self._health is HealthState.PAUSED:
+            elif self._health is HealthState.PAUSED and self._mode is not Mode.OFF_THE_RECORD:
+                self._last_transcript_event_ms = max(self._last_transcript_event_ms, now_ms)
                 if self._consecutive_clf_errors >= self._classifier_error_threshold:
                     self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
                 elif self._local_only_blocked() or (

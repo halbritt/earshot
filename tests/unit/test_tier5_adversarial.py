@@ -3440,3 +3440,252 @@ def test_candidate_validator_prompt_exfiltration_verbs_and_benign_rules() -> Non
             supplied_segment_ids=["seg1"],
         )
         assert res.valid is True, (benign_q, res)
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_after_timeout_does_not_trip_no_transcript(tmp_path: Path) -> None:
+    from coach.template_renderer import load_templates_dir
+
+    policy = load_policy(POLICY_PATH)
+    templates = load_templates_dir(Path("policies/templates"))
+
+    # (a) PAUSED -> advance >= no_transcript_after_ms -> PROACTIVE / QUIET stays OK
+    for target_mode in (Mode.PROACTIVE, Mode.QUIET):
+        clock = ManualClock(1000)
+        sid = f"s-pause-{target_mode.name.lower()}"
+        brief = SessionBrief(
+            schema_version=SCHEMA_VERSION,
+            session_id=sid,
+            mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+            objective="Ship v1",
+            recipient=RecipientConfig("speaker-rec"),
+        )
+        store = SQLiteStore(tmp_path / f"{sid}.db")
+        ctrl = SuggestionController(
+            brief=brief,
+            policy=policy,
+            classifier=RulesClassifier(),
+            templates=templates,
+            store=store,
+            clock=clock,
+        )
+        await ctrl.start()
+        try:
+            clock.advance(1000)
+            await ctrl.set_mode(Mode.PAUSED)
+            assert ctrl.health.value == HealthState.PAUSED.value
+            clock.advance(policy.health.no_transcript_after_ms + 5_000)
+            await ctrl.set_mode(target_mode)
+            await ctrl.tick()
+            assert ctrl.health.value == HealthState.OK.value
+        finally:
+            await ctrl.stop()
+            assert check_conservation_invariants(store, sid, "live").passed
+            store.close()
+
+    # (b) PAUSED -> OFF_RECORD_START -> OFF_RECORD_END -> advance -> PROACTIVE stays OK
+    clock_b = ManualClock(1000)
+    brief_b = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="s-pause-otr",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    store_b = SQLiteStore(tmp_path / "pause_otr.db")
+    ctrl_b = SuggestionController(
+        brief=brief_b,
+        policy=policy,
+        classifier=RulesClassifier(),
+        templates=templates,
+        store=store_b,
+        clock=clock_b,
+    )
+    await ctrl_b.start()
+    try:
+        await ctrl_b.set_mode(Mode.PAUSED)
+        await ctrl_b.submit_event(
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                session_id="s-pause-otr",
+                event_id="otr-s",
+                kind=EventKind.CONTROL,
+                subtype=ControlSubtype.OFF_RECORD_START,
+                received_ms=1500,
+                source_sequence=1,
+                source_id="probe",
+            )
+        )
+        await ctrl_b.drain()
+        assert ctrl_b.mode.value == Mode.OFF_THE_RECORD.value
+        clock_b.advance(policy.health.no_transcript_after_ms + 5_000)
+        await ctrl_b.submit_event(
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                session_id="s-pause-otr",
+                event_id="otr-e",
+                kind=EventKind.CONTROL,
+                subtype=ControlSubtype.OFF_RECORD_END,
+                received_ms=clock_b.now_ms(),
+                source_sequence=2,
+                source_id="probe",
+            )
+        )
+        await ctrl_b.drain()
+        assert ctrl_b.mode.value == Mode.PAUSED.value
+        assert ctrl_b.health.value == HealthState.PAUSED.value
+        clock_b.advance(policy.health.no_transcript_after_ms + 5_000)
+        await ctrl_b.set_mode(Mode.PROACTIVE)
+        await ctrl_b.tick()
+        assert ctrl_b.health.value == HealthState.OK.value
+    finally:
+        await ctrl_b.stop()
+        assert check_conservation_invariants(store_b, "s-pause-otr", "live").passed
+        store_b.close()
+
+
+@pytest.mark.asyncio
+async def test_stray_off_record_end_does_not_overwrite_quiet_or_paused(tmp_path: Path) -> None:
+    from coach.template_renderer import load_templates_dir
+
+    policy = load_policy(POLICY_PATH)
+    clock = ManualClock(1000)
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="s-stray-otr",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    store = SQLiteStore(tmp_path / "otr.db")
+    ctrl = SuggestionController(
+        brief=brief,
+        policy=policy,
+        classifier=_FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96),
+        templates=load_templates_dir(Path("policies/templates")),
+        store=store,
+        clock=clock,
+    )
+    await ctrl.start()
+    try:
+        # 1. Stray OFF_RECORD_END while QUIET must not flip to PROACTIVE or surface cards
+        await ctrl.set_mode(Mode.QUIET)
+        await ctrl.submit_event(
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                session_id="s-stray-otr",
+                event_id="c1",
+                kind=EventKind.CONTROL,
+                subtype=ControlSubtype.OFF_RECORD_END,
+                received_ms=1100,
+                source_sequence=1,
+                source_id="probe",
+            )
+        )
+        await ctrl.drain()
+        assert str(ctrl.mode) == Mode.QUIET.value
+        await ctrl.submit_event(
+            _seg_ev(
+                "s-stray-otr",
+                "e-q",
+                "seg-q",
+                "Someone needs to own the deployment checklist.",
+                rx_ms=1200,
+                start_ms=900,
+                end_ms=1180,
+                seq=2,
+            )
+        )
+        await ctrl.drain()
+        clock.advance(5_000)
+        await ctrl.tick()
+        assert str(ctrl.mode) == Mode.QUIET.value and ctrl.active_card is None
+
+        # 2. Stray OFF_RECORD_END while PAUSED must not split mode vs health
+        await ctrl.set_mode(Mode.PAUSED)
+        await ctrl.submit_event(
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                session_id="s-stray-otr",
+                event_id="c2",
+                kind=EventKind.CONTROL,
+                subtype=ControlSubtype.OFF_RECORD_END,
+                received_ms=6300,
+                source_sequence=3,
+                source_id="probe",
+            )
+        )
+        await ctrl.drain()
+        assert str(ctrl.mode) == Mode.PAUSED.value
+        assert str(ctrl.health) == HealthState.PAUSED.value
+
+        # 3. Stray OFF_RECORD_END while SHADOW must not flip to PROACTIVE
+        await ctrl.set_mode(Mode.SHADOW)
+        await ctrl.submit_event(
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                session_id="s-stray-otr",
+                event_id="c3",
+                kind=EventKind.CONTROL,
+                subtype=ControlSubtype.OFF_RECORD_END,
+                received_ms=6400,
+                source_sequence=4,
+                source_id="probe",
+            )
+        )
+        await ctrl.drain()
+        assert str(ctrl.mode) == Mode.SHADOW.value
+        assert str(ctrl.health) == HealthState.OK.value
+    finally:
+        await ctrl.stop()
+        assert check_conservation_invariants(store, "s-stray-otr", "live").passed
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_replaysim_stray_off_record_end_does_not_clobber_active_stream() -> None:
+    policy = load_policy(POLICY_PATH)
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="rep-stray-otr",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    clf = _FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96)
+    seg1 = _seg_ev(
+        "rep-stray-otr",
+        "e1",
+        "seg-1",
+        "Someone needs to own the deployment checklist.",
+        rx_ms=1000,
+        start_ms=100,
+        end_ms=900,
+        seq=1,
+    )
+    stray_otr_end = CanonicalEvent(
+        schema_version=SCHEMA_VERSION,
+        session_id="rep-stray-otr",
+        event_id="stray-end",
+        kind=EventKind.CONTROL,
+        subtype=ControlSubtype.OFF_RECORD_END,
+        received_ms=1100,
+        source_sequence=2,
+        source_id="probe",
+    )
+    db = SQLiteStore(":memory:")
+    try:
+        res = await async_simulate_replay(
+            brief=brief,
+            events=[seg1, stray_otr_end],
+            policy=policy,
+            classifier=clf,
+            store=db,
+            run_id="r-stray-end",
+            cache_classifier=False,
+        )
+        assert len(res.displayed_cards) == 1
+        assert res.displayed_cards[0].evidence_refs[0].segment_id == "seg-1"
+        assert check_conservation_invariants(db, brief.session_id, "r-stray-end").passed
+    finally:
+        db.close()
