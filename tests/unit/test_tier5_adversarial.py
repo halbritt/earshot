@@ -3942,3 +3942,643 @@ async def test_replaysim_stray_off_record_end_mid_flight_latency_200() -> None:
         assert check_conservation_invariants(db_b, brief.session_id, "r-stray-b").passed
     finally:
         db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_controller_midflight_breaker_open_does_not_overwrite_paused_or_manual_only() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        categories={
+            **base_pol.categories,
+            Category.SUCCESS_CRITERION: replace(
+                base_pol.categories[Category.SUCCESS_CRITERION],
+                route=Route.GENERATOR,
+                template="success_criterion_v1",
+            ),
+        },
+    )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_500(_req: httpx.Request) -> httpx.Response:
+        entered.set()
+        await release.wait()
+        return httpx.Response(500, json={"error": "boom"})
+
+    # (a) Proactive mid-flight breaker open while PAUSED + 20s clock advance + resume
+    brief_a = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="f1-paused",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    clk_a = ManualClock(1000)
+    db_a = SQLiteStore(":memory:")
+    prov_a = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+            breaker_consecutive_failures=1,
+        ),
+        transport=httpx.MockTransport(_slow_500),
+        clock_ms=clk_a.now_ms,
+    )
+    ctrl_a = SuggestionController(
+        brief=brief_a,
+        policy=policy,
+        classifier=_FixedScoreClf(policy.classifier.version, Category.SUCCESS_CRITERION, 0.96),
+        provider=prov_a,
+        store=db_a,
+        run_id="r-f1-a",
+        mode=Mode.PROACTIVE,
+        clock=clk_a,
+    )
+    await ctrl_a.start()
+    try:
+        await ctrl_a.submit_event(
+            _seg_ev("f1-paused", "e1", "seg-1", "We need a clear success metric.", rx_ms=1000)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+        def _h(c: SuggestionController) -> HealthState:
+            return c.health
+
+        await ctrl_a.set_mode(Mode.PAUSED)
+        assert _h(ctrl_a) is HealthState.PAUSED
+        release.set()
+        await ctrl_a.drain()
+        assert prov_a.breaker_state is BreakerState.OPEN
+        assert _h(ctrl_a) is HealthState.PAUSED
+
+        # Advance past no_transcript_after_ms while PAUSED, then resume to PROACTIVE.
+        clk_a.advance(policy.health.no_transcript_after_ms + 5000)
+        await ctrl_a.tick()
+        assert _h(ctrl_a) is HealthState.PAUSED
+        await ctrl_a.set_mode(Mode.PROACTIVE)
+        assert _h(ctrl_a) is HealthState.TEMPLATE_ONLY
+        await ctrl_a.tick()
+        assert _h(ctrl_a) is HealthState.TEMPLATE_ONLY
+    finally:
+        release.set()
+        await ctrl_a.stop()
+        await prov_a.aclose()
+        assert check_conservation_invariants(db_a, "f1-paused", "r-f1-a").passed
+        db_a.close()
+
+    # (b) Manual mid-flight breaker open while MANUAL_ONLY must keep MANUAL_ONLY
+    entered.clear()
+    release.clear()
+    brief_b = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="f1-manual",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    clk_b = ManualClock(1000)
+    db_b = SQLiteStore(":memory:")
+    prov_b = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+            breaker_consecutive_failures=1,
+        ),
+        transport=httpx.MockTransport(_slow_500),
+        clock_ms=clk_b.now_ms,
+    )
+    ctrl_b = SuggestionController(
+        brief=brief_b,
+        policy=policy,
+        classifier=_FixedScoreClf(policy.classifier.version, Category.SUCCESS_CRITERION, 0.96),
+        provider=prov_b,
+        store=db_b,
+        run_id="r-f1-b",
+        mode=Mode.PROACTIVE,
+        clock=clk_b,
+    )
+    await ctrl_b.start()
+    try:
+        async with ctrl_b._state_lock:
+            ctrl_b._consecutive_clf_errors = ctrl_b._classifier_error_threshold
+            ctrl_b._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
+        await ctrl_b.submit_event(
+            _seg_ev("f1-manual", "e1", "seg-1", "We need a clear success metric.", rx_ms=1000)
+        )
+        await ctrl_b.drain()
+        manual_task = asyncio.create_task(ctrl_b.trigger_manual())
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        release.set()
+        await manual_task
+        assert prov_b.breaker_state is BreakerState.OPEN
+        assert ctrl_b.health is HealthState.MANUAL_ONLY
+    finally:
+        release.set()
+        await ctrl_b.stop()
+        await prov_b.aclose()
+        assert check_conservation_invariants(db_b, "f1-manual", "r-f1-b").passed
+        db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_replaysim_non_timeout_classifier_errors_keep_manual_only_with_provider() -> None:
+    import random
+
+    from coach.replay_evaluator import _ReplaySim
+    from coach.template_renderer import load_templates_dir
+
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        categories={
+            **base_pol.categories,
+            Category.SUCCESS_CRITERION: replace(
+                base_pol.categories[Category.SUCCESS_CRITERION],
+                route=Route.GENERATOR,
+                template="success_criterion_v1",
+            ),
+        },
+    )
+    tpl_map = load_templates_dir(Path("policies/templates"))
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="f2-rep-man",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+
+    class _ThreeBoomThenOkClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierResult | ClassifierErrorResult]:
+            self.calls += 1
+            out: list[ClassifierResult | ClassifierErrorResult] = []
+            for raw in contexts:
+                ctx = coerce_classifier_input(raw).context
+                if self.calls <= 3:
+                    out.append(
+                        make_classifier_error_result(
+                            ctx, self.classifier_version, error="runtime_boom"
+                        )
+                    )
+                else:
+                    sc = ScoreSet(opportunity=0.96, categories={"SUCCESS_CRITERION": 0.96})
+                    out.append(
+                        ClassifierResult(
+                            schema_version=SCHEMA_VERSION,
+                            candidate_id=ctx.candidate_id,
+                            based_on_state_version=ctx.based_on_state_version,
+                            classifier_version=self.classifier_version,
+                            raw_scores=sc,
+                            calibration_version=None,
+                            calibrated_scores=sc,
+                            latency_ms=1.0,
+                            input_refs=ctx.anchor_refs,
+                        )
+                    )
+            return out
+
+    events = [
+        _seg_ev(
+            "f2-rep-man",
+            f"e{i}",
+            f"seg-{i}",
+            f"We need clear acceptance metric {i}.",
+            rx_ms=1000 + i * 10000,
+            start_ms=500 + i * 10000,
+            end_ms=900 + i * 10000,
+            seq=i + 1,
+        )
+        for i in range(4)
+    ]
+
+    prov = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+        ),
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"choices": []})),
+    )
+    db = SQLiteStore(":memory:")
+    try:
+        sim = _ReplaySim(
+            brief=brief,
+            ordered=events,
+            policy=policy,
+            classifier=_ThreeBoomThenOkClf(),  # type: ignore[arg-type]
+            cal_obj=None,
+            tpl_map=tpl_map,
+            store=db,
+            run_id="r-f2",
+            mode=Mode.PROACTIVE,
+            provider=prov,
+            health=None,
+            simulated_latency_ms=1.0,
+            latency_distribution_ms=None,
+            rng=random.Random(0),
+            cache_classifier=False,
+        )
+        res = await sim.run()
+        assert sim.eff_health is HealthState.MANUAL_ONLY
+        assert res.routed_count == 0
+        assert res.displayed_cards == ()
+        assert any(h["state"] == "manual_only" for h in sim.health_timeline)
+        assert sim.health_timeline[-1]["state"] == "manual_only"
+        decs = db.get_decisions("f2-rep-man", "r-f2")
+        assert any(d["terminal_state"] == "retired" for d in decs)
+        assert all(d["outcome"] != "ROUTE" for d in decs)
+        assert check_conservation_invariants(db, "f2-rep-man", "r-f2").passed
+    finally:
+        await prov.aclose()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_fallback_and_provider_none_paths_enforce_do_not_suggest_and_dedup() -> None:
+    from coach.template_renderer import load_templates_dir
+
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        categories={
+            **base_pol.categories,
+            Category.CONFIRM_OWNER: replace(
+                base_pol.categories[Category.CONFIRM_OWNER],
+                route=Route.GENERATOR,
+                template="confirm_owner_v1",
+            ),
+        },
+    )
+    tpl_map = load_templates_dir(Path("policies/templates"))
+
+    # 3b: question_generator._try_fallback enforces do_not_suggest and ledger DUPLICATE
+    brief_dns = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="f3-qg",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+        do_not_suggest=("next step",),
+    )
+    st_dns = CanonicalState(brief_dns)
+    st_dns.apply(
+        _seg_ev(
+            "f3-qg", "e1", "seg-1", "Definitely, let us figure out what happens next.", rx_ms=1000
+        )
+    )
+    snap_dns = st_dns.snapshot()
+    built_dns = build_decision_context(snap_dns, [snap_dns.segments[-1]], policy=policy)
+    assert built_dns.context is not None
+    prov_500 = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+            breaker_consecutive_failures=1,
+        ),
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500, json={"error": "boom"})),
+        clock_ms=lambda: 1200,
+    )
+    try:
+        # HTTP 500 -> _try_fallback -> blocked by do_not_suggest
+        out_dns = await generate_question(
+            built_dns.context,
+            Category.CONFIRM_OWNER,
+            snap_dns,
+            policy,
+            prov_500,
+            clock_ms=lambda: 1200,
+            templates=tpl_map,
+        )
+        assert out_dns.candidate is None
+        assert out_dns.terminal_reason is ReasonCode.DO_NOT_SUGGEST
+
+        # Pre-call breaker OPEN -> _try_fallback -> blocked by ledger DUPLICATE
+        brief_dup = replace(brief_dns, do_not_suggest=())
+        st_dup = CanonicalState(brief_dup)
+        st_dup.apply(
+            _seg_ev(
+                "f3-qg",
+                "e1",
+                "seg-1",
+                "Definitely, let us figure out what happens next.",
+                rx_ms=1000,
+            )
+        )
+        prev_cand = SuggestionCandidate(
+            schema_version=1,
+            suggestion_id="sug-prev",
+            candidate_id="cand-prev",
+            origin=Origin.PROACTIVE,
+            category=Category.CONFIRM_OWNER,
+            route=Route.TEMPLATE,
+            text="Who owns that next step?",
+            word_count=5,
+            based_on_state_version=1,
+            evidence_refs=(SegmentRef("other-seg", 1),),
+            template_id="confirm_owner_v1",
+            grounded_slots={},
+            ready_ms=500,
+            display_by_ms=8000,
+            display_ttl_ms=10000,
+        )
+        st_dup.register_suggestion(prev_cand)
+        st_dup.apply(
+            LedgerEvent(
+                schema_version=SCHEMA_VERSION,
+                event_id="le-disp",
+                suggestion_id="sug-prev",
+                transition=LedgerState.DISPLAYED,
+                cause=ReasonCode.ABOVE_T_DISPLAY,
+                at_ms=700,
+            ).to_canonical_event("f3-qg", received_ms=700)
+        )
+        snap_dup = st_dup.snapshot()
+        out_dup = await generate_question(
+            built_dns.context,
+            Category.CONFIRM_OWNER,
+            snap_dup,
+            policy,
+            prov_500,
+            clock_ms=lambda: 1200,
+            templates=tpl_map,
+            ledger_texts={"sug-prev": "Who owns that next step?"},
+            ledger_categories={"sug-prev": Category.CONFIRM_OWNER},
+        )
+        assert out_dup.candidate is None
+        assert out_dup.terminal_reason is ReasonCode.DUPLICATE
+    finally:
+        await prov_500.aclose()
+
+    # 3a: SuggestionController._render_fallback_sync (provider=None + Route.GENERATOR)
+    for tag, dns_terms, expect_reason in [
+        ("dns", ("next step",), ReasonCode.DO_NOT_SUGGEST.value),
+        ("dup", (), ReasonCode.DUPLICATE.value),
+    ]:
+        sid = f"f3-ctrl-{tag}"
+        brief_c = SessionBrief(
+            schema_version=SCHEMA_VERSION,
+            session_id=sid,
+            mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+            objective="Ship v1",
+            recipient=RecipientConfig("speaker-rec"),
+            do_not_suggest=dns_terms,
+        )
+        clk = ManualClock(1000)
+        db = SQLiteStore(":memory:")
+        ctrl = SuggestionController(
+            brief=brief_c,
+            policy=policy,
+            classifier=_FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96),
+            provider=None,
+            store=db,
+            run_id=f"r-{tag}",
+            mode=Mode.PROACTIVE,
+            clock=clk,
+        )
+        await ctrl.start()
+        try:
+            await ctrl.submit_event(
+                _seg_ev(
+                    sid,
+                    "e1",
+                    "seg-1",
+                    "Definitely, let us figure out what happens next.",
+                    rx_ms=1000,
+                    seq=1,
+                )
+            )
+            await ctrl.drain()
+            clk.set_ms(4000)
+            await ctrl.tick()
+            await ctrl.drain()
+            if tag == "dup":
+                clk.set_ms(6000)
+                await ctrl.submit_event(
+                    _seg_ev(
+                        sid,
+                        "e2",
+                        "seg-2",
+                        "Certainly, we ought to coordinate the rest very soon.",
+                        start_ms=5000,
+                        end_ms=5900,
+                        rx_ms=6000,
+                        seq=2,
+                    )
+                )
+                await ctrl.drain()
+                clk.set_ms(9000)
+                await ctrl.tick()
+                await ctrl.drain()
+        finally:
+            await ctrl.stop()
+        decs = db.get_decisions(sid, f"r-{tag}")
+        assert any(
+            d["terminal_state"] == "suppressed" and d["terminal_reason"] == expect_reason
+            for d in decs
+        )
+        assert check_conservation_invariants(db, sid, f"r-{tag}").passed
+        db.close()
+
+    # 3c: _ReplaySim provider=None + Route.GENERATOR + template='confirm_owner_v1'
+    for tag, dns_terms, expect_reason in [
+        ("dns", ("next step",), ReasonCode.DO_NOT_SUGGEST.value),
+        ("dup", (), ReasonCode.DUPLICATE.value),
+    ]:
+        sid = f"f3-rep-{tag}"
+        brief_r = SessionBrief(
+            schema_version=SCHEMA_VERSION,
+            session_id=sid,
+            mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+            objective="Ship v1",
+            recipient=RecipientConfig("speaker-rec"),
+            do_not_suggest=dns_terms,
+        )
+        evs = [
+            _seg_ev(
+                sid,
+                "e1",
+                "seg-1",
+                "Definitely, let us figure out what happens next.",
+                rx_ms=1000,
+                seq=1,
+            )
+        ]
+        if tag == "dup":
+            evs.append(
+                _seg_ev(
+                    sid,
+                    "e2",
+                    "seg-2",
+                    "Certainly, we ought to coordinate the rest very soon.",
+                    start_ms=4000,
+                    end_ms=4900,
+                    rx_ms=5000,
+                    seq=2,
+                )
+            )
+        db = SQLiteStore(":memory:")
+        res = await async_simulate_replay(
+            brief_r,
+            evs,
+            policy,
+            _FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96),
+            store=db,
+            run_id=f"rr-{tag}",
+            mode=Mode.PROACTIVE,
+            provider=None,
+        )
+        if tag == "dns":
+            assert res.displayed_cards == ()
+        else:
+            assert len(res.displayed_cards) == 1
+        decs = db.get_decisions(sid, f"rr-{tag}")
+        assert any(
+            d["terminal_state"] == "suppressed" and d["terminal_reason"] == expect_reason
+            for d in decs
+        )
+        assert check_conservation_invariants(db, sid, f"rr-{tag}").passed
+        db.close()
+
+
+def test_peecee_realtime_and_deepgram_handle_null_and_nonfinite_numeric_fields() -> None:
+    from coach.transcript_adapter import (
+        DeepgramNormalizer,
+        PeeceeConfig,
+        PeeceeRealtimeAdapter,
+    )
+
+    clk = ManualClock(1000)
+    adapter = PeeceeRealtimeAdapter(
+        session_id="f4-sess",
+        config=PeeceeConfig(),
+        clock=clk,
+    )
+    # .delta with audio_processed: null and NaN
+    ev_delta_null = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.delta",
+            "delta": "hello",
+            "audio_processed": None,
+        },
+        received_ms=1100,
+    )
+    assert len(ev_delta_null) == 1
+    assert ev_delta_null[0].stability is Stability.INTERIM
+    assert ev_delta_null[0].text == "hello"
+
+    ev_delta_nan = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.delta",
+            "delta": "world",
+            "audio_processed": float("nan"),
+        },
+        received_ms=1200,
+    )
+    assert len(ev_delta_nan) == 1
+
+    # .completed with audio_processed: null and words containing null numeric fields
+    ev_comp_null = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "hello world",
+            "audio_processed": None,
+            "words": [
+                {"word": "hello", "start": None, "end": None, "confidence": None},
+                {"word": "world", "start": 0.4, "end": 0.8, "confidence": float("inf")},
+            ],
+        },
+        received_ms=1500,
+    )
+    assert any(
+        ev.kind is EventKind.SEGMENT and ev.stability is Stability.COMMITTED for ev in ev_comp_null
+    )
+
+    # .completed fallback (no words) with audio_processed: null
+    ev_comp_fallback = adapter.process_server_message(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "fallback text",
+            "audio_processed": None,
+        },
+        received_ms=1800,
+    )
+    assert any(
+        ev.kind is EventKind.SEGMENT
+        and ev.stability is Stability.COMMITTED
+        and ev.text == "fallback text"
+        for ev in ev_comp_fallback
+    )
+
+    # Off-record mode with audio_processed: null
+    adapter.set_off_record(True)
+    assert (
+        adapter.process_server_message(
+            {
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "secret",
+                "audio_processed": None,
+            },
+            received_ms=2000,
+        )
+        == []
+    )
+    assert (
+        adapter.process_server_message(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "secret",
+                "audio_processed": None,
+            },
+            received_ms=2100,
+        )
+        == []
+    )
+
+    # DeepgramNormalizer with null numeric fields
+    dg = DeepgramNormalizer(session_id="f4-dg", confidence_floor=0.7)
+    dg_evs = dg.normalize(
+        {
+            "type": "Results",
+            "is_final": True,
+            "speech_final": True,
+            "start": None,
+            "duration": None,
+            "channel": {
+                "alternatives": [
+                    {
+                        "transcript": "test message",
+                        "confidence": None,
+                        "words": [{"word": "test", "start": None, "end": None, "speaker": 0}],
+                    }
+                ]
+            },
+        },
+        received_ms=2200,
+    )
+    assert any(ev.kind is EventKind.SEGMENT and ev.text == "test message" for ev in dg_evs)
+    dg_end = dg.normalize({"type": "UtteranceEnd", "last_word_end": None}, received_ms=2300)
+    assert len(dg_end) == 1 and dg_end[0].kind is EventKind.BOUNDARY

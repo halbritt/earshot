@@ -507,9 +507,17 @@ class SuggestionController:
         )
 
     def _on_provider_health_change(self, new_state: HealthState) -> None:
-        if new_state is HealthState.TEMPLATE_ONLY and self._health is HealthState.OK:
+        if (
+            new_state is HealthState.TEMPLATE_ONLY
+            and self._health is HealthState.OK
+            and self._mode is not Mode.PAUSED
+        ):
             self._set_health(HealthState.TEMPLATE_ONLY, "generator_breaker_open")
-        elif new_state is HealthState.OK and self._health is HealthState.TEMPLATE_ONLY:
+        elif (
+            new_state is HealthState.OK
+            and self._health is HealthState.TEMPLATE_ONLY
+            and not self._local_only_blocked()
+        ):
             self._set_health(HealthState.OK, "generator_breaker_closed")
 
     def _set_health(self, state: HealthState, reason: str | None = None) -> None:
@@ -737,10 +745,12 @@ class SuggestionController:
         await self._close_pending_proactive_items(at_ms=self._clock.now_ms(), snap=snap)
         if self._mode is Mode.PAUSED:
             self._set_health(HealthState.PAUSED, "paused")
-        elif self._provider is not None and self._provider.breaker_state is BreakerState.OPEN:
-            self._set_health(HealthState.TEMPLATE_ONLY, "generator_breaker_open")
         elif self._consecutive_clf_errors >= self._classifier_error_threshold:
             self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
+        elif self._local_only_blocked() or (
+            self._provider is not None and self._provider.breaker_state is BreakerState.OPEN
+        ):
+            self._set_health(HealthState.TEMPLATE_ONLY, "generator_breaker_open")
         else:
             self._set_health(HealthState.OK, reason)
         self._proactive_wake.set()
@@ -1402,9 +1412,26 @@ class SuggestionController:
             ready_ms=now_ms,
             origin=ctx.origin,
         )
-        if fb.candidate is not None:
-            return (fb.candidate, replace(routing, route=Route.TEMPLATE), None)
-        return (None, routing, ReasonCode.INSUFFICIENT_BUDGET)
+        if fb.candidate is None:
+            return (None, routing, ReasonCode.INSUFFICIENT_BUDGET)
+        cpol = self._policy.categories.get(routing.category)
+        tpl = self._templates.get(cpol.template) if (cpol and cpol.template) else None
+        max_words = tpl.max_words if tpl is not None else self._policy.generator.max_words
+        val = validate_template_candidate(
+            fb.candidate,
+            snap,
+            snap.brief,
+            max_words=max_words,
+            ledger_texts=self._ledger_texts,
+            ledger_categories=self._ledger_categories,
+        )
+        if not val.valid:
+            return (
+                None,
+                replace(routing, route=Route.TEMPLATE),
+                val.reason_code or ReasonCode.SLOT_UNAVAILABLE,
+            )
+        return (fb.candidate, replace(routing, route=Route.TEMPLATE), None)
 
     def _render_template_sync(
         self,
@@ -1662,7 +1689,10 @@ class SuggestionController:
             elapsed_ms = self._clock.now_ms() - t0
             async with self._state_lock:
                 self._record_gen_latency(elapsed_ms)
-                if self._provider.breaker_state is BreakerState.OPEN:
+                if (
+                    self._provider.breaker_state is BreakerState.OPEN
+                    and self._health is HealthState.OK
+                ):
                     self._set_health(HealthState.TEMPLATE_ONLY, "generator_breaker_open")
                 fresh_snap = self._state.snapshot()
                 recipient_ids = {"ME", fresh_snap.brief.recipient.participant_id}
@@ -1909,7 +1939,10 @@ class SuggestionController:
             elapsed_ms = self._clock.now_ms() - t0
             async with self._state_lock:
                 self._record_gen_latency(elapsed_ms)
-                if self._provider.breaker_state is BreakerState.OPEN:
+                if (
+                    self._provider.breaker_state is BreakerState.OPEN
+                    and self._health is HealthState.OK
+                ):
                     self._set_health(HealthState.TEMPLATE_ONLY, "generator_breaker_open")
             return gen_out
         finally:
@@ -2346,17 +2379,29 @@ class SuggestionController:
                             t_reason = (
                                 gen_out.terminal_reason if gen_out is not None else None
                             ) or ReasonCode.GENERATOR_INVALID_OUTPUT
+                            t_state = (
+                                "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
+                            )
                             eff_rt = (
-                                routing
-                                if t_reason is ReasonCode.GENERATOR_TIMEOUT
-                                else _downgrade_unexecuted_generator_routing(
-                                    routing, egress_id=gen_egress_id, terminal_reason=t_reason
+                                replace(
+                                    routing,
+                                    outcome=Outcome.SUPPRESS,
+                                    route=None,
+                                    reason_codes=(t_reason,),
+                                )
+                                if t_state == "suppressed"
+                                else (
+                                    routing
+                                    if t_reason is ReasonCode.GENERATOR_TIMEOUT
+                                    else _downgrade_unexecuted_generator_routing(
+                                        routing, egress_id=gen_egress_id, terminal_reason=t_reason
+                                    )
                                 )
                             )
                             self._enqueue_recorder(
                                 "decision",
                                 context=built.context,
-                                terminal_state="unrendered",
+                                terminal_state=t_state,
                                 terminal_reason=t_reason,
                                 classifier=clf_res,
                                 routing=eff_rt,
@@ -2597,17 +2642,27 @@ class SuggestionController:
                     t_reason = (
                         gen_out_fb.terminal_reason if gen_out_fb is not None else None
                     ) or ReasonCode.GENERATOR_INVALID_OUTPUT
+                    t_state = "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
                     eff_rt = (
-                        base_rt
-                        if t_reason is ReasonCode.GENERATOR_TIMEOUT
-                        else _downgrade_unexecuted_generator_routing(
-                            base_rt, egress_id=gen_fb_egress_id, terminal_reason=t_reason
+                        replace(
+                            base_rt,
+                            outcome=Outcome.SUPPRESS,
+                            route=None,
+                            reason_codes=(t_reason,),
+                        )
+                        if t_state == "suppressed"
+                        else (
+                            base_rt
+                            if t_reason is ReasonCode.GENERATOR_TIMEOUT
+                            else _downgrade_unexecuted_generator_routing(
+                                base_rt, egress_id=gen_fb_egress_id, terminal_reason=t_reason
+                            )
                         )
                     )
                     self._enqueue_recorder(
                         "decision",
                         context=built0.context,
-                        terminal_state="unrendered",
+                        terminal_state=t_state,
                         terminal_reason=t_reason,
                         classifier=dummy_clf,
                         routing=eff_rt,

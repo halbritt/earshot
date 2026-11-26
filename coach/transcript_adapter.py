@@ -1207,6 +1207,21 @@ class NemotronSegmenter:
         return events
 
 
+def _coerce_opt_finite_float(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        num = float(val)
+    except TypeError, ValueError:
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _coerce_finite_float(val: Any, default: float = 0.0) -> float:
+    parsed = _coerce_opt_finite_float(val)
+    return default if parsed is None else parsed
+
+
 def _extract_nemo_words(payload: Mapping[str, Any], offset_ms: int = 0) -> list[AsrWord]:
     raw_words = payload.get("words")
     if raw_words is None and isinstance(payload.get("item"), Mapping):
@@ -1220,11 +1235,11 @@ def _extract_nemo_words(payload: Mapping[str, Any], offset_ms: int = 0) -> list[
         word_text = str(item.get("word", ""))
         if not word_text.strip():
             continue
-        start_raw = float(item.get("start", 0.0))
-        end_raw = float(item.get("end", start_raw))
+        start_raw = _coerce_finite_float(item.get("start"), 0.0)
+        end_raw = _coerce_finite_float(item.get("end"), start_raw)
         start_ms = max(0, offset_ms + round(start_raw * 1000.0))
         end_ms = max(start_ms, offset_ms + round(end_raw * 1000.0))
-        conf = float(item.get("confidence", 1.0))
+        conf = _coerce_finite_float(item.get("confidence"), 1.0)
         spk_raw = item.get("speaker")
         spk_str: str | None = None
         if spk_raw is not None:
@@ -2013,7 +2028,9 @@ class PeeceeRealtimeAdapter:
         msg_type = str(payload.get("type", ""))
         if self._off_record:
             if msg_type.endswith(("transcription.delta", "transcription.completed")):
-                rel_ms = max(0, round(float(payload.get("audio_processed", 0.0)) * 1000.0))
+                rel_ms = max(
+                    0, round(_coerce_finite_float(payload.get("audio_processed")) * 1000.0)
+                )
                 self._last_utterance_audio_ms = max(self._last_utterance_audio_ms, rel_ms)
             elif msg_type == "input_audio_buffer.committed":
                 self._handle_buffer_committed()
@@ -2026,7 +2043,7 @@ class PeeceeRealtimeAdapter:
                 payload=payload,
             )
         if msg_type.endswith("transcription.delta"):
-            rel_ms = max(0, round(float(payload.get("audio_processed", 0.0)) * 1000.0))
+            rel_ms = max(0, round(_coerce_finite_float(payload.get("audio_processed")) * 1000.0))
             self._last_utterance_audio_ms = max(self._last_utterance_audio_ms, rel_ms)
             abs_ms = self._commit_base_ms + rel_ms
             delta_text = str(payload.get("delta", ""))
@@ -2037,7 +2054,7 @@ class PeeceeRealtimeAdapter:
             )
 
         if msg_type.endswith("transcription.completed"):
-            rel_ms = max(0, round(float(payload.get("audio_processed", 0.0)) * 1000.0))
+            rel_ms = max(0, round(_coerce_finite_float(payload.get("audio_processed")) * 1000.0))
             self._last_utterance_audio_ms = max(self._last_utterance_audio_ms, rel_ms)
             words = _extract_nemo_words(payload, offset_ms=self._commit_base_ms)
             if not words:
@@ -2276,7 +2293,7 @@ class DeepgramNormalizer:
         if msg_type == "UtteranceEnd":
             ch_raw = data.get("channel", [0])
             ch = int(ch_raw[0]) if isinstance(ch_raw, Sequence) and ch_raw else int(ch_raw or 0)
-            end_ms = max(0, round(float(data.get("last_word_end", 0.0)) * 1000.0))
+            end_ms = max(0, round(_coerce_finite_float(data.get("last_word_end")) * 1000.0))
             self._active_utt_start_ms.pop(ch, None)
             return [
                 CanonicalEvent(
@@ -2316,26 +2333,28 @@ class DeepgramNormalizer:
         is_final = bool(data.get("is_final", False))
         speech_final = bool(data.get("speech_final", False))
 
-        has_explicit_start = ("start" in data) or bool(
-            words and isinstance(words[0], Mapping) and "start" in words[0]
+        has_explicit_start = (data.get("start") is not None) or bool(
+            words and isinstance(words[0], Mapping) and words[0].get("start") is not None
         )
-        duration_ms = max(0, round(float(data.get("duration", 0.0)) * 1000.0))
+        duration_ms = max(0, round(_coerce_finite_float(data.get("duration")) * 1000.0))
         if has_explicit_start:
-            start_ms = max(0, round(float(data.get("start", 0.0)) * 1000.0))
-            if words and isinstance(words[0], Mapping) and "start" in words[0]:
-                start_ms = max(0, round(float(words[0]["start"]) * 1000.0))
+            start_ms = max(0, round(_coerce_finite_float(data.get("start")) * 1000.0))
+            if words and isinstance(words[0], Mapping) and words[0].get("start") is not None:
+                start_ms = max(0, round(_coerce_finite_float(words[0].get("start")) * 1000.0))
         elif ch in self._active_utt_start_ms:
             start_ms = self._active_utt_start_ms[ch]
         else:
             prev_end = self._last_end_ms_by_channel.get(ch)
             start_ms = 0 if prev_end is None else prev_end + 1
         end_ms = start_ms + duration_ms
-        if words and isinstance(words[-1], Mapping) and "end" in words[-1]:
-            end_ms = max(start_ms, round(float(words[-1]["end"]) * 1000.0))
+        if words and isinstance(words[-1], Mapping) and words[-1].get("end") is not None:
+            end_ms = max(
+                start_ms,
+                round(_coerce_finite_float(words[-1].get("end"), end_ms / 1000.0) * 1000.0),
+            )
 
         speaker_id, spk_uncertain = self._resolve_speaker(words)
-        conf_raw = alt.get("confidence")
-        asr_conf = float(conf_raw) if conf_raw is not None else None
+        asr_conf = _coerce_opt_finite_float(alt.get("confidence"))
         low_conf = (
             asr_conf is not None
             and self._confidence_floor is not None

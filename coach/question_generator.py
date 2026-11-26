@@ -12,6 +12,7 @@ from coach.candidate_validator import (
     DEFAULT_NEAR_DUP_THRESHOLD,
     ValidationResult,
     validate_generated_candidate,
+    validate_template_candidate,
 )
 from coach.canonical_state import SegmentRecord, StateSnapshot
 from coach.context_builder import (
@@ -39,7 +40,7 @@ from coach.provider_adapter import (
     ProviderTimeoutError,
 )
 from coach.storage import SQLiteStore
-from coach.template_renderer import TemplateSpec, render_generic_fallback
+from coach.template_renderer import TemplateSpec, load_templates_dir, render_generic_fallback
 
 DOWNSTREAM_RESERVE_MS = 45  # §11.3: render_and_validate (20 ms) + handoff (25 ms)
 
@@ -271,7 +272,10 @@ def _try_fallback(
     *,
     now_ms: int,
     templates: Mapping[str, TemplateSpec] | None,
-) -> SuggestionCandidate | None:
+    ledger_texts: Mapping[str, str] | None = None,
+    ledger_categories: Mapping[str, Category] | None = None,
+    near_dup_threshold: float = DEFAULT_NEAR_DUP_THRESHOLD,
+) -> tuple[SuggestionCandidate | None, ValidationResult | None]:
     fb = render_generic_fallback(
         context,
         category,
@@ -281,7 +285,24 @@ def _try_fallback(
         templates=templates,
         ready_ms=now_ms,
     )
-    return fb.candidate
+    if fb.candidate is None:
+        return (None, None)
+    cpol = policy.categories.get(category)
+    tpl_map = templates if templates is not None else load_templates_dir()
+    tpl = tpl_map.get(cpol.template) if (cpol is not None and cpol.template is not None) else None
+    max_words = tpl.max_words if tpl is not None else policy.generator.max_words
+    val = validate_template_candidate(
+        fb.candidate,
+        snapshot,
+        snapshot.brief,
+        max_words=max_words,
+        ledger_texts=ledger_texts,
+        ledger_categories=ledger_categories,
+        near_dup_threshold=near_dup_threshold,
+    )
+    if not val.valid:
+        return (None, val)
+    return (fb.candidate, val)
 
 
 async def generate_question(
@@ -318,9 +339,28 @@ async def generate_question(
         or breaker_state is BreakerState.OPEN
         or local_blocked
     ):
-        fb = _try_fallback(context, category, snapshot, policy, now_ms=now_ms, templates=templates)
+        fb, fb_val = _try_fallback(
+            context,
+            category,
+            snapshot,
+            policy,
+            now_ms=now_ms,
+            templates=templates,
+            ledger_texts=ledger_texts,
+            ledger_categories=ledger_categories,
+            near_dup_threshold=near_dup_threshold,
+        )
         if fb is not None:
             return GenerationOutcome(candidate=fb, terminal_reason=None, fallback_used=True)
+        if fb_val is not None and not fb_val.valid:
+            return GenerationOutcome(
+                candidate=None,
+                terminal_reason=fb_val.reason_code or ReasonCode.SLOT_UNAVAILABLE,
+                fallback_used=False,
+                failed_check=fb_val.failed_check,
+                validation_reason=fb_val.reason,
+                validation_reason_code=fb_val.reason_code,
+            )
         return GenerationOutcome(
             candidate=None, terminal_reason=ReasonCode.INSUFFICIENT_BUDGET, fallback_used=False
         )
@@ -440,22 +480,56 @@ async def generate_question(
     except BreakerOpenError, LocalOnlyBlockedError:
         post_ms = clk()
         if post_ms <= context.display_by_ms - downstream_reserve_ms:
-            fb = _try_fallback(
-                context, category, snapshot, policy, now_ms=post_ms, templates=templates
+            fb, fb_val = _try_fallback(
+                context,
+                category,
+                snapshot,
+                policy,
+                now_ms=post_ms,
+                templates=templates,
+                ledger_texts=ledger_texts,
+                ledger_categories=ledger_categories,
+                near_dup_threshold=near_dup_threshold,
             )
             if fb is not None:
                 return GenerationOutcome(candidate=fb, terminal_reason=None, fallback_used=True)
+            if fb_val is not None and not fb_val.valid:
+                return GenerationOutcome(
+                    candidate=None,
+                    terminal_reason=fb_val.reason_code or ReasonCode.SLOT_UNAVAILABLE,
+                    fallback_used=False,
+                    failed_check=fb_val.failed_check,
+                    validation_reason=fb_val.reason,
+                    validation_reason_code=fb_val.reason_code,
+                )
         return GenerationOutcome(
             candidate=None, terminal_reason=ReasonCode.INSUFFICIENT_BUDGET, fallback_used=False
         )
     except ProviderTimeoutError, ProviderError:
         post_ms = clk()
         if post_ms <= context.display_by_ms - downstream_reserve_ms:
-            fb = _try_fallback(
-                context, category, snapshot, policy, now_ms=post_ms, templates=templates
+            fb, fb_val = _try_fallback(
+                context,
+                category,
+                snapshot,
+                policy,
+                now_ms=post_ms,
+                templates=templates,
+                ledger_texts=ledger_texts,
+                ledger_categories=ledger_categories,
+                near_dup_threshold=near_dup_threshold,
             )
             if fb is not None:
                 return GenerationOutcome(candidate=fb, terminal_reason=None, fallback_used=True)
+            if fb_val is not None and not fb_val.valid:
+                return GenerationOutcome(
+                    candidate=None,
+                    terminal_reason=fb_val.reason_code or ReasonCode.SLOT_UNAVAILABLE,
+                    fallback_used=False,
+                    failed_check=fb_val.failed_check,
+                    validation_reason=fb_val.reason,
+                    validation_reason_code=fb_val.reason_code,
+                )
         return GenerationOutcome(
             candidate=None, terminal_reason=ReasonCode.GENERATOR_TIMEOUT, fallback_used=False
         )

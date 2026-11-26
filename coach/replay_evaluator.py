@@ -1650,7 +1650,13 @@ class _ReplaySim:
                 finally:
                     self.provider.egress_sink = orig_sink
                     self.provider.clock_ms = orig_clock
-                    if self.health_override is None and not self.local_blocked:
+                    if (
+                        self.health_override is None
+                        and not self.local_blocked
+                        and self.eff_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}
+                        and self.provider.health_state
+                        in {HealthState.OK, HealthState.TEMPLATE_ONLY}
+                    ):
                         new_h = self.provider.health_state
                         if new_h is not self.eff_health:
                             self.record_health(new_h, ready_ms, "generator_breaker")
@@ -1670,9 +1676,20 @@ class _ReplaySim:
                     ready_ms=ready_ms,
                     display_ttl_ms=self.policy.display.display_ttl_ms,
                 )
-                cand = rendered.candidate
-                if cand is None:
+                if rendered.candidate is None:
                     fail_reason = rendered.unrendered_reason or ReasonCode.SLOT_UNAVAILABLE
+                else:
+                    val = validate_template_candidate(
+                        rendered.candidate,
+                        snap,
+                        max_words=tpl.max_words,
+                        ledger_texts=self.ledger_texts,
+                        ledger_categories=self.ledger_categories,
+                    )
+                    if val.valid:
+                        cand = rendered.candidate
+                    else:
+                        fail_reason = val.reason_code or ReasonCode.SLOT_UNAVAILABLE
             else:
                 fail_reason = ReasonCode.INSUFFICIENT_BUDGET
         else:
@@ -1745,6 +1762,12 @@ class _ReplaySim:
                     route=None,
                     reason_codes=(t_reason,),
                 )
+            elif (
+                not egress_recorded
+                and eff_routing.route is Route.GENERATOR
+                and t_reason not in {ReasonCode.INSUFFICIENT_BUDGET, ReasonCode.GENERATOR_TIMEOUT}
+            ):
+                eff_routing = replace(eff_routing, route=Route.TEMPLATE)
             self.upsert_decision(
                 context=ctx,
                 terminal_state=t_state,
@@ -2068,14 +2091,21 @@ class _ReplaySim:
                 self.health_override is None
                 and self.provider is not None
                 and not self.local_blocked
+                and self.eff_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}
             ):
                 brk_state = self.provider.advance_clock(self.sim_now_ms)
-                if brk_state is BreakerState.HALF_OPEN and self.provider.half_open_probe_available:
+                if (
+                    self.eff_health is HealthState.TEMPLATE_ONLY
+                    and brk_state is BreakerState.HALF_OPEN
+                    and self.provider.half_open_probe_available
+                ):
                     route_health = HealthState.OK
                 else:
-                    route_health = self.provider.health_state
-                    if route_health is not self.eff_health:
-                        self.record_health(route_health, self.sim_now_ms, "breaker")
+                    prov_health = self.provider.health_state
+                    if prov_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}:
+                        route_health = prov_health
+                        if prov_health is not self.eff_health:
+                            self.record_health(prov_health, self.sim_now_ms, "breaker")
 
             routing = route_candidate(
                 ctx,
@@ -2495,6 +2525,14 @@ async def _render_dataset_candidate(
             cand = gen_out.candidate
             if cand is None:
                 fail_reason = gen_out.terminal_reason or ReasonCode.GENERATOR_INVALID_OUTPUT
+                if (
+                    not egress_recorded
+                    and eff_routing.route is Route.GENERATOR
+                    and fail_reason not in SUPPRESS_REASON_CODES
+                    and fail_reason
+                    not in {ReasonCode.INSUFFICIENT_BUDGET, ReasonCode.GENERATOR_TIMEOUT}
+                ):
+                    eff_routing = replace(eff_routing, route=Route.TEMPLATE)
             elif gen_out.fallback_used and not egress_recorded:
                 eff_routing = replace(routing, route=cand.route)
             return (cand, eff_routing, fail_reason)
@@ -2720,22 +2758,33 @@ async def _simulate_one_dataset_session(
         clf_res = _calibrate_dataset_result(cal_obj, ctx, clf_raw, policy, snap.brief.mode)
         decisions_count += 1
         route_health = cur_health
-        if health_override is None and provider is not None and not local_blocked:
+        if (
+            health_override is None
+            and provider is not None
+            and not local_blocked
+            and cur_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}
+        ):
             brk_state = provider.advance_clock(ctx.anchor_received_ms)
-            if brk_state is BreakerState.HALF_OPEN and provider.half_open_probe_available:
+            if (
+                cur_health is HealthState.TEMPLATE_ONLY
+                and brk_state is BreakerState.HALF_OPEN
+                and provider.half_open_probe_available
+            ):
                 route_health = HealthState.OK
             else:
-                route_health = provider.health_state
-                if route_health is not cur_health:
-                    cur_health = route_health
-                    health_timeline.append(
-                        {
-                            "at_ms": ctx.anchor_received_ms,
-                            "state": cur_health.value,
-                            "health": cur_health.value,
-                            "reason": "breaker",
-                        }
-                    )
+                prov_health = provider.health_state
+                if prov_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}:
+                    route_health = prov_health
+                    if prov_health is not cur_health:
+                        cur_health = prov_health
+                        health_timeline.append(
+                            {
+                                "at_ms": ctx.anchor_received_ms,
+                                "state": cur_health.value,
+                                "health": cur_health.value,
+                                "reason": "breaker",
+                            }
+                        )
         routing = route_candidate(
             ctx,
             clf_res,
@@ -2777,7 +2826,13 @@ async def _simulate_one_dataset_session(
             ledger_texts=ledger_texts,
             ledger_categories=ledger_categories,
         )
-        if health_override is None and provider is not None and not local_blocked:
+        if (
+            health_override is None
+            and provider is not None
+            and not local_blocked
+            and cur_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}
+            and provider.health_state in {HealthState.OK, HealthState.TEMPLATE_ONLY}
+        ):
             post_health = provider.health_state
             if post_health is not cur_health:
                 cur_health = post_health
