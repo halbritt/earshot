@@ -2726,7 +2726,10 @@ async def _simulate_one_dataset_session(
 
     rx_times = [c.context.anchor_received_ms for c, _ in items]
     started_ms = min(rx_times, default=0)
+    last_rx_ms = max(rx_times, default=0)
     cur_health = eff_health
+    consecutive_clf_errors = 0
+    classifier_error_threshold = 3
     health_timeline: list[dict[str, Any]] = [
         {
             "at_ms": started_ms,
@@ -2770,8 +2773,63 @@ async def _simulate_one_dataset_session(
             is_context=False,
         )
         snap = state.snapshot()
-        clf_res = _calibrate_dataset_result(cal_obj, ctx, clf_raw, policy, snap.brief.mode)
         decisions_count += 1
+        is_manual = ctx.origin is Origin.MANUAL
+        if (
+            is_manual
+            and (
+                cur_health in {HealthState.PAUSED, HealthState.NO_TRANSCRIPT}
+                or mode in {Mode.SHADOW, Mode.PAUSED, Mode.OFF_THE_RECORD}
+            )
+        ) or (
+            not is_manual
+            and cur_health
+            in {
+                HealthState.MANUAL_ONLY,
+                HealthState.PAUSED,
+                HealthState.NO_TRANSCRIPT,
+            }
+        ):
+            if store is not None:
+                store.record_decision(
+                    run_id=run_id,
+                    context=ctx,
+                    terminal_state="retired",
+                    terminal_reason=(
+                        ReasonCode.EXPIRED_UNEVALUATED
+                        if ctx.display_by_ms <= last_rx_ms
+                        else ReasonCode.SESSION_ENDED
+                    ),
+                    classifier=None,
+                    routing=None,
+                    serialized_text=cin.serialized_text,
+                    retention=sess_brief.retention,
+                )
+            continue
+
+        if (
+            not is_manual
+            and mode in {Mode.PROACTIVE, Mode.QUIET, Mode.SHADOW}
+            and snap.brief.attention.proactive
+            and not snap.off_record
+        ):
+            if isinstance(clf_raw, ClassifierErrorResult):
+                consecutive_clf_errors += 1
+                if consecutive_clf_errors >= classifier_error_threshold:
+                    cur_health = HealthState.MANUAL_ONLY
+                    if health_timeline[-1]["state"] != HealthState.MANUAL_ONLY.value:
+                        health_timeline.append(
+                            {
+                                "at_ms": ctx.anchor_received_ms,
+                                "state": HealthState.MANUAL_ONLY.value,
+                                "health": HealthState.MANUAL_ONLY.value,
+                                "reason": "classifier_errors",
+                            }
+                        )
+            else:
+                consecutive_clf_errors = 0
+
+        clf_res = _calibrate_dataset_result(cal_obj, ctx, clf_raw, policy, snap.brief.mode)
         route_health = cur_health
         if (
             health_override is None
@@ -2800,19 +2858,56 @@ async def _simulate_one_dataset_session(
                                 "reason": "breaker",
                             }
                         )
-        routing = route_candidate(
-            ctx,
-            clf_res,
-            snap,
-            policy,
-            mode=mode,
-            health=route_health,
-            now_ms=ctx.anchor_received_ms,
-            ledger_texts=ledger_texts,
-            ledger_categories=ledger_categories,
-            prior_anchor_texts=prior_anchor_texts,
-            anchor_text=anchor_text or None,
-            recent_displayed_ms=displayed_times,
+        manual_fallback_routing: RoutingDecision | None = None
+        if (
+            is_manual
+            and cur_health is HealthState.MANUAL_ONLY
+            and isinstance(clf_raw, ClassifierErrorResult)
+            and provider is not None
+            and policy.generator.enabled
+            and not local_blocked
+            and policy.categories
+        ):
+            m_brk = provider.advance_clock(ctx.anchor_received_ms)
+            if provider.health_state is HealthState.OK or (
+                m_brk is BreakerState.HALF_OPEN and provider.half_open_probe_available
+            ):
+                m_cat = (
+                    Category.FOLLOW_UP
+                    if Category.FOLLOW_UP in policy.categories
+                    else next(iter(policy.categories))
+                )
+                manual_fallback_routing = RoutingDecision(
+                    schema_version=SCHEMA_VERSION,
+                    candidate_id=ctx.candidate_id,
+                    policy_version=policy.policy_version,
+                    policy_sha256=policy.policy_sha256,
+                    based_on_state_version=snap.state_version,
+                    outcome=Outcome.ROUTE,
+                    route=Route.GENERATOR,
+                    category=m_cat,
+                    reason_codes=(ReasonCode.MANUAL_REQUEST,),
+                    abstain_reasons=(),
+                    thresholds=None,
+                    decided_ms=ctx.anchor_received_ms,
+                )
+        routing = (
+            manual_fallback_routing
+            if manual_fallback_routing is not None
+            else route_candidate(
+                ctx,
+                clf_res,
+                snap,
+                policy,
+                mode=mode,
+                health=route_health,
+                now_ms=ctx.anchor_received_ms,
+                ledger_texts=ledger_texts,
+                ledger_categories=ledger_categories,
+                prior_anchor_texts=prior_anchor_texts,
+                anchor_text=anchor_text or None,
+                recent_displayed_ms=displayed_times,
+            )
         )
         if routing.outcome is not Outcome.ROUTE or routing.category is None:
             t_state, t_reason = _dataset_non_routed_state(routing)
