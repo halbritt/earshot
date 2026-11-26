@@ -1687,3 +1687,28 @@ async def test_rules_classifier_finish_date_topic_time_resolution_and_define_met
     assert t1_slots["action"].text == "the database migration"
     t5_slots = extract_slots_span_rules_v0([snap.segments_by_id["t5"]], Category.SUCCESS_CRITERION)
     assert t5_slots["proposal"].text == "load test acceptance"
+
+
+def test_rules_classifier_confirm_time_age_tags_and_unrelated_context() -> None:
+    clf = RulesClassifier()
+    for age_tag in ("<30s", "<2m", "<10m", "older"):
+        serialized = (
+            "[OBJECTIVE] Confirm migration cutover timeline.\n"
+            "[ROLE] reviewer\n"
+            "[CONTEXT]\n"
+            f"{age_tag} S1: We will finish it by Friday.\n"
+            "[ANCHOR]\n"
+            "S1: We also need a finish date for the database migration."
+        )
+        scores = clf.score_text(serialized)
+        assert scores.categories["CONFIRM_TIME"] >= 0.80, (age_tag, scores.categories)
+
+    related_serialized = (
+        "[OBJECTIVE] Confirm migration cutover timeline.\n"
+        "[ROLE] reviewer\n"
+        "[CONTEXT]\n"
+        "<2m S1: Database migration will finish by Friday.\n"
+        "[ANCHOR]\n"
+        "S1: We also need a finish date for the database migration."
+    )
+    assert clf.score_text(related_serialized).categories["CONFIRM_TIME"] < 0.25

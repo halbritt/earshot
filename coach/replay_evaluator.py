@@ -2095,6 +2095,36 @@ def _extract_anchor_text_from_serialized(serialized_text: str) -> str:
     return joined
 
 
+_CONTEXT_TURN_RE = re.compile(
+    r"^(?:(?:<\d+[sm]|older)\s+)?(ME|S\d+|S\?|[A-Za-z0-9_-]{1,32}):\s*(.*)$"
+)
+
+
+def _extract_context_turns_from_serialized(serialized_text: str) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
+    in_context = False
+    for raw_line in serialized_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "[CONTEXT]":
+            in_context = True
+            continue
+        if not in_context:
+            continue
+        if line.startswith("[GAP:"):
+            continue
+        if re.match(r"^\[[A-Z_]+\](?:\s|$)", line):
+            break
+        m = _CONTEXT_TURN_RE.match(line)
+        if m is not None:
+            turns.append((m.group(1), m.group(2).strip()))
+        elif turns:
+            prev_role, prev_text = turns[-1]
+            turns[-1] = (prev_role, f"{prev_text} {line}".strip())
+    return turns
+
+
 def _parse_dataset_classifier_input(row: Mapping[str, Any]) -> ClassifierInput:
     if "context" in row and "serialized_text" in row:
         ctx = DecisionContext.from_dict(row["context"])
@@ -2251,18 +2281,55 @@ def _ensure_dataset_segment_revs(
     retention: RetentionConfig,
     store: SQLiteStore | None,
     is_context: bool,
+    anchor_seg_revs: set[tuple[str, int]] | None = None,
+    anchor_text_by_ref: Mapping[tuple[str, int], str] | None = None,
+    context_turns: Sequence[tuple[str, str]] | None = None,
 ) -> int:
-    for ref in refs:
+    use_ctx_turns = is_context and context_turns is not None and len(context_turns) == len(refs)
+    for idx, ref in enumerate(refs):
         cur_rev = applied_seg_revs.get(ref.segment_id, 0)
         if cur_rev >= ref.revision:
             continue
+        role_label, turn_text = (
+            context_turns[idx] if (use_ctx_turns and context_turns is not None) else ("S1", text)
+        )
         for rev in range(cur_rev + 1, ref.revision + 1):
             seq_counter += 1
-            seg_text = (
-                text
-                if (rev == ref.revision and text)
-                else f"__rev_{rev}__ {text or ref.segment_id}"
-            )
+            if is_context:
+                is_anchor_rev = (
+                    anchor_seg_revs is not None and (ref.segment_id, rev) in anchor_seg_revs
+                )
+                if is_anchor_rev:
+                    eff_speaker = role_label if re.fullmatch(r"S\d+", role_label) else "S1"
+                    eff_channel = 1
+                    resolved_text = (
+                        anchor_text_by_ref.get((ref.segment_id, rev))
+                        if anchor_text_by_ref is not None
+                        else None
+                    ) or turn_text
+                else:
+                    eff_speaker = (
+                        "ME"
+                        if role_label == "ME"
+                        else (role_label if re.fullmatch(r"S\d+", role_label) else "S1")
+                    )
+                    eff_channel = 0 if eff_speaker == "ME" else 1
+                    resolved_text = turn_text
+                seg_text = (
+                    resolved_text
+                    if (rev == ref.revision and resolved_text)
+                    else f"__rev_{rev}__ {resolved_text or ref.segment_id}"
+                )
+                should_record = is_anchor_rev
+            else:
+                eff_speaker = "S1"
+                eff_channel = 1
+                seg_text = (
+                    text
+                    if (rev == ref.revision and text)
+                    else f"__rev_{rev}__ {text or ref.segment_id}"
+                )
+                should_record = True
             start_ms = max(0, rx_ms - (1000 if is_context else 500))
             end_ms = max(start_ms + 1, rx_ms - (500 if is_context else 0))
             ev = CanonicalEvent(
@@ -2276,8 +2343,8 @@ def _ensure_dataset_segment_revs(
                 segment_id=ref.segment_id,
                 source_revision=rev,
                 stability=Stability.COMMITTED,
-                channel=1,
-                speaker_id="S1",
+                channel=eff_channel,
+                speaker_id=eff_speaker,
                 start_ms=start_ms,
                 end_ms=end_ms,
                 text=seg_text,
@@ -2291,7 +2358,7 @@ def _ensure_dataset_segment_revs(
                     else rev
                 )
                 applied_seg_revs[ref.segment_id] = actual_rev
-                if store is not None:
+                if store is not None and should_record:
                     store.record_canonical_event(
                         run_id=run_id,
                         event=ev,
@@ -2315,6 +2382,8 @@ async def _simulate_one_dataset_session(
     provider: ProviderAdapter | None,
     eff_health: HealthState,
     stage_latency_ms: float,
+    health_override: HealthState | None = None,
+    local_blocked: bool = False,
 ) -> ReplayResult:
     state = CanonicalState(sess_brief)
     applied_seg_revs: dict[str, int] = {}
@@ -2332,9 +2401,32 @@ async def _simulate_one_dataset_session(
     withdrawn_count = 0
     expired_count = 0
 
+    anchor_seg_revs: set[tuple[str, int]] = set()
+    anchor_text_by_ref: dict[tuple[str, int], str] = {}
+    for cin_item, _ in items:
+        item_anchor_text = _extract_anchor_text_from_serialized(cin_item.serialized_text)
+        for r in cin_item.context.anchor_refs:
+            key = (r.segment_id, r.revision)
+            anchor_seg_revs.add(key)
+            if item_anchor_text and key not in anchor_text_by_ref:
+                anchor_text_by_ref[key] = item_anchor_text
+
+    rx_times = [c.context.anchor_received_ms for c, _ in items]
+    started_ms = min(rx_times, default=0)
+    cur_health = eff_health
+    health_timeline: list[dict[str, Any]] = [
+        {
+            "at_ms": started_ms,
+            "state": cur_health.value,
+            "health": cur_health.value,
+            "reason": "dataset_replay",
+        }
+    ]
+
     for cin, clf_raw in items:
         ctx = cin.context
         anchor_text = _extract_anchor_text_from_serialized(cin.serialized_text)
+        ctx_turns = _extract_context_turns_from_serialized(cin.serialized_text)
         seq_counter = _ensure_dataset_segment_revs(
             state=state,
             applied_seg_revs=applied_seg_revs,
@@ -2347,6 +2439,9 @@ async def _simulate_one_dataset_session(
             retention=sess_brief.retention,
             store=store,
             is_context=True,
+            anchor_seg_revs=anchor_seg_revs,
+            anchor_text_by_ref=anchor_text_by_ref,
+            context_turns=ctx_turns,
         )
         seq_counter = _ensure_dataset_segment_revs(
             state=state,
@@ -2364,13 +2459,30 @@ async def _simulate_one_dataset_session(
         snap = state.snapshot()
         clf_res = _calibrate_dataset_result(cal_obj, ctx, clf_raw, policy, snap.brief.mode)
         decisions_count += 1
+        route_health = cur_health
+        if health_override is None and provider is not None and not local_blocked:
+            brk_state = provider.advance_clock(ctx.anchor_received_ms)
+            if brk_state is BreakerState.HALF_OPEN and provider.half_open_probe_available:
+                route_health = HealthState.OK
+            else:
+                route_health = provider.health_state
+                if route_health is not cur_health:
+                    cur_health = route_health
+                    health_timeline.append(
+                        {
+                            "at_ms": ctx.anchor_received_ms,
+                            "state": cur_health.value,
+                            "health": cur_health.value,
+                            "reason": "breaker",
+                        }
+                    )
         routing = route_candidate(
             ctx,
             clf_res,
             snap,
             policy,
             mode=mode,
-            health=eff_health,
+            health=route_health,
             now_ms=ctx.anchor_received_ms,
             ledger_texts=ledger_texts,
             ledger_categories=ledger_categories,
@@ -2405,6 +2517,18 @@ async def _simulate_one_dataset_session(
             ledger_texts=ledger_texts,
             ledger_categories=ledger_categories,
         )
+        if health_override is None and provider is not None and not local_blocked:
+            post_health = provider.health_state
+            if post_health is not cur_health:
+                cur_health = post_health
+                health_timeline.append(
+                    {
+                        "at_ms": ctx.anchor_received_ms,
+                        "state": cur_health.value,
+                        "health": cur_health.value,
+                        "reason": "breaker",
+                    }
+                )
         if cand is None:
             t_reason = fail_reason or ReasonCode.SLOT_UNAVAILABLE
             t_state = "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
@@ -2546,9 +2670,7 @@ async def _simulate_one_dataset_session(
             )
 
     final_snap = state.snapshot()
-    rx_times = [c.context.anchor_received_ms for c, _ in items]
     dur_ms = max(1, (max(rx_times) - min(rx_times)) if len(rx_times) >= 2 else 1)
-    started_ms = min(rx_times, default=0)
     ended_ms = max([*rx_times, *displayed_times], default=started_ms)
     if store is not None:
         store.upsert_session(
@@ -2556,14 +2678,7 @@ async def _simulate_one_dataset_session(
             run_id=run_id,
             runtime_mode=mode,
             effective_max_cards_per_10_min=effective_max_cards_per_10_min(final_snap.brief, policy),
-            health_timeline=[
-                {
-                    "at_ms": started_ms,
-                    "state": eff_health.value,
-                    "health": eff_health.value,
-                    "reason": "dataset_replay",
-                }
-            ],
+            health_timeline=health_timeline,
             reducer_counters=final_snap.counters,
             revision_history=final_snap.revision_history,
             started_ms=started_ms,
@@ -2612,12 +2727,6 @@ async def async_simulate_dataset_replay(
     local_blocked = (
         provider is not None and provider.config.local_only and provider.config.effective_is_hosted
     )
-    if health is not None:
-        eff_health = health
-    elif local_blocked or provider is None:
-        eff_health = HealthState.TEMPLATE_ONLY
-    else:
-        eff_health = provider.health_state
 
     t0 = time.perf_counter()
     if cache_classifier and store is not None:
@@ -2654,6 +2763,15 @@ async def async_simulate_dataset_replay(
             by_session[sid],
             key=lambda pair: (pair[0].context.anchor_received_ms, pair[0].context.candidate_id),
         )
+        sess_eff_health = (
+            health
+            if health is not None
+            else (
+                HealthState.TEMPLATE_ONLY
+                if (local_blocked or provider is None)
+                else provider.health_state
+            )
+        )
         results.append(
             await _simulate_one_dataset_session(
                 sid=sid,
@@ -2666,8 +2784,10 @@ async def async_simulate_dataset_replay(
                 run_id=run_id,
                 mode=mode,
                 provider=provider,
-                eff_health=eff_health,
+                eff_health=sess_eff_health,
                 stage_latency_ms=stage_ms,
+                health_override=health,
+                local_blocked=local_blocked,
             )
         )
     return results

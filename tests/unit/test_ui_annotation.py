@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -387,3 +388,66 @@ def test_annotation_pass2_step1_lock_review_queue_and_kappa(tmp_path: Path) -> N
     assert k_big["worthwhile"]["low_n"] is False
     assert k_big["worthwhile"]["kappa"] == pytest.approx(1.0)
     assert k_big["per_category"]["CONFIRM_OWNER"]["low_n"] is False
+
+
+async def test_card_ui_server_rejects_stale_seq_and_serializes_broadcasts() -> None:
+    srv = CardUIServer(session_id="s-seq", port=0, emit_card_events=True)
+    await srv.start()
+    try:
+        card2 = {
+            "suggestion_id": "c2",
+            "candidate_id": "cand-2",
+            "category": "CONFIRM_OWNER",
+            "category_chip": "owner",
+            "text": "Who owns rollback?",
+            "word_count": 3,
+            "pinned": False,
+            "origin": "proactive",
+            "route": "template",
+        }
+        async with ws_connect(srv.ws_url) as ws:
+            init_msg = json.loads(await ws.recv())
+            assert init_msg["type"] == "state"
+            assert init_msg["active_card"] is None
+
+            await srv.broadcast_state(UIStateSnapshot(session_id="s-seq", active_card=card2, seq=1))
+            st1 = json.loads(await ws.recv())
+            cf1 = json.loads(await ws.recv())
+            assert st1["active_card"]["suggestion_id"] == "c2"
+            assert cf1["type"] == "card"
+            assert cf1["suggestion_id"] == "c2"
+
+            await srv.broadcast_state(UIStateSnapshot(session_id="s-seq", active_card=None, seq=3))
+            st3 = json.loads(await ws.recv())
+            assert st3["active_card"] is None
+
+            # Out-of-order stale seq=2 must be dropped by both broadcast_state and update_state
+            await srv.broadcast_state(
+                UIStateSnapshot(
+                    session_id="s-seq",
+                    active_card={**card2, "pinned": True},
+                    seq=2,
+                )
+            )
+            srv.update_state(UIStateSnapshot(session_id="s-seq", active_card=card2, seq=2))
+            assert srv.current_state["active_card"] is None
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(ws.recv(), timeout=0.1)
+
+            # Concurrent broadcasts serialize cleanly under _broadcast_lock
+            card4 = {**card2, "suggestion_id": "c4", "candidate_id": "cand-4"}
+            t4 = asyncio.create_task(
+                srv.broadcast_state(UIStateSnapshot(session_id="s-seq", active_card=card4, seq=4))
+            )
+            t5 = asyncio.create_task(
+                srv.broadcast_state(UIStateSnapshot(session_id="s-seq", active_card=None, seq=5))
+            )
+            await asyncio.gather(t4, t5)
+            m4_state = json.loads(await ws.recv())
+            m4_card = json.loads(await ws.recv())
+            m5_state = json.loads(await ws.recv())
+            assert m4_state["active_card"]["suggestion_id"] == "c4"
+            assert m4_card["type"] == "card" and m4_card["suggestion_id"] == "c4"
+            assert m5_state["active_card"] is None
+    finally:
+        await srv.stop()

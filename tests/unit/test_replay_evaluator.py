@@ -11,6 +11,7 @@ import httpx
 
 from coach.calibration import default_calibration_metadata
 from coach.canonical_state import CanonicalState
+from coach.cli import main as cli_main
 from coach.context_builder import build_decision_contexts
 from coach.contracts import (
     AnnotationPass,
@@ -48,7 +49,7 @@ from coach.replay_evaluator import (
 )
 from coach.routing_policy import load_policy
 from coach.storage import SQLiteStore
-from coach.telemetry import check_conservation_invariants
+from coach.telemetry import build_session_report, check_conservation_invariants
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POLICY_PATH = REPO_ROOT / "policies" / "policy-v0-a.yaml"
@@ -767,3 +768,207 @@ def test_simulate_dataset_replay_caches_revisions_and_invariants(tmp_path: Path)
         )
         assert check_conservation_invariants(store, "sess-ds-1", "r-ds-1").passed
         assert check_conservation_invariants(store, "sess-ds-2", "r-ds-1").passed
+
+
+def test_simulate_dataset_replay_2party_context_refs_preserves_invariants_and_grounding(
+    tmp_path: Path,
+) -> None:
+    base_policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    policy = replace(
+        base_policy,
+        display=replace(base_policy.display, settle_ms=100, cooldown_ms=100),
+    )
+    clf = create_classifier("rules_v0")
+    sid = "sess-ds-2party"
+    brief = _brief(session_id=sid, max_cards=3)
+    state = CanonicalState(brief)
+    state.apply(
+        _seg(
+            "me1",
+            "Let us finalize the cutover checklist today.",
+            session_id=sid,
+            speaker_id="ME",
+            start_ms=100,
+            end_ms=190,
+            received_ms=200,
+            seq=1,
+            boundary="utterance_end",
+        )
+    )
+    state.apply(
+        _seg(
+            "s_short",
+            "Okay.",
+            session_id=sid,
+            speaker_id="S1",
+            start_ms=300,
+            end_ms=390,
+            received_ms=400,
+            seq=2,
+            boundary="utterance_end",
+        )
+    )
+    state.apply(
+        _seg(
+            "s_ctx_only",
+            "Alice already verified staging pool A.",
+            session_id=sid,
+            speaker_id="S1",
+            start_ms=500,
+            end_ms=590,
+            received_ms=600,
+            seq=3,
+            boundary="utterance_end",
+        )
+    )
+    state.apply(
+        _seg(
+            "s_main",
+            "Someone should own the rollback plan.",
+            session_id=sid,
+            speaker_id="S1",
+            start_ms=700,
+            end_ms=790,
+            received_ms=800,
+            seq=4,
+            boundary="utterance_end",
+        )
+    )
+    built = build_decision_contexts(state.snapshot(), policy=policy)
+    kept = [
+        b
+        for b in built
+        if not b.dropped
+        and b.context is not None
+        and b.serialized_text is not None
+        and any(r.segment_id == "s_main" for r in b.context.anchor_refs)
+    ]
+    assert len(kept) == 1
+    ctx_main = kept[0].context
+    assert ctx_main is not None and kept[0].serialized_text is not None
+    ctx_seg_ids = {r.segment_id for r in ctx_main.context_refs}
+    assert {"me1", "s_short", "s_ctx_only"}.issubset(ctx_seg_ids)
+
+    row = {"context": ctx_main.to_dict(), "serialized_text": kept[0].serialized_text}
+    db_path = tmp_path / "ds_2party.db"
+    with SQLiteStore(db_path) as store:
+        res = simulate_dataset_replay(
+            [row],
+            policy,
+            clf,
+            brief=brief,
+            store=store,
+            run_id="r-2party",
+        )
+        assert len(res) == 1 and len(res[0].displayed_cards) == 1
+        inv = check_conservation_invariants(store, sid, "r-2party")
+        assert inv.passed, inv.violations
+        assert build_session_report(store, sid, "r-2party").invariants.passed is True
+
+    assert (
+        cli_main(
+            ["report", "--db", str(db_path), "--session", sid, "--run-id", "r-2party", "--json"]
+        )
+        == 0
+    )
+
+    # Route.GENERATOR + [CONTEXT] Check 4 grounding ("Alice" only appears in s_ctx_only) + Inv 5
+    gen_policy_txt = (
+        POLICY_PATH.read_text(encoding="utf-8")
+        .replace("enabled: false", "enabled: true")
+        .replace("route: template", "route: generator", 1)
+        .replace("template: confirm_owner_v1", "template: null", 1)
+    )
+    gen_policy_path = tmp_path / "gen_2party.yaml"
+    gen_policy_path.write_text(gen_policy_txt, encoding="utf-8")
+    gen_policy = replace(
+        load_policy(gen_policy_path, calibration_metadata=default_calibration_metadata()),
+        display=replace(base_policy.display, settle_ms=100, cooldown_ms=100),
+    )
+
+    def _gen_handler(_request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "question": "Will Alice own the rollback plan?",
+                "evidence_segment_ids": ["s_main"],
+                "decline_reason": None,
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 90, "completion_tokens": 12},
+            },
+        )
+
+    provider = ProviderAdapter(
+        config=ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8080/v1",
+            model_id="qwen3:14b",
+            use_streaming=False,
+        ),
+        transport=httpx.MockTransport(_gen_handler),
+        validate_on_init=False,
+    )
+    with SQLiteStore(tmp_path / "ds_2party_gen.db") as store_gen:
+        res_gen = simulate_dataset_replay(
+            [row],
+            gen_policy,
+            clf,
+            brief=brief,
+            store=store_gen,
+            run_id="r-2party-gen",
+            provider=provider,
+        )
+        assert len(res_gen) == 1 and len(res_gen[0].displayed_cards) == 1
+        assert res_gen[0].displayed_cards[0].route is Route.GENERATOR
+        assert res_gen[0].displayed_cards[0].text == "Will Alice own the rollback plan?"
+        assert len(store_gen.get_egress_records(sid, "r-2party-gen")) == 1
+        inv_gen = check_conservation_invariants(store_gen, sid, "r-2party-gen")
+        assert inv_gen.passed, inv_gen.violations
+
+        # Negative control: duplicate s_main@1 anchor across two rows triggers Inv 1 violation
+        dup_row = {
+            "context": {**ctx_main.to_dict(), "candidate_id": "cand-dup-neg"},
+            "serialized_text": kept[0].serialized_text,
+        }
+        simulate_dataset_replay(
+            [row, dup_row],
+            policy,
+            clf,
+            brief=brief,
+            store=store_gen,
+            run_id="r-2party-neg",
+        )
+        inv_neg = check_conservation_invariants(store_gen, sid, "r-2party-neg")
+        assert inv_neg.passed is False
+        assert any(v.invariant_id == 1 for v in inv_neg.violations)
+
+        # Breaker open syncs route_health / health_timeline to template_only
+        fail_provider = ProviderAdapter(
+            config=ProviderConfig(
+                provider="local",
+                base_url="http://127.0.0.1:8080/v1",
+                model_id="qwen3:14b",
+                use_streaming=False,
+                breaker_consecutive_failures=1,
+            ),
+            transport=httpx.MockTransport(lambda _req: httpx.Response(503, text="down")),
+            validate_on_init=False,
+        )
+        with SQLiteStore(tmp_path / "ds_2party_brk.db") as store_brk:
+            simulate_dataset_replay(
+                [row],
+                gen_policy,
+                clf,
+                brief=brief,
+                store=store_brk,
+                run_id="r-2party-brk",
+                provider=fail_provider,
+            )
+            sess_brk = store_brk.get_session(sid, "r-2party-brk")
+            assert sess_brk is not None
+            tl = json.loads(sess_brk["health_timeline_json"])
+            assert [e["state"] for e in tl] == ["ok", "template_only"]

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from coach.cli import main
+from coach.cli import _try_load_dataset_rows, main
 from coach.contracts import (
     CanonicalEvent,
     Category,
@@ -825,3 +825,62 @@ def test_build_session_report_sliding_window_budget_compliance(tmp_path: Path) -
 
     assert _run_case("over-cap", [10_000, 100_000, 610_000]) is False
     assert _run_case("spaced-out", [10_000, 610_001, 1_210_002]) is True
+
+
+def test_try_load_dataset_rows_and_cli_replay_peecee_pretty_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pretty_nemo = tmp_path / "peecee_offline.json"
+    pretty_nemo.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"word": "someone", "start": 0.1, "end": 0.3, "speaker": "1"},
+                    {"word": "should", "start": 0.3, "end": 0.5, "speaker": "1"},
+                    {"word": "own", "start": 0.5, "end": 0.7, "speaker": "1"},
+                    {"word": "the", "start": 0.7, "end": 0.8, "speaker": "1"},
+                    {"word": "rollback", "start": 0.8, "end": 1.1, "speaker": "1"},
+                    {"word": "plan", "start": 1.1, "end": 1.4, "speaker": "1"},
+                ]
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    assert _try_load_dataset_rows(pretty_nemo) is None
+
+    bad_json = tmp_path / "malformed.json"
+    bad_json.write_text("{not valid json\n", encoding="utf-8")
+    assert _try_load_dataset_rows(bad_json) is None
+
+    pretty_jsonl = tmp_path / "pretty.jsonl"
+    pretty_jsonl.write_text(json.dumps({"words": []}, indent=2), encoding="utf-8")
+    assert _try_load_dataset_rows(pretty_jsonl) is None
+
+    brief_path = tmp_path / "brief.json"
+    brief_path.write_text(json.dumps(_brief("s-peecee-json").to_dict(), indent=2), encoding="utf-8")
+    db_path = tmp_path / "peecee_json.db"
+    policy_path = Path(__file__).resolve().parents[2] / "policies" / "policy-v0-a.yaml"
+
+    rc = main(
+        [
+            "replay",
+            "--source",
+            "peecee",
+            "--session",
+            str(pretty_nemo),
+            "--brief",
+            str(brief_path),
+            "--policy",
+            str(policy_path),
+            "--db",
+            str(db_path),
+            "--speed",
+            "stepped",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["decisions_count"] >= 1
+    assert out["invariants"]["passed"] is True

@@ -59,6 +59,7 @@ class UIStateSnapshot:
     active_card: dict[str, Any] | None = None
     manual_status: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    seq: int | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -104,6 +105,10 @@ class CardUIServer:
         self._on_action = on_action
         self._emit_card_events = bool(emit_card_events)
         self._last_emitted_card_id: str | None = None
+        self._broadcast_lock = asyncio.Lock()
+        self._last_broadcast_seq: int = (
+            initial_state.seq if initial_state is not None and initial_state.seq is not None else -1
+        )
         self._state: dict[str, Any] = (
             initial_state.to_dict()
             if initial_state is not None
@@ -247,54 +252,88 @@ class CardUIServer:
             frame["question"] = card.get("question") or card.get("text")
         return frame
 
-    async def broadcast_state(self, state: UIStateSnapshot | Mapping[str, Any]) -> None:
-        if isinstance(state, UIStateSnapshot):
-            payload = state.to_dict()
-        else:
-            payload = {"type": "state", **dict(state)}
-        self._state = payload
-        card = payload.get("active_card")
-        card_sid = (
-            str(card["suggestion_id"])
-            if isinstance(card, Mapping) and card.get("suggestion_id")
-            else None
-        )
-        card_frame: dict[str, Any] | None = None
-        if self._emit_card_events:
-            if card_sid is not None and card_sid != self._last_emitted_card_id:
-                self._last_emitted_card_id = card_sid
-                card_frame = self._build_card_frame(payload)
-            elif card_sid is None:
-                self._last_emitted_card_id = None
-        if not self._clients:
-            return
-        encoded = json.dumps(payload, sort_keys=True)
-        encoded_card = json.dumps(card_frame, sort_keys=True) if card_frame is not None else None
-        dead: list[ServerConnection] = []
-        for ws in list(self._clients):
-            try:
-                await ws.send(encoded)
-                if encoded_card is not None:
-                    await ws.send(encoded_card)
-            except OSError, ConnectionClosed:
-                dead.append(ws)
-        for ws in dead:
-            self._clients.discard(ws)
+    async def broadcast_state(
+        self,
+        state: UIStateSnapshot | Mapping[str, Any],
+        *,
+        seq: int | None = None,
+    ) -> None:
+        async with self._broadcast_lock:
+            eff_seq = (
+                seq
+                if seq is not None
+                else (state.seq if isinstance(state, UIStateSnapshot) else None)
+            )
+            if eff_seq is not None and eff_seq <= self._last_broadcast_seq:
+                return
+            if eff_seq is not None:
+                self._last_broadcast_seq = eff_seq
+            if isinstance(state, UIStateSnapshot):
+                payload = state.to_dict()
+            else:
+                payload = {"type": "state", **dict(state)}
+            self._state = payload
+            card = payload.get("active_card")
+            card_sid = (
+                str(card["suggestion_id"])
+                if isinstance(card, Mapping) and card.get("suggestion_id")
+                else None
+            )
+            card_frame: dict[str, Any] | None = None
+            if self._emit_card_events:
+                if card_sid is not None and card_sid != self._last_emitted_card_id:
+                    self._last_emitted_card_id = card_sid
+                    card_frame = self._build_card_frame(payload)
+                elif card_sid is None:
+                    self._last_emitted_card_id = None
+            if not self._clients:
+                return
+            encoded = json.dumps(payload, sort_keys=True)
+            encoded_card = (
+                json.dumps(card_frame, sort_keys=True) if card_frame is not None else None
+            )
+            dead: list[ServerConnection] = []
+            for ws in list(self._clients):
+                try:
+                    await ws.send(encoded)
+                    if encoded_card is not None:
+                        await ws.send(encoded_card)
+                except OSError, ConnectionClosed:
+                    dead.append(ws)
+            for ws in dead:
+                self._clients.discard(ws)
 
-    def update_state(self, state: UIStateSnapshot | Mapping[str, Any]) -> None:
+    def update_state(
+        self,
+        state: UIStateSnapshot | Mapping[str, Any],
+        *,
+        seq: int | None = None,
+    ) -> None:
+        eff_seq = (
+            seq if seq is not None else (state.seq if isinstance(state, UIStateSnapshot) else None)
+        )
+        if eff_seq is not None and eff_seq <= self._last_broadcast_seq:
+            return
+        if eff_seq is not None:
+            self._last_broadcast_seq = eff_seq
         if isinstance(state, UIStateSnapshot):
             self._state = state.to_dict()
         else:
             self._state = {"type": "state", **dict(state)}
 
     async def _ws_handler(self, websocket: ServerConnection) -> None:
-        self._clients.add(websocket)
+        async with self._broadcast_lock:
+            self._clients.add(websocket)
+            try:
+                await websocket.send(json.dumps(self._state, sort_keys=True))
+                if self._emit_card_events:
+                    card_frame = self._build_card_frame(self._state)
+                    if card_frame is not None:
+                        await websocket.send(json.dumps(card_frame, sort_keys=True))
+            except OSError, ConnectionClosed:
+                self._clients.discard(websocket)
+                return
         try:
-            await websocket.send(json.dumps(self._state, sort_keys=True))
-            if self._emit_card_events:
-                card_frame = self._build_card_frame(self._state)
-                if card_frame is not None:
-                    await websocket.send(json.dumps(card_frame, sort_keys=True))
             async for raw in websocket:
                 if not isinstance(raw, str):
                     continue

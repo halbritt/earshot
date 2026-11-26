@@ -392,6 +392,8 @@ class SuggestionController:
         self._adapter_pump_task: asyncio.Task[None] | None = None
         self._tel_seq = 0
         self._evt_seq = 0
+        self._ui_seq = 0
+        self._ui_broadcast_queue: asyncio.Queue[UIStateSnapshot] = asyncio.Queue()
         self._ui_broadcast_task: asyncio.Task[None] | None = None
 
         if self._ui is not None:
@@ -567,22 +569,38 @@ class SuggestionController:
     def _schedule_ui_broadcast(self) -> None:
         if self._ui is None:
             return
-        ui_snap = self.build_ui_snapshot()
-        self._ui.update_state(ui_snap)
+        self._ui_seq += 1
+        ui_snap = replace(self.build_ui_snapshot(), seq=self._ui_seq)
+        if self._stopping:
+            self._ui.update_state(ui_snap)
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            self._ui.update_state(ui_snap)
             return
-        prev = self._ui_broadcast_task
+        self._ui_broadcast_queue.put_nowait(ui_snap)
+        if self._ui_broadcast_task is None or self._ui_broadcast_task.done():
+            self._ui_broadcast_task = loop.create_task(
+                self._drain_ui_broadcasts(), name="ui_broadcast"
+            )
+
+    async def _drain_ui_broadcasts(self) -> None:
         ui_server = self._ui
+        if ui_server is None:
+            return
+        while not self._ui_broadcast_queue.empty():
+            snap = self._ui_broadcast_queue.get_nowait()
+            try:
+                await ui_server.broadcast_state(snap)
+            finally:
+                self._ui_broadcast_queue.task_done()
 
-        async def _send() -> None:
-            if prev is not None and not prev.done():
-                with contextlib.suppress(BaseException):
-                    await prev
-            await ui_server.broadcast_state(ui_snap)
-
-        self._ui_broadcast_task = loop.create_task(_send())
+    async def _flush_ui_broadcast(self) -> None:
+        while self._ui_broadcast_task is not None and not self._ui_broadcast_task.done():
+            task = self._ui_broadcast_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     def set_recipient_speaking(self, speaking: bool) -> None:
         self._recipient_speaking = speaking
@@ -682,9 +700,7 @@ class SuggestionController:
             await asyncio.sleep(0)
             await asyncio.wait_for(self._proactive_idle.wait(), timeout=timeout_s)
         await self.tick()
-        if self._ui_broadcast_task is not None and not self._ui_broadcast_task.done():
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._ui_broadcast_task
+        await self._flush_ui_broadcast()
         if self._store is not None:
             await asyncio.wait_for(self._recorder_queue.join(), timeout=timeout_s)
             await self.flush_recorder()
@@ -914,6 +930,8 @@ class SuggestionController:
                 )
             finally:
                 self._proactive_idle.set()
+                if self._health is HealthState.NO_TRANSCRIPT:
+                    self._display_wake.set()
 
     def _retire_anchor(
         self,
@@ -2502,7 +2520,7 @@ class SuggestionController:
             reason=ReasonCode.MANUAL_REQUEST,
         )
 
-    async def handle_ui_action(self, action: Mapping[str, Any]) -> dict[str, Any]:
+    async def handle_ui_action(self, action: Mapping[str, Any]) -> dict[str, Any] | None:
         act = str(action.get("action") or "").strip().lower()
         now_ms = self._clock.now_ms()
         if act == "manual":
@@ -2520,7 +2538,8 @@ class SuggestionController:
                         raise
             else:
                 await self.trigger_manual()
-            return self.build_ui_snapshot().to_dict()
+            await self._flush_ui_broadcast()
+            return None
         if act == "off_record":
             active_arg = action.get("active")
             if isinstance(active_arg, bool):
@@ -2534,19 +2553,21 @@ class SuggestionController:
                     self._pre_otr_mode if self._mode is Mode.OFF_THE_RECORD else Mode.OFF_THE_RECORD
                 )
             await self.set_mode(target)
-            return self.build_ui_snapshot().to_dict()
+            await self._flush_ui_broadcast()
+            return None
         if act == "mode":
             raw_mode = str(action.get("mode") or "").strip()
             if raw_mode:
                 await self.set_mode(Mode(raw_mode))
-            return self.build_ui_snapshot().to_dict()
+            await self._flush_ui_broadcast()
+            return None
 
         async with self._state_lock:
             if self._active is None or self._active.shadow:
-                return self.build_ui_snapshot().to_dict()
+                return None
             req_sid = action.get("suggestion_id")
             if req_sid is not None and str(req_sid) != self._active.cand.suggestion_id:
-                return self.build_ui_snapshot().to_dict()
+                return None
             if act == "use":
                 await self._transition_active(
                     LedgerState.USED, ReasonCode.USER_ACTION, at_ms=now_ms
@@ -2589,7 +2610,8 @@ class SuggestionController:
                 self._enqueue_recorder("ledger_event", event=pin_ev)
                 self._active.pinned = True
                 self._schedule_ui_broadcast()
-        return self.build_ui_snapshot().to_dict()
+        await self._flush_ui_broadcast()
+        return None
 
     async def set_mode(self, new_mode: Mode) -> None:
         async with self._state_lock:
@@ -2726,6 +2748,23 @@ class SuggestionController:
             deadlines.append(
                 self._last_transcript_event_ms + self._policy.health.no_transcript_after_ms
             )
+        if (
+            self._health is HealthState.NO_TRANSCRIPT
+            and self._proactive_idle.is_set()
+            and self._mode is not Mode.OFF_THE_RECORD
+        ):
+            snap = self._state.snapshot()
+            unprocessed = self._cursor.unprocessed_segments(snap)
+            if unprocessed:
+                anchors = coalesce_anchors(
+                    snap,
+                    max_candidate_age_ms=self._policy.display.max_candidate_age_ms,
+                    tokenizer=self._classifier.tokenizer,
+                    speaker_boundary_end_ms=self._speaker_boundary_end_ms,
+                    segments_subset=unprocessed,
+                )
+                if anchors:
+                    deadlines.append(min(a.display_by_ms for a in anchors))
         if self._provider is not None and self._provider.breaker_state is BreakerState.OPEN:
             opened_at = self._provider.opened_at_ms
             if opened_at is not None:
@@ -3362,6 +3401,9 @@ class SuggestionController:
             self._ui_broadcast_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ui_broadcast_task
+        while not self._ui_broadcast_queue.empty():
+            self._ui_broadcast_queue.get_nowait()
+            self._ui_broadcast_queue.task_done()
 
         if "ingest" in self._tasks:
             await self._ingest_queue.put(None)

@@ -874,22 +874,40 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return asyncio.run(_serve_async(args))
 
 
+def _is_dataset_row(obj: Any) -> bool:
+    return isinstance(obj, Mapping) and (
+        ("candidate_id" in obj and "serialized_text" in obj and "kind" not in obj)
+        or ("context" in obj and "serialized_text" in obj)
+    )
+
+
 def _try_load_dataset_rows(session_path: str | Path) -> list[dict[str, Any]] | None:
     src = Path(session_path)
     if src.suffix in {".db", ".sqlite", ".sqlite3"} or not src.is_file():
         return None
+    raw_text = src.read_text(encoding="utf-8")
+    if src.suffix.lower() == ".json":
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, Mapping):
+            return [dict(parsed)] if _is_dataset_row(parsed) else None
+        if isinstance(parsed, list) and parsed and all(_is_dataset_row(item) for item in parsed):
+            return [dict(item) for item in parsed if isinstance(item, Mapping)]
+        return None
     rows: list[dict[str, Any]] = []
-    for raw in src.read_text(encoding="utf-8").splitlines():
+    for raw in raw_text.splitlines():
         stripped = raw.strip()
         if not stripped:
             continue
-        obj = json.loads(stripped)
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
         if not isinstance(obj, Mapping):
             return None
-        if not rows and not (
-            ("candidate_id" in obj and "serialized_text" in obj and "kind" not in obj)
-            or ("context" in obj and "serialized_text" in obj)
-        ):
+        if not rows and not _is_dataset_row(obj):
             return None
         rows.append(dict(obj))
     return rows if rows else None
@@ -946,7 +964,11 @@ def _load_replay_events(
 def _cmd_replay(args: argparse.Namespace) -> int:
     policy, cal_obj = _load_policy_and_cal(args.policy, calibration_path=args.calibration)
     run_id = args.run_id or f"replay-{uuid.uuid4().hex[:10]}"
-    dataset_rows = _try_load_dataset_rows(args.session)
+    dataset_rows = (
+        _try_load_dataset_rows(args.session)
+        if getattr(args, "source", "canonical") == "canonical"
+        else None
+    )
     if dataset_rows is not None:
         split_mode = args.split_by or "conversation"
         splits = (

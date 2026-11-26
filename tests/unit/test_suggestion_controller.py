@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from websockets.asyncio.client import connect as ws_connect
 
 from coach.calibration import default_calibration_registry
 from coach.context_builder import PolicyConfig, Tokenizer, WhitespaceTokenizer
@@ -42,7 +43,8 @@ from coach.routing_policy import load_policy
 from coach.storage import SQLiteStore
 from coach.suggestion_controller import SuggestionController
 from coach.telemetry import BoundedRecorderBuffer, check_conservation_invariants
-from coach.transcript_adapter import ManualClock
+from coach.transcript_adapter import ManualClock, MonotonicSessionClock
+from coach.ui import CardUIServer
 
 POLICY_PATH = Path(__file__).resolve().parents[2] / "policies" / "policy-v0-a.yaml"
 
@@ -1217,3 +1219,296 @@ async def test_no_transcript_and_stop_retire_expired_uncovered_anchors(tmp_path:
         assert ReasonCode.EXPIRED_UNEVALUATED.value in reasons
         assert ReasonCode.SESSION_ENDED.value in reasons
         assert check_conservation_invariants(store, sid, rid).passed
+
+
+async def test_pipelined_ui_pin_dismiss_and_next_card_no_stale_broadcast(tmp_path: Path) -> None:
+    base_pol = _policy()
+    policy = replace(base_pol, display=replace(base_pol.display, settle_ms=10, cooldown_ms=10))
+    sid = "sess-pipe-ui"
+    rid = "run-pipe-ui"
+    clock = MonotonicSessionClock()
+    ui_srv = CardUIServer(session_id=sid, port=0, emit_card_events=True)
+    await ui_srv.start()
+    try:
+        with SQLiteStore(tmp_path / "pipe_ui.db") as store:
+            ctrl = SuggestionController(
+                brief=_brief(session_id=sid),
+                policy=policy,
+                classifier=_ScriptedClassifier(opp=0.90, cats={"CONFIRM_OWNER": 0.90}),
+                clock=clock,
+                store=store,
+                ui_server=ui_srv,
+                run_id=rid,
+            )
+            await ctrl.start()
+            try:
+                async with ws_connect(ui_srv.ws_url) as ws:
+                    init_msg = json.loads(await ws.recv())
+                    assert init_msg["type"] == "state"
+
+                    t1 = clock.now_ms()
+                    await ctrl.submit_event(
+                        _seg(
+                            sid,
+                            "e1",
+                            "s1",
+                            "Someone should own the staging cutover.",
+                            rx_ms=t1,
+                            start_ms=max(0, t1 - 300),
+                            end_ms=max(1, t1 - 50),
+                            seq=1,
+                        )
+                    )
+                    sid1: str | None = None
+                    for _ in range(20):
+                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                        if msg.get("type") == "card":
+                            sid1 = str(msg["suggestion_id"])
+                            break
+                    assert sid1 is not None
+
+                    # Pipeline pin -> dismiss back-to-back with no recv() in between
+                    await ws.send(
+                        json.dumps({"type": "action", "action": "pin", "suggestion_id": sid1})
+                    )
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "action",
+                                "action": "dismiss",
+                                "suggestion_id": sid1,
+                                "feedback": "too_late",
+                            }
+                        )
+                    )
+
+                    await asyncio.sleep(0.03)
+                    t2 = clock.now_ms()
+                    await ctrl.submit_event(
+                        _seg(
+                            sid,
+                            "e2",
+                            "s2",
+                            "Someone should own the database rollback.",
+                            rx_ms=t2,
+                            start_ms=max(0, t2 - 300),
+                            end_ms=max(1, t2 - 50),
+                            seq=2,
+                        )
+                    )
+
+                    frames: list[dict[str, Any]] = []
+                    sid2: str | None = None
+                    for _ in range(30):
+                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                        frames.append(msg)
+                        if msg.get("type") == "card" and msg.get("suggestion_id") != sid1:
+                            sid2 = str(msg["suggestion_id"])
+                            break
+                    assert sid2 is not None
+
+                    # No stale card frame for sid1 and no sid1 state after active_card=None
+                    assert not any(
+                        f.get("type") == "card" and f.get("suggestion_id") == sid1 for f in frames
+                    ), frames
+                    cleared_idx = next(
+                        (
+                            i
+                            for i, f in enumerate(frames)
+                            if f.get("type") == "state" and f.get("active_card") is None
+                        ),
+                        None,
+                    )
+                    assert cleared_idx is not None, frames
+                    for f in frames[cleared_idx + 1 :]:
+                        if f.get("type") == "state" and isinstance(f.get("active_card"), dict):
+                            assert f["active_card"].get("suggestion_id") != sid1
+
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "action",
+                                "action": "dismiss",
+                                "suggestion_id": sid2,
+                                "key": "2",
+                            }
+                        )
+                    )
+                    await ctrl.drain()
+            finally:
+                await ctrl.stop()
+
+            sugs = {s["suggestion_id"]: s for s in store.get_suggestions(sid, rid)}
+            assert sid1 in sugs and sid2 in sugs
+            t1_list = json.loads(sugs[sid1]["transitions_json"])
+            assert any(t["transition"] == LedgerState.PINNED.value for t in t1_list)
+            assert sugs[sid1]["current_state"] == LedgerState.DISMISSED.value
+            assert sugs[sid2]["current_state"] == LedgerState.DISMISSED.value
+            fb_reasons = {f["feedback_reason"] for f in store.get_feedback(sid, rid)}
+            assert fb_reasons == {"too_late", "already_answered"}
+            assert check_conservation_invariants(store, sid, rid).passed
+    finally:
+        await ui_srv.stop()
+
+
+async def test_next_display_wake_ms_and_live_retirement_in_no_transcript(tmp_path: Path) -> None:
+    base_pol = _policy()
+    policy = replace(base_pol, display=replace(base_pol.display, max_candidate_age_ms=500))
+    sid = "sess-no-tx-wake"
+    rid = "run-no-tx-wake"
+    clock = ManualClock(0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    inner = create_classifier("rules_v0", clock_ms=clock.now_ms)
+
+    class _GatedClf:
+        classifier_version = inner.classifier_version
+        tokenizer = inner.tokenizer
+
+        async def classify_batch(
+            self, contexts: Sequence[Any], *, deadline_ms: int | None = None
+        ) -> list[ClassifierResult]:
+            entered.set()
+            await release.wait()
+            return await inner.classify_batch(contexts, deadline_ms=deadline_ms)
+
+    with SQLiteStore(tmp_path / "no_tx_wake.db") as store:
+        ctrl = SuggestionController(
+            brief=_brief(session_id=sid),
+            policy=policy,
+            classifier=_GatedClf(),
+            clock=clock,
+            store=store,
+            run_id=rid,
+        )
+        try:
+            await ctrl.start()
+            clock.set_ms(100)
+            await ctrl.submit_event(
+                _seg(
+                    sid,
+                    "e0",
+                    "s0",
+                    "Someone should own staging.",
+                    rx_ms=100,
+                    start_ms=50,
+                    end_ms=90,
+                    seq=1,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            clock.set_ms(200)
+            await ctrl.submit_event(
+                _seg(
+                    sid,
+                    "e1",
+                    "s1",
+                    "Someone should own rollback.",
+                    rx_ms=200,
+                    start_ms=150,
+                    end_ms=190,
+                    seq=2,
+                )
+            )
+            await ctrl._ingest_queue.join()
+            clock.set_ms(600)
+            await ctrl.submit_event(
+                _seg(
+                    sid,
+                    "e2",
+                    "s2",
+                    "Someone should own cutover.",
+                    rx_ms=600,
+                    start_ms=550,
+                    end_ms=590,
+                    seq=3,
+                )
+            )
+            await ctrl._ingest_queue.join()
+            await ctrl.report_adapter_health(HealthState.NO_TRANSCRIPT, "peecee_tunnel_lost")
+            clock.set_ms(800)
+            assert not ctrl._proactive_idle.is_set()
+            assert ctrl._next_display_wake_ms() is None
+
+            release.set()
+            await ctrl.drain()
+            await ctrl.tick()
+            # s1 (display_by=700 <= 800) retired; s2 (display_by=1100 > 800) scheduled
+            assert ctrl._next_display_wake_ms() == 1100
+        finally:
+            release.set()
+            await ctrl.stop()
+
+    # Live _display_loop timer auto-retires uncovered anchor without manual tick()
+    live_policy = replace(base_pol, display=replace(base_pol.display, max_candidate_age_ms=80))
+    live_clock = MonotonicSessionClock()
+    live_entered = asyncio.Event()
+    live_release = asyncio.Event()
+
+    class _LiveGatedClf:
+        classifier_version = inner.classifier_version
+        tokenizer = inner.tokenizer
+
+        async def classify_batch(
+            self, contexts: Sequence[Any], *, deadline_ms: int | None = None
+        ) -> list[ClassifierResult]:
+            live_entered.set()
+            await live_release.wait()
+            return await inner.classify_batch(contexts, deadline_ms=deadline_ms)
+
+    with SQLiteStore(tmp_path / "no_tx_live.db") as store2:
+        ctrl2 = SuggestionController(
+            brief=_brief(session_id="sess-no-tx-live"),
+            policy=live_policy,
+            classifier=_LiveGatedClf(),
+            clock=live_clock,
+            store=store2,
+            run_id="run-no-tx-live",
+        )
+        try:
+            await ctrl2.start()
+            t0 = live_clock.now_ms()
+            await ctrl2.submit_event(
+                _seg(
+                    "sess-no-tx-live",
+                    "e0",
+                    "s0",
+                    "Someone should own staging.",
+                    rx_ms=t0,
+                    start_ms=max(0, t0 - 30),
+                    end_ms=max(1, t0 - 5),
+                    seq=1,
+                )
+            )
+            await asyncio.wait_for(live_entered.wait(), timeout=2.0)
+            t1 = live_clock.now_ms()
+            await ctrl2.submit_event(
+                _seg(
+                    "sess-no-tx-live",
+                    "e1",
+                    "s1",
+                    "Someone should own rollback.",
+                    rx_ms=t1,
+                    start_ms=max(0, t1 - 20),
+                    end_ms=max(1, t1 - 2),
+                    seq=2,
+                )
+            )
+            await ctrl2._ingest_queue.join()
+            await ctrl2.report_adapter_health(HealthState.NO_TRANSCRIPT, "lost")
+            live_release.set()
+            await asyncio.sleep(0.25)
+            await ctrl2.flush_recorder()
+            decs = {
+                d["anchor_refs_json"]: d
+                for d in store2.get_decisions("sess-no-tx-live", "run-no-tx-live")
+            }
+            assert any(
+                "s1" in k and v["terminal_reason"] == ReasonCode.EXPIRED_UNEVALUATED.value
+                for k, v in decs.items()
+            )
+            assert ctrl2._next_display_wake_ms() is None
+        finally:
+            live_release.set()
+            await ctrl2.stop()
+        assert check_conservation_invariants(store2, "sess-no-tx-live", "run-no-tx-live").passed

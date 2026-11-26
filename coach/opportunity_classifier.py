@@ -528,10 +528,17 @@ _OWNER_TOPIC_STOP: frozenset[str] = frozenset(
 )
 
 
+_CTX_LINE_PREFIX_RE = re.compile(
+    r"^(?:(?:<\d+[sm]|older)\s+)?(?:ME|S\d+|S\?):\s*",
+    re.MULTILINE,
+)
+
+
 def _owner_topic_words(text: str) -> set[str]:
+    cleaned = _CTX_LINE_PREFIX_RE.sub("", text.strip())
     return {
         w
-        for w in normalize_for_matching(text).split()
+        for w in normalize_for_matching(cleaned).split()
         if len(w) >= 3 and w not in _OWNER_TOPIC_STOP and not re.fullmatch(r"s\d+", w)
     }
 
@@ -583,9 +590,10 @@ _TIME_TOPIC_STOP: frozenset[str] = _OWNER_TOPIC_STOP | frozenset(
 
 
 def _time_topic_words(text: str) -> set[str]:
+    cleaned = _CTX_LINE_PREFIX_RE.sub("", text.strip())
     return {
         w
-        for w in normalize_for_matching(text).split()
+        for w in normalize_for_matching(cleaned).split()
         if len(w) >= 3 and w not in _TIME_TOPIC_STOP and not re.fullmatch(r"s\d+|\d+", w)
     }
 
@@ -747,7 +755,7 @@ class RulesClassifier(_BaseOpportunityClassifier):
             for ctx_line in sections["CONTEXT"].splitlines():
                 if _TIME_RESOLVED_RE.search(ctx_line):
                     ctx_topics = _time_topic_words(ctx_line)
-                    if not anc_topics or not ctx_topics or (anc_topics & ctx_topics):
+                    if not anc_topics or (anc_topics & ctx_topics):
                         time_resolved = True
                         break
         if (
