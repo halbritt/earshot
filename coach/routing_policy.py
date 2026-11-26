@@ -538,7 +538,32 @@ def route_candidate(
             reason_codes=(ReasonCode.PROACTIVE_DISABLED,),
         )
 
-    # 2. Classifier error / mode_mismatch / input_overflow
+    # 2. Deterministic anchor safety & recipient-speaker invariants (never masked by classifier/overflow)
+    if _matches_do_not_suggest(anchor_text_eff, None, snapshot.brief) is not None:
+        return _make_decision(
+            context,
+            policy,
+            outcome=Outcome.SUPPRESS,
+            decided_ms=decided_ms,
+            reason_codes=(ReasonCode.DO_NOT_SUGGEST,),
+        )
+
+    recipient_ids = {"ME", snapshot.brief.recipient.participant_id}
+    if any(
+        (seg := snapshot.segments_by_id.get(r.segment_id)) is not None
+        and seg.speaker_id in recipient_ids
+        for r in context.anchor_refs
+    ):
+        return _make_decision(
+            context,
+            policy,
+            outcome=Outcome.ABSTAIN,
+            decided_ms=decided_ms,
+            reason_codes=(ReasonCode.SPEAKER_UNCERTAIN,),
+            abstain_reasons=(ReasonCode.SPEAKER_UNCERTAIN,),
+        )
+
+    # 3. Classifier error / mode_mismatch / input_overflow
     if (
         classifier_error
         or classifier_result is None
@@ -579,15 +604,7 @@ def route_candidate(
             abstain_reasons=(ReasonCode.INPUT_OVERFLOW,),
         )
 
-    # 3. Anchor-level do_not_suggest & known_fact suppression
-    if _matches_do_not_suggest(anchor_text_eff, None, snapshot.brief) is not None:
-        return _make_decision(
-            context,
-            policy,
-            outcome=Outcome.SUPPRESS,
-            decided_ms=decided_ms,
-            reason_codes=(ReasonCode.DO_NOT_SUGGEST,),
-        )
+    # 4. Anchor-level known_fact suppression & proactive input-quality abstentions
     if not is_manual and _matches_known_fact(anchor_text_eff, snapshot.brief) is not None:
         return _make_decision(
             context,
@@ -597,8 +614,6 @@ def route_candidate(
             reason_codes=(ReasonCode.KNOWN_FACT,),
         )
 
-    # 4. Input-quality abstentions (proactive) + recipient-flip guard (proactive & manual)
-    recipient_ids = {"ME", snapshot.brief.recipient.participant_id}
     if not is_manual:
         input_abstain = _detect_input_abstain_reasons(
             context,
@@ -616,19 +631,6 @@ def route_candidate(
                 reason_codes=tuple(input_abstain),
                 abstain_reasons=tuple(input_abstain),
             )
-    elif any(
-        (seg := snapshot.segments_by_id.get(r.segment_id)) is not None
-        and seg.speaker_id in recipient_ids
-        for r in context.anchor_refs
-    ):
-        return _make_decision(
-            context,
-            policy,
-            outcome=Outcome.ABSTAIN,
-            decided_ms=decided_ms,
-            reason_codes=(ReasonCode.SPEAKER_UNCERTAIN,),
-            abstain_reasons=(ReasonCode.SPEAKER_UNCERTAIN,),
-        )
 
     # 5. Score selection & threshold checks
     scores = classifier_result.calibrated_scores

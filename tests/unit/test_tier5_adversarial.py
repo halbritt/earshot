@@ -45,6 +45,7 @@ from coach.contracts import (
     LedgerState,
     Mode,
     Origin,
+    Outcome,
     ReasonCode,
     RecipientConfig,
     RetentionConfig,
@@ -82,7 +83,7 @@ from coach.replay_evaluator import (
     async_sweep_t_display,
     simulate_replay,
 )
-from coach.routing_policy import load_policy
+from coach.routing_policy import load_policy, route_candidate
 from coach.storage import SQLiteStore
 from coach.suggestion_controller import SuggestionController
 from coach.telemetry import check_conservation_invariants
@@ -5496,3 +5497,494 @@ async def test_dataset_replay_manual_fallback_parity() -> None:
             assert check_conservation_invariants(db_ho, "ds-man-fb", "ds-man-to-ho").passed
     finally:
         await prov_probe.aclose()
+
+
+@pytest.mark.asyncio
+async def test_manual_fallback_blocks_do_not_suggest_across_health_states() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+    )
+
+    class _HitClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierResult]:
+            out: list[ClassifierResult] = []
+            for raw in contexts:
+                ctx = coerce_classifier_input(raw).context
+                sc = ScoreSet(opportunity=0.95, categories={"CONFIRM_OWNER": 0.95})
+                out.append(
+                    ClassifierResult(
+                        schema_version=SCHEMA_VERSION,
+                        candidate_id=ctx.candidate_id,
+                        based_on_state_version=ctx.based_on_state_version,
+                        classifier_version=self.classifier_version,
+                        raw_scores=sc,
+                        calibration_version=policy.classifier.calibration,
+                        calibrated_scores=sc,
+                        latency_ms=1.0,
+                        input_refs=ctx.anchor_refs,
+                    )
+                )
+            return out
+
+    class _ErrClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierErrorResult]:
+            return [
+                make_classifier_error_result(
+                    coerce_classifier_input(raw).context,
+                    self.classifier_version,
+                    error="backend_error",
+                    retryable=False,
+                )
+                for raw in contexts
+            ]
+
+    def _paraphrase_gen(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "question": "Who will own that item right now?",
+                                    "evidence_segment_ids": ["seg-dns"],
+                                    "decline_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 25, "completion_tokens": 10},
+            },
+        )
+
+    cases: list[tuple[str, HealthState, Any]] = [
+        ("ok-hit", HealthState.OK, _HitClf()),
+        ("ok-err", HealthState.OK, _ErrClf()),
+        ("manual-only", HealthState.MANUAL_ONLY, _HitClf()),
+    ]
+    for tag, init_health, clf in cases:
+        sid = f"man-dns-{tag}"
+        run_id = f"r-{tag}"
+        brief = SessionBrief(
+            schema_version=SCHEMA_VERSION,
+            session_id=sid,
+            mode=policy.mode,
+            objective="Ship v1",
+            recipient=RecipientConfig("speaker-me"),
+            do_not_suggest=("forbidden_topic",),
+        )
+        clk = ManualClock(1000)
+        db = SQLiteStore(":memory:")
+        prov = ProviderAdapter(
+            ProviderConfig(
+                provider="local",
+                base_url="http://127.0.0.1:8000/v1",
+                model_id="qwen3:14b",
+                local_only=True,
+                use_streaming=False,
+            ),
+            transport=httpx.MockTransport(_paraphrase_gen),
+        )
+        ctrl = SuggestionController(
+            brief=brief,
+            policy=policy,
+            classifier=clf,
+            provider=prov,
+            store=db,
+            run_id=run_id,
+            mode=Mode.PROACTIVE,
+            clock=clk,
+        )
+        await ctrl.start()
+        try:
+            if init_health is not HealthState.OK:
+                async with ctrl._state_lock:
+                    ctrl._set_health(init_health, "test_setup")
+            await ctrl.submit_event(
+                _seg_ev(
+                    sid,
+                    "ev-dns",
+                    "seg-dns",
+                    "Someone needs to own forbidden_topic right now.",
+                    speaker="speaker-a",
+                    rx_ms=1000,
+                    start_ms=500,
+                    end_ms=900,
+                    seq=1,
+                )
+            )
+            await ctrl.drain()
+            res = await ctrl.trigger_manual()
+            assert res.status == "empty", (tag, res)
+            assert res.reason is ReasonCode.DO_NOT_SUGGEST, (tag, res)
+            assert ctrl.active_card is None
+            await ctrl.drain()
+        finally:
+            await ctrl.stop()
+            await prov.aclose()
+        assert db.get_egress_records(sid, run_id) == []
+        decs = db.get_decisions(sid, run_id)
+        man_decs = [d for d in decs if d.get("origin") == "manual"]
+        assert len(man_decs) == 1
+        assert man_decs[0]["terminal_state"] == "suppressed"
+        assert man_decs[0]["terminal_reason"] == ReasonCode.DO_NOT_SUGGEST.value
+        assert check_conservation_invariants(db, sid, run_id).passed
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_route_candidate_and_dataset_replay_dns_on_classifier_error() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+    )
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="ds-dns-err",
+        mode=policy.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+        do_not_suggest=("forbidden_topic",),
+    )
+    st = CanonicalState(brief)
+    st.apply(
+        _seg_ev(
+            "ds-dns-err",
+            "ev-dns",
+            "seg-dns",
+            "Someone needs to own forbidden_topic right now.",
+            speaker="speaker-a",
+            rx_ms=1000,
+            start_ms=500,
+            end_ms=900,
+            seq=1,
+        )
+    )
+    st.apply(
+        _seg_ev(
+            "ds-dns-err",
+            "ev-me",
+            "seg-me",
+            "Someone needs to own deployment checklist.",
+            speaker="speaker-me",
+            rx_ms=2000,
+            start_ms=1500,
+            end_ms=1900,
+            seq=2,
+        )
+    )
+    snap = st.snapshot()
+    b_pro_dns = build_decision_context(snap, [snap.segments_by_id["seg-dns"]], policy=policy)
+    b_man_dns = build_decision_context(
+        snap, [snap.segments_by_id["seg-dns"]], policy=policy, origin=Origin.MANUAL
+    )
+    b_man_me = build_decision_context(
+        snap, [snap.segments_by_id["seg-me"]], policy=policy, origin=Origin.MANUAL
+    )
+    assert b_pro_dns.context is not None and b_pro_dns.serialized_text is not None
+    assert b_man_dns.context is not None and b_man_dns.serialized_text is not None
+    assert b_man_me.context is not None and b_man_me.serialized_text is not None
+
+    err_dns = make_classifier_error_result(
+        b_man_dns.context, policy.classifier.version, error="timeout", retryable=True
+    )
+    err_me = make_classifier_error_result(
+        b_man_me.context, policy.classifier.version, error="timeout", retryable=True
+    )
+    rt_dns = route_candidate(b_man_dns.context, err_dns, snap, policy)
+    assert rt_dns.outcome is Outcome.SUPPRESS
+    assert rt_dns.reason_codes == (ReasonCode.DO_NOT_SUGGEST,)
+    rt_me = route_candidate(b_man_me.context, err_me, snap, policy)
+    assert rt_me.outcome is Outcome.ABSTAIN
+    assert rt_me.reason_codes == (ReasonCode.SPEAKER_UNCERTAIN,)
+
+    overflow_dns = replace(
+        b_man_dns.context, flags={**b_man_dns.context.flags, "input_overflow": True}
+    )
+    assert route_candidate(overflow_dns, err_dns, snap, policy).outcome is Outcome.SUPPRESS
+
+    class _ErrClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierErrorResult]:
+            return [
+                make_classifier_error_result(
+                    coerce_classifier_input(raw).context,
+                    self.classifier_version,
+                    error="backend_error",
+                    retryable=False,
+                )
+                for raw in contexts
+            ]
+
+    def _paraphrase_gen(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "question": "Who will own that item right now?",
+                                    "evidence_segment_ids": ["seg-dns"],
+                                    "decline_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 25, "completion_tokens": 10},
+            },
+        )
+
+    man_dns_ctx = replace(
+        b_man_dns.context, candidate_id="man-dns-1", anchor_received_ms=1000, display_by_ms=13000
+    )
+    rows = [
+        {"context": b_pro_dns.context.to_dict(), "serialized_text": b_pro_dns.serialized_text},
+        {"context": man_dns_ctx.to_dict(), "serialized_text": b_man_dns.serialized_text},
+    ]
+    prov = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+        ),
+        transport=httpx.MockTransport(_paraphrase_gen),
+    )
+    try:
+        with SQLiteStore(":memory:") as db:
+            res = await async_simulate_dataset_replay(
+                rows,
+                policy,
+                _ErrClf(),  # type: ignore[arg-type]
+                brief=brief,
+                store=db,
+                run_id="ds-dns-err-run",
+                provider=prov,
+                health=HealthState.OK,
+                cache_classifier=False,
+            )
+            assert res[0].displayed_cards == ()
+            assert db.get_egress_records("ds-dns-err", "ds-dns-err-run") == []
+            decs = db.get_decisions("ds-dns-err", "ds-dns-err-run")
+            man_dec = next(d for d in decs if d["origin"] == "manual")
+            assert man_dec["outcome"] == Outcome.SUPPRESS.value
+            assert man_dec["terminal_state"] == "suppressed"
+            assert man_dec["terminal_reason"] == ReasonCode.DO_NOT_SUGGEST.value
+            assert check_conservation_invariants(db, "ds-dns-err", "ds-dns-err-run").passed
+    finally:
+        await prov.aclose()
+
+
+@pytest.mark.asyncio
+async def test_dataset_replay_reconstructs_me_and_uncertain_anchor_speakers() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+    )
+
+    class _HitClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierResult]:
+            out: list[ClassifierResult] = []
+            for raw in contexts:
+                ctx = coerce_classifier_input(raw).context
+                sc = ScoreSet(opportunity=0.95, categories={"CONFIRM_OWNER": 0.95})
+                out.append(
+                    ClassifierResult(
+                        schema_version=SCHEMA_VERSION,
+                        candidate_id=ctx.candidate_id,
+                        based_on_state_version=ctx.based_on_state_version,
+                        classifier_version=self.classifier_version,
+                        raw_scores=sc,
+                        calibration_version=policy.classifier.calibration,
+                        calibrated_scores=sc,
+                        latency_ms=1.0,
+                        input_refs=ctx.anchor_refs,
+                    )
+                )
+            return out
+
+    class _ErrClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierErrorResult]:
+            return [
+                make_classifier_error_result(
+                    coerce_classifier_input(raw).context,
+                    self.classifier_version,
+                    error="backend_error",
+                    retryable=False,
+                )
+                for raw in contexts
+            ]
+
+    def _ok_gen(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "question": "Who will own deployment checklist?",
+                                    "evidence_segment_ids": ["seg-me"],
+                                    "decline_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 25, "completion_tokens": 10},
+            },
+        )
+
+    for tag, clf in [("hit", _HitClf()), ("err", _ErrClf())]:
+        sid = f"ds-me-{tag}"
+        run_id = f"r-{tag}"
+        brief = SessionBrief(
+            schema_version=SCHEMA_VERSION,
+            session_id=sid,
+            mode=policy.mode,
+            objective="Ship v1",
+            recipient=RecipientConfig("speaker-me"),
+        )
+        st = CanonicalState(brief)
+        st.apply(
+            _seg_ev(
+                sid,
+                "ev-me",
+                "seg-me",
+                "Someone needs to own deployment checklist.",
+                speaker="ME",
+                rx_ms=1000,
+                start_ms=500,
+                end_ms=900,
+                seq=1,
+            )
+        )
+        snap = st.snapshot()
+        b_man = build_decision_context(
+            snap, [snap.segments_by_id["seg-me"]], policy=policy, origin=Origin.MANUAL
+        )
+        assert b_man.context is not None and b_man.serialized_text is not None
+        assert "[ANCHOR] ME:" in b_man.serialized_text
+        rows = [{"context": b_man.context.to_dict(), "serialized_text": b_man.serialized_text}]
+
+        prov = ProviderAdapter(
+            ProviderConfig(
+                provider="local",
+                base_url="http://127.0.0.1:8000/v1",
+                model_id="qwen3:14b",
+                local_only=True,
+                use_streaming=False,
+            ),
+            transport=httpx.MockTransport(_ok_gen),
+        )
+        try:
+            with SQLiteStore(":memory:") as db:
+                res = await async_simulate_dataset_replay(
+                    rows,
+                    policy,
+                    clf,  # type: ignore[arg-type]
+                    brief=brief,
+                    store=db,
+                    run_id=run_id,
+                    provider=prov,
+                    health=HealthState.OK,
+                    cache_classifier=False,
+                )
+                assert res[0].displayed_cards == ()
+                assert db.get_egress_records(sid, run_id) == []
+                ev_rows = db.get_events(sid, run_id)
+                assert len(ev_rows) == 1
+                assert ev_rows[0]["speaker_id"] == "ME"
+                assert ev_rows[0]["channel"] == 0
+                decs = db.get_decisions(sid, run_id)
+                assert len(decs) == 1
+                assert decs[0]["outcome"] == Outcome.ABSTAIN.value
+                assert decs[0]["terminal_state"] == "abstained"
+                assert decs[0]["terminal_reason"] == ReasonCode.SPEAKER_UNCERTAIN.value
+                assert check_conservation_invariants(db, sid, run_id).passed
+        finally:
+            await prov.aclose()
+
+    # [ANCHOR] S?: ... on Origin.PROACTIVE reconstructs speaker_id="S?" + speaker_uncertain=True
+    sid_u = "ds-spk-q"
+    brief_u = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id=sid_u,
+        mode=policy.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+    )
+    st_u = CanonicalState(brief_u)
+    st_u.apply(
+        _seg_ev(
+            sid_u,
+            "ev-q",
+            "seg-q",
+            "Someone needs to own deployment checklist.",
+            speaker="S?",
+            rx_ms=1000,
+            start_ms=500,
+            end_ms=900,
+            seq=1,
+        )
+    )
+    snap_u = st_u.snapshot()
+    b_pro_q = build_decision_context(snap_u, [snap_u.segments_by_id["seg-q"]], policy=policy)
+    assert b_pro_q.context is not None and b_pro_q.serialized_text is not None
+    assert "[ANCHOR] S?:" in b_pro_q.serialized_text
+    with SQLiteStore(":memory:") as db_u:
+        res_u = await async_simulate_dataset_replay(
+            [{"context": b_pro_q.context.to_dict(), "serialized_text": b_pro_q.serialized_text}],
+            policy,
+            _HitClf(),  # type: ignore[arg-type]
+            brief=brief_u,
+            store=db_u,
+            run_id="r-q",
+            cache_classifier=False,
+        )
+        assert res_u[0].displayed_cards == ()
+        ev_u = db_u.get_events(sid_u, "r-q")
+        assert ev_u[0]["speaker_id"] == "S?"
+        assert json.loads(ev_u[0]["payload_json"])["speaker_uncertain"] is True
+        decs_u = db_u.get_decisions(sid_u, "r-q")
+        assert decs_u[0]["outcome"] == Outcome.ABSTAIN.value
+        assert decs_u[0]["terminal_reason"] == ReasonCode.SPEAKER_UNCERTAIN.value
+        assert check_conservation_invariants(db_u, sid_u, "r-q").passed

@@ -75,7 +75,12 @@ from coach.opportunity_classifier import (
 )
 from coach.provider_adapter import BreakerState, ProviderAdapter
 from coach.question_generator import generate_question
-from coach.routing_policy import is_equivalent_question, matches_resolution_cue, route_candidate
+from coach.routing_policy import (
+    _matches_do_not_suggest,
+    is_equivalent_question,
+    matches_resolution_cue,
+    route_candidate,
+)
 from coach.storage import SQLiteStore
 from coach.template_renderer import (
     TemplateSpec,
@@ -2407,6 +2412,46 @@ def _extract_anchor_text_from_serialized(serialized_text: str) -> str:
     return joined
 
 
+def _extract_anchor_role_from_serialized(serialized_text: str) -> str | None:
+    lines: list[str] = []
+    in_anchor = False
+    for raw_line in serialized_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "[ANCHOR]" or line.startswith("[ANCHOR] "):
+            in_anchor = True
+            rest = line[len("[ANCHOR]") :].strip()
+            if rest:
+                lines.append(rest)
+            continue
+        if in_anchor:
+            if re.match(r"^\[[A-Z_]+\](?:\s|$)", line):
+                break
+            lines.append(line)
+    joined = " ".join(lines).strip()
+    if not joined or ":" not in joined:
+        return None
+    prefix, _rest = joined.split(":", 1)
+    cand_role = prefix.strip()
+    if re.fullmatch(r"(?:S\d+|S\?|ME|[A-Za-z0-9_-]{1,32})", cand_role):
+        return cand_role
+    return None
+
+
+def _resolve_dataset_speaker(
+    role: str | None,
+    recipient_ids: frozenset[str],
+) -> tuple[str, int, bool]:
+    if role is not None and (role == "ME" or role in recipient_ids):
+        return (role, 0, False)
+    if role == "S?":
+        return ("S?", 1, True)
+    if role is not None and re.fullmatch(r"S\d+", role):
+        return (role, 1, False)
+    return ("S1", 1, False)
+
+
 _CONTEXT_TURN_RE = re.compile(
     r"^(?:(?:<\d+[sm]|older)\s+)?(ME|S\d+|S\?|[A-Za-z0-9_-]{1,32}):\s*(.*)$"
 )
@@ -2601,8 +2646,11 @@ def _ensure_dataset_segment_revs(
     retention: RetentionConfig,
     store: SQLiteStore | None,
     is_context: bool,
+    recipient_ids: frozenset[str] = frozenset({"ME"}),
+    anchor_role: str | None = None,
     anchor_seg_revs: set[tuple[str, int]] | None = None,
     anchor_text_by_ref: Mapping[tuple[str, int], str] | None = None,
+    anchor_role_by_ref: Mapping[tuple[str, int], str] | None = None,
     context_turns: Sequence[tuple[str, str]] | None = None,
 ) -> int:
     use_ctx_turns = is_context and context_turns is not None and len(context_turns) == len(refs)
@@ -2620,20 +2668,23 @@ def _ensure_dataset_segment_revs(
                     anchor_seg_revs is not None and (ref.segment_id, rev) in anchor_seg_revs
                 )
                 if is_anchor_rev:
-                    eff_speaker = role_label if re.fullmatch(r"S\d+", role_label) else "S1"
-                    eff_channel = 1
+                    eff_role = (
+                        anchor_role_by_ref.get((ref.segment_id, rev))
+                        if anchor_role_by_ref is not None
+                        else None
+                    ) or role_label
+                    eff_speaker, eff_channel, eff_uncertain = _resolve_dataset_speaker(
+                        eff_role, recipient_ids
+                    )
                     resolved_text = (
                         anchor_text_by_ref.get((ref.segment_id, rev))
                         if anchor_text_by_ref is not None
                         else None
                     ) or turn_text
                 else:
-                    eff_speaker = (
-                        "ME"
-                        if role_label == "ME"
-                        else (role_label if re.fullmatch(r"S\d+", role_label) else "S1")
+                    eff_speaker, eff_channel, eff_uncertain = _resolve_dataset_speaker(
+                        role_label, recipient_ids
                     )
-                    eff_channel = 0 if eff_speaker == "ME" else 1
                     resolved_text = turn_text
                 seg_text = (
                     resolved_text
@@ -2642,8 +2693,9 @@ def _ensure_dataset_segment_revs(
                 )
                 should_record = is_anchor_rev
             else:
-                eff_speaker = "S1"
-                eff_channel = 1
+                eff_speaker, eff_channel, eff_uncertain = _resolve_dataset_speaker(
+                    anchor_role, recipient_ids
+                )
                 seg_text = (
                     text
                     if (rev == ref.revision and text)
@@ -2665,6 +2717,7 @@ def _ensure_dataset_segment_revs(
                 stability=Stability.COMMITTED,
                 channel=eff_channel,
                 speaker_id=eff_speaker,
+                speaker_uncertain=eff_uncertain,
                 start_ms=start_ms,
                 end_ms=end_ms,
                 text=seg_text,
@@ -2721,15 +2774,20 @@ async def _simulate_one_dataset_session(
     withdrawn_count = 0
     expired_count = 0
 
+    recipient_ids = frozenset({"ME", sess_brief.recipient.participant_id})
     anchor_seg_revs: set[tuple[str, int]] = set()
     anchor_text_by_ref: dict[tuple[str, int], str] = {}
+    anchor_role_by_ref: dict[tuple[str, int], str] = {}
     for cin_item, _ in items:
         item_anchor_text = _extract_anchor_text_from_serialized(cin_item.serialized_text)
+        item_anchor_role = _extract_anchor_role_from_serialized(cin_item.serialized_text)
         for r in cin_item.context.anchor_refs:
             key = (r.segment_id, r.revision)
             anchor_seg_revs.add(key)
             if item_anchor_text and key not in anchor_text_by_ref:
                 anchor_text_by_ref[key] = item_anchor_text
+            if item_anchor_role and key not in anchor_role_by_ref:
+                anchor_role_by_ref[key] = item_anchor_role
 
     rx_times = [c.context.anchor_received_ms for c, _ in items]
     started_ms = min(rx_times, default=0)
@@ -2749,6 +2807,7 @@ async def _simulate_one_dataset_session(
     for cin, clf_raw in items:
         ctx = cin.context
         anchor_text = _extract_anchor_text_from_serialized(cin.serialized_text)
+        anchor_role = _extract_anchor_role_from_serialized(cin.serialized_text)
         ctx_turns = _extract_context_turns_from_serialized(cin.serialized_text)
         seq_counter = _ensure_dataset_segment_revs(
             state=state,
@@ -2762,8 +2821,10 @@ async def _simulate_one_dataset_session(
             retention=sess_brief.retention,
             store=store,
             is_context=True,
+            recipient_ids=recipient_ids,
             anchor_seg_revs=anchor_seg_revs,
             anchor_text_by_ref=anchor_text_by_ref,
+            anchor_role_by_ref=anchor_role_by_ref,
             context_turns=ctx_turns,
         )
         seq_counter = _ensure_dataset_segment_revs(
@@ -2778,6 +2839,8 @@ async def _simulate_one_dataset_session(
             retention=sess_brief.retention,
             store=store,
             is_context=False,
+            recipient_ids=recipient_ids,
+            anchor_role=anchor_role,
         )
         snap = state.snapshot()
         decisions_count += 1
@@ -2886,11 +2949,18 @@ async def _simulate_one_dataset_session(
             anchor_text=anchor_text or None,
             recent_displayed_ms=displayed_times,
         )
+        anchor_has_recipient = any(
+            (seg := snap.segments_by_id.get(r.segment_id)) is not None
+            and seg.speaker_id in recipient_ids
+            for r in ctx.anchor_refs
+        )
         if (
             is_manual
             and routing.outcome is not Outcome.ROUTE
             and routing.outcome is not Outcome.SUPPRESS
             and ReasonCode.SPEAKER_UNCERTAIN not in routing.reason_codes
+            and _matches_do_not_suggest(anchor_text or "", None, snap.brief) is None
+            and not anchor_has_recipient
             and (cur_health is not HealthState.TEMPLATE_ONLY or allow_fb_probe)
             and provider is not None
             and policy.generator.enabled

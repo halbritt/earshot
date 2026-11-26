@@ -61,7 +61,12 @@ from coach.opportunity_classifier import (
 )
 from coach.provider_adapter import BreakerState, ProviderAdapter
 from coach.question_generator import GenerationOutcome, generate_question
-from coach.routing_policy import is_equivalent_question, matches_resolution_cue, route_candidate
+from coach.routing_policy import (
+    _matches_do_not_suggest,
+    is_equivalent_question,
+    matches_resolution_cue,
+    route_candidate,
+)
 from coach.storage import SQLiteStore
 from coach.template_renderer import (
     TemplateSpec,
@@ -2156,6 +2161,13 @@ class SuggestionController:
                         scored_cands.append((s_val, built, clf_res, routing, a_txt))
                     else:
                         non_routed_manual.append((built, clf_res, routing))
+                        if (
+                            routing.outcome is Outcome.SUPPRESS
+                            or ReasonCode.SPEAKER_UNCERTAIN in routing.reason_codes
+                        ):
+                            rejected_cand_ids.add(ctx.candidate_id)
+                            if first_fail_reason is None and routing.reason_codes:
+                                first_fail_reason = routing.reason_codes[0]
                 valid_built_pairs = fresh_valid_pairs
                 scored_cands.sort(key=lambda x: x[0], reverse=True)
 
@@ -2531,9 +2543,62 @@ class SuggestionController:
                 cur_snap = self._state.snapshot()
                 allow_fb_probe = self._half_open_probe_ready()
                 if self._health is not HealthState.TEMPLATE_ONLY or allow_fb_probe:
+                    recipient_ids = {"ME", cur_snap.brief.recipient.participant_id}
+                    non_routed_cids = {
+                        b.context.candidate_id
+                        for b, _, _ in non_routed_manual
+                        if b.context is not None
+                    }
                     for b_cand, txt_cand in valid_built_pairs:
                         assert b_cand.context is not None
-                        if b_cand.context.candidate_id in rejected_cand_ids:
+                        cid = b_cand.context.candidate_id
+                        if cid in rejected_cand_ids:
+                            continue
+                        is_dns = _matches_do_not_suggest(txt_cand, None, cur_snap.brief) is not None
+                        is_rec = any(
+                            (seg := cur_snap.segments_by_id.get(r.segment_id)) is not None
+                            and seg.speaker_id in recipient_ids
+                            for r in b_cand.context.anchor_refs
+                        )
+                        if is_dns or is_rec:
+                            rej_reason = (
+                                ReasonCode.DO_NOT_SUGGEST
+                                if is_dns
+                                else ReasonCode.SPEAKER_UNCERTAIN
+                            )
+                            rejected_cand_ids.add(cid)
+                            if fb_empty_reason is None:
+                                fb_empty_reason = rej_reason
+                            if cid not in non_routed_cids:
+                                dummy_rej_clf = ClassifierResult(
+                                    schema_version=SCHEMA_VERSION,
+                                    candidate_id=cid,
+                                    based_on_state_version=cur_snap.state_version,
+                                    classifier_version=self._classifier.classifier_version,
+                                    raw_scores=ScoreSet(opportunity=0.0, categories={}),
+                                    calibration_version=None,
+                                    calibrated_scores=ScoreSet(opportunity=0.0, categories={}),
+                                    latency_ms=0.0,
+                                    input_refs=(
+                                        b_cand.context.anchor_refs + b_cand.context.context_refs
+                                    ),
+                                )
+                                rej_rt = RoutingDecision(
+                                    schema_version=SCHEMA_VERSION,
+                                    candidate_id=cid,
+                                    policy_version=self._policy.policy_version,
+                                    policy_sha256=self._policy.policy_sha256,
+                                    based_on_state_version=cur_snap.state_version,
+                                    outcome=Outcome.SUPPRESS if is_dns else Outcome.ABSTAIN,
+                                    route=None,
+                                    category=None,
+                                    reason_codes=(rej_reason,),
+                                    abstain_reasons=() if is_dns else (rej_reason,),
+                                    thresholds=None,
+                                    decided_ms=self._clock.now_ms(),
+                                )
+                                non_routed_manual.append((b_cand, dummy_rej_clf, rej_rt))
+                                non_routed_cids.add(cid)
                             continue
                         st = self._check_manual_staleness_locked(
                             ctx=b_cand.context,
