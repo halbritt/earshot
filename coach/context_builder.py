@@ -1298,7 +1298,7 @@ _OWNER_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _TIME_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"\b(?:deadline|target\s+date|timeline|eta)\s+(?:for|on)\s+"
+        r"\b(?:deadline|target\s+date|finish\s+date|due\s+date|timeline|eta)\s+(?:for|on)\s+"
         r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:before|by|until|soon|later|eventually|when|if|so|because)\b|$)",
         flags=re.IGNORECASE,
     ),
@@ -1317,7 +1317,7 @@ _TIME_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _PROPOSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"\b(?:define|confirm|check|agree\s+on|set)\s+(?:a\s+)?(?:test\s+criteri(?:on|a)|success\s+criteri(?:on|a)|acceptance\s+criteri(?:on|a))\s+(?:for|on)\s+"
+        r"\b(?:define|confirm|check|agree\s+on|set)\s+(?:a\s+)?(?:(?:test|success|acceptance)\s+criteri(?:on|a)|metric)\s+(?:for|on)\s+"
         r"(?P<span>.+?)(?=[.,!?;:]|\s+(?:except|excluding|including|only\s+for|up\s+to|within|outside\s+of|without|not\s+including|for\s+now|so|because|to\s+make|when|if)\b|$)",
         flags=re.IGNORECASE,
     ),

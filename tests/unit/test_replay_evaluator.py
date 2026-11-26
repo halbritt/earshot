@@ -40,6 +40,7 @@ from coach.replay_evaluator import (
     match_opportunities,
     paired_conversation_bootstrap,
     run_latency_benchmark,
+    simulate_dataset_replay,
     simulate_replay,
     split_by_conversation,
     split_by_series,
@@ -697,3 +698,72 @@ def test_simulate_replay_wakes_for_open_tail_anchor_display_by_before_far_future
         assert decs[0]["terminal_state"] == "retired"
         assert decs[0]["terminal_reason"] == "expired_unevaluated"
         assert decs[0]["based_on_state_version"] == 1
+
+
+def test_simulate_dataset_replay_caches_revisions_and_invariants(tmp_path: Path) -> None:
+    base_policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    policy = replace(
+        base_policy,
+        display=replace(base_policy.display, settle_ms=100, cooldown_ms=100),
+    )
+    clf = create_classifier("rules_v0")
+    brief = _brief(session_id="sess-ds-base", max_cards=3)
+    state = CanonicalState(_brief(session_id="sess-ds-1", max_cards=3))
+    state.apply(
+        _seg(
+            "s1",
+            "Someone should own the rollback plan.",
+            session_id="sess-ds-1",
+            start_ms=100,
+            end_ms=400,
+            received_ms=500,
+            seq=1,
+            boundary="utterance_end",
+        )
+    )
+    state.apply(
+        _seg(
+            "s1",
+            "Someone should own the DNS cutover plan.",
+            session_id="sess-ds-1",
+            start_ms=100,
+            end_ms=400,
+            received_ms=600,
+            seq=2,
+            rev=2,
+            boundary="utterance_end",
+        )
+    )
+    built = build_decision_contexts(state.snapshot(), policy=policy)
+    assert built[0].context is not None and built[0].serialized_text is not None
+    flat_row = {
+        **built[0].context.to_dict(),
+        "serialized_text": built[0].serialized_text,
+    }
+    nested_row = {
+        "context": {
+            **built[0].context.to_dict(),
+            "session_id": "sess-ds-2",
+            "candidate_id": "c-ds-2",
+        },
+        "serialized_text": built[0].serialized_text,
+    }
+    with SQLiteStore(tmp_path / "ds_replay.db") as store:
+        results = simulate_dataset_replay(
+            [flat_row, nested_row],
+            policy,
+            clf,
+            brief=brief,
+            store=store,
+            run_id="r-ds-1",
+        )
+        assert len(results) == 2
+        assert all(len(r.displayed_cards) == 1 for r in results)
+        assert (
+            store.get_cached_model_output(
+                built[0].context.serialized_sha256, clf.classifier_version
+            )
+            is not None
+        )
+        assert check_conservation_invariants(store, "sess-ds-1", "r-ds-1").passed
+        assert check_conservation_invariants(store, "sess-ds-2", "r-ds-1").passed

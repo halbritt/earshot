@@ -1123,3 +1123,97 @@ async def test_bug5_manual_unlocked_generator_staleness_b15_b18_b04_b22(tmp_path
     await _run_case("b04_rev")
     await _run_case("b22_speaker_update")
     await _run_case("manual_only_b15", manual_only=True)
+
+
+async def test_no_transcript_and_stop_retire_expired_uncovered_anchors(tmp_path: Path) -> None:
+    base_pol = _policy()
+    policy = replace(base_pol, display=replace(base_pol.display, max_candidate_age_ms=500))
+    sid = "sess-no-tx-retire"
+    rid = "run-no-tx-retire"
+    clock = ManualClock(0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    inner = create_classifier("rules_v0", clock_ms=clock.now_ms)
+
+    class _GatedClf:
+        classifier_version = inner.classifier_version
+        tokenizer = inner.tokenizer
+
+        async def classify_batch(
+            self, contexts: Sequence[Any], *, deadline_ms: int | None = None
+        ) -> list[ClassifierResult]:
+            entered.set()
+            await release.wait()
+            return await inner.classify_batch(contexts, deadline_ms=deadline_ms)
+
+    with SQLiteStore(tmp_path / "no_tx_retire.db") as store:
+        ctrl = SuggestionController(
+            brief=_brief(session_id=sid),
+            policy=policy,
+            classifier=_GatedClf(),
+            clock=clock,
+            store=store,
+            run_id=rid,
+        )
+        try:
+            await ctrl.start()
+            clock.set_ms(100)
+            await ctrl.submit_event(
+                _seg(
+                    sid,
+                    "e0",
+                    "s0",
+                    "Someone should own staging.",
+                    rx_ms=100,
+                    start_ms=50,
+                    end_ms=90,
+                    seq=1,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            clock.set_ms(200)
+            await ctrl.submit_event(
+                _seg(
+                    sid,
+                    "e1",
+                    "s1",
+                    "Someone should own rollback.",
+                    rx_ms=200,
+                    start_ms=150,
+                    end_ms=190,
+                    seq=2,
+                )
+            )
+            clock.set_ms(600)
+            await ctrl.submit_event(
+                _seg(
+                    sid,
+                    "e2",
+                    "s2",
+                    "Someone should own cutover.",
+                    rx_ms=600,
+                    start_ms=550,
+                    end_ms=590,
+                    seq=3,
+                )
+            )
+            await ctrl._ingest_queue.join()
+            await ctrl.report_adapter_health(HealthState.NO_TRANSCRIPT, "peecee_tunnel_lost")
+            clock.set_ms(800)
+            release.set()
+            await ctrl.drain()
+            await ctrl.tick()
+            await ctrl.flush_recorder()
+            decs_after_tick = {d["anchor_refs_json"]: d for d in store.get_decisions(sid, rid)}
+            assert any(
+                "s1" in k and v["terminal_reason"] == ReasonCode.EXPIRED_UNEVALUATED.value
+                for k, v in decs_after_tick.items()
+            )
+        finally:
+            await ctrl.stop()
+
+        decs = {d["anchor_refs_json"]: d for d in store.get_decisions(sid, rid)}
+        reasons = {d["terminal_reason"] for d in decs.values()}
+        assert ReasonCode.EXPIRED_UNEVALUATED.value in reasons
+        assert ReasonCode.SESSION_ENDED.value in reasons
+        assert check_conservation_invariants(store, sid, rid).passed

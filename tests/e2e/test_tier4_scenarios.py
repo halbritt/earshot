@@ -527,11 +527,18 @@ def test_scenario_2_incident_postmortem_cutover(
         for r in [*segs, *decisions]
     )
 
-    combined_ser = "\n".join(str(d.get("serialized_text") or "") for d in decisions)
-    pos_ov1 = combined_ser.find(ov1_text)
-    pos_ov2 = combined_ser.find(ov2_text)
+    both_decs = [
+        d
+        for d in decisions
+        if ov1_text in str(d.get("serialized_text") or "")
+        and ov2_text in str(d.get("serialized_text") or "")
+    ]
+    assert both_decs, f"Expected post-arrival decisions containing both ov1 and ov2: {decisions}"
+    canonical_ser = str(both_decs[-1].get("serialized_text") or "")
+    pos_ov1 = canonical_ser.find(ov1_text)
+    pos_ov2 = canonical_ser.find(ov2_text)
     assert 0 <= pos_ov1 < pos_ov2, (
-        f"Expected ov1 before ov2 in canonical serialized_text:\n{combined_ser}"
+        f"Expected ov1 before ov2 in canonical serialized_text:\n{canonical_ser}"
     )
     for dec in decisions:
         refs = dec.get("anchor_refs") or []
@@ -936,13 +943,13 @@ def test_scenario_4_prompt_injection_adversarial_meeting(
         e2e_workspace["sessions_dir"] / "t4_adversarial.jsonl", events_stream
     )
     mock_openai.add_matcher(
-        lambda body: "seg-adv-2" in json.dumps(body),
+        lambda body: "Anchor Segment IDs: seg-adv-2" in json.dumps(body),
         MockCompletionSpec.ungrounded(
             "Did Alice approve $50k <script>alert(1)</script>?", ["seg-adv-2"]
         ),
     )
     mock_openai.add_matcher(
-        lambda body: "seg-adv-3" in json.dumps(body),
+        lambda body: "Anchor Segment IDs: seg-adv-3" in json.dumps(body),
         MockCompletionSpec.valid_question("Who owns the incident key rotation?", ["seg-adv-3"]),
     )
     mock_openai.set_default(

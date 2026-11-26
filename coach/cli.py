@@ -81,6 +81,7 @@ from coach.replay_evaluator import (
     match_opportunities,
     paired_conversation_bootstrap,
     run_latency_benchmark,
+    simulate_dataset_replay,
     simulate_replay,
     split_by_conversation,
     split_by_series,
@@ -885,7 +886,10 @@ def _try_load_dataset_rows(session_path: str | Path) -> list[dict[str, Any]] | N
         obj = json.loads(stripped)
         if not isinstance(obj, Mapping):
             return None
-        if not rows and ("candidate_id" not in obj or "kind" in obj):
+        if not rows and not (
+            ("candidate_id" in obj and "serialized_text" in obj and "kind" not in obj)
+            or ("context" in obj and "serialized_text" in obj)
+        ):
             return None
         rows.append(dict(obj))
     return rows if rows else None
@@ -950,11 +954,64 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             if split_mode == "series"
             else split_by_conversation(dataset_rows)
         )
+        brief_opt = _load_brief_file(args.brief) if args.brief else None
+        clf_name = args.classifier or policy.classifier.version
+        model_dir = args.classifier_model_dir or policy.classifier.model_path
+        clf = _create_classifier_from_args(clf_name, model_dir, local_only=bool(args.local_only))
+        provider = _make_provider_from_args(args, policy)
+        mode = Mode(args.mode)
+        try:
+            with SQLiteStore(args.db) as store:
+                session_results = simulate_dataset_replay(
+                    dataset_rows,
+                    policy,
+                    clf,
+                    brief=brief_opt,
+                    calibration=cal_obj,
+                    store=store,
+                    run_id=run_id,
+                    mode=mode,
+                    provider=provider,
+                    simulated_latency_ms=args.simulated_latency_ms,
+                    cache_classifier=not args.no_cache,
+                )
+        finally:
+            if provider is not None:
+                asyncio.run(provider.aclose())
+        all_cards = [c for r in session_results for c in r.displayed_cards]
+        total_dur_ms = sum(r.duration_ms for r in session_results)
         payload: dict[str, Any] = {
             "run_id": run_id,
             "n_rows": len(dataset_rows),
             "splits": splits.to_dict(),
+            "duration_ms": total_dur_ms,
+            "decisions_count": sum(r.decisions_count for r in session_results),
+            "dropped_count": sum(r.dropped_count for r in session_results),
+            "routed_count": sum(r.routed_count for r in session_results),
+            "withdrawn_count": sum(r.withdrawn_count for r in session_results),
+            "expired_count": sum(r.expired_count for r in session_results),
+            "displayed_cards": [
+                {
+                    "suggestion_id": c.suggestion_id,
+                    "candidate_id": c.candidate_id,
+                    "session_id": c.session_id,
+                    "category": str(c.category),
+                    "display_ms": c.display_ms,
+                    "text": c.text,
+                    "route": str(c.route),
+                    "origin": str(c.origin),
+                }
+                for c in all_cards
+            ],
         }
+        if args.labels:
+            ds_labels = load_labels_jsonl(args.labels)
+            payload["evaluation"] = match_opportunities(
+                all_cards,
+                ds_labels,
+                settle_ms=policy.display.settle_ms,
+                duration_ms=total_dur_ms,
+            )
         if args.eval_log:
             looks = EvalLookCounter(args.eval_log).record_look(
                 run_id, split_by=split_mode, eval_conversations=splits.eval_conversations
@@ -964,7 +1021,10 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         _emit_output(
             payload,
             as_json=args.json,
-            summary_lines=[f"Dataset split ({split_mode}): {len(dataset_rows)} rows"],
+            summary_lines=[
+                f"Dataset replay ({split_mode}): {len(dataset_rows)} rows, "
+                f"decisions={payload['decisions_count']}, displayed={len(all_cards)}"
+            ],
         )
         return 0
 

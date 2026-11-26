@@ -536,6 +536,60 @@ def _owner_topic_words(text: str) -> set[str]:
     }
 
 
+_TIME_TOPIC_STOP: frozenset[str] = _OWNER_TOPIC_STOP | frozenset(
+    {
+        "finish",
+        "finished",
+        "target",
+        "date",
+        "deadline",
+        "timeline",
+        "eta",
+        "soon",
+        "when",
+        "ship",
+        "land",
+        "complete",
+        "deploy",
+        "deliver",
+        "launch",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "eod",
+        "eow",
+        "q1",
+        "q2",
+        "q3",
+        "q4",
+    }
+)
+
+
+def _time_topic_words(text: str) -> set[str]:
+    return {
+        w
+        for w in normalize_for_matching(text).split()
+        if len(w) >= 3 and w not in _TIME_TOPIC_STOP and not re.fullmatch(r"s\d+|\d+", w)
+    }
+
+
 _OWNER_MED_RE = re.compile(
     r"\b(?:own\s+the|own\s+this|take\s+care\s+of|follow\s+up\s+on|handle\s+the|pick\s+up\s+the)\b|"
     r"\b(?:double[\s-]+check|make\s+sure|confirm)\s+(?:that\s+)?.{1,60}\bis\s+covered\b",
@@ -549,8 +603,8 @@ _OWNER_RESOLVED_RE = re.compile(
 )
 
 _TIME_HIGH_RE = re.compile(
-    r"\b(?:by\s+when|when\s+(?:should|does|will|do\s+we)|target\s+date|deadline|eta\b|"
-    r"need\s+to\s+ship|must\s+ship|cutover\s+date|before\s+launch|timeline|"
+    r"\b(?:by\s+when|when\s+(?:should|does|will|do\s+we)|target\s+date|finish\s+date|due\s+date|"
+    r"deadline|eta\b|need\s+to\s+ship|must\s+ship|cutover\s+date|before\s+launch|timeline|"
     r"needs?\s+to\s+finish\s+soon)\b",
     re.IGNORECASE,
 )
@@ -571,6 +625,7 @@ _SUCCESS_HIGH_RE = re.compile(
     r"how\s+do\s+we\s+know|i\s+propose\s+we\s+adopt|we\s+should\s+adopt|adopt\s+canary|"
     r"canary\s+(?:acceptance|rollout\s+succeeded|rollout\s+works)|"
     r"(?:test|confirm|define)\s+(?:a\s+)?(?:test\s+)?criteri(?:on|a)|"
+    r"(?:define|confirm|set)\s+(?:a\s+)?metric\s+for|"
     r"check\s+how\s+the\s+canary\s+rollout\s+succeeded|review\s+the\s+canary\s+metrics)\b",
     re.IGNORECASE,
 )
@@ -684,10 +739,17 @@ class RulesClassifier(_BaseOpportunityClassifier):
             time_s = 0.84
         elif _TIME_MED_RE.search(anchor):
             time_s = 0.60
-        ctx_and_sugg = f"{sections['CONTEXT']}\n{sections['SUGGESTED']}"
         time_resolved = bool(
-            _TIME_RESOLVED_RE.search(anchor) or _TIME_RESOLVED_RE.search(ctx_and_sugg)
+            _TIME_RESOLVED_RE.search(anchor) or _TIME_RESOLVED_RE.search(sections["SUGGESTED"])
         )
+        if not time_resolved and sections["CONTEXT"]:
+            anc_topics = _time_topic_words(anchor)
+            for ctx_line in sections["CONTEXT"].splitlines():
+                if _TIME_RESOLVED_RE.search(ctx_line):
+                    ctx_topics = _time_topic_words(ctx_line)
+                    if not anc_topics or not ctx_topics or (anc_topics & ctx_topics):
+                        time_resolved = True
+                        break
         if (
             not time_resolved
             and _TIME_RESOLVED_RE.search(sections["KNOWN"])
@@ -698,7 +760,7 @@ class RulesClassifier(_BaseOpportunityClassifier):
                     re.IGNORECASE,
                 )
                 or not re.search(
-                    r"\b(?:deadline|target\s+date|migration|cutover)\b",
+                    r"\b(?:deadline|target\s+date|finish\s+date|due\s+date|migration|cutover)\b",
                     anchor,
                     re.IGNORECASE,
                 )

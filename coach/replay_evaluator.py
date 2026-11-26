@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import json
 import random
+import re
 import resource
 import time
 from collections import Counter
@@ -39,8 +40,10 @@ from coach.context_builder import (
 from coach.contracts import (
     SCHEMA_VERSION,
     SUPPRESS_REASON_CODES,
+    AttentionConfig,
     CanonicalEvent,
     Category,
+    ClassifierResult,
     ClosedBy,
     ControlSubtype,
     DecisionContext,
@@ -54,6 +57,8 @@ from coach.contracts import (
     Origin,
     Outcome,
     ReasonCode,
+    RecipientConfig,
+    RetentionConfig,
     Route,
     RoutingDecision,
     SegmentRef,
@@ -2061,6 +2066,621 @@ def simulate_replay(
 ) -> ReplayResult:
     """Synchronous wrapper for async_simulate_replay."""
     return asyncio.run(async_simulate_replay(brief, events, policy, classifier, **kwargs))
+
+
+def _extract_anchor_text_from_serialized(serialized_text: str) -> str:
+    lines: list[str] = []
+    in_anchor = False
+    for raw_line in serialized_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "[ANCHOR]" or line.startswith("[ANCHOR] "):
+            in_anchor = True
+            rest = line[len("[ANCHOR]") :].strip()
+            if rest:
+                lines.append(rest)
+            continue
+        if in_anchor:
+            if re.match(r"^\[[A-Z_]+\](?:\s|$)", line):
+                break
+            lines.append(line)
+    joined = " ".join(lines).strip()
+    if not joined:
+        return ""
+    if ":" in joined:
+        prefix, rest = joined.split(":", 1)
+        if re.fullmatch(r"(?:S\d+|S\?|ME|[A-Za-z0-9_-]{1,32})", prefix.strip()):
+            return rest.strip()
+    return joined
+
+
+def _parse_dataset_classifier_input(row: Mapping[str, Any]) -> ClassifierInput:
+    if "context" in row and "serialized_text" in row:
+        ctx = DecisionContext.from_dict(row["context"])
+        return ClassifierInput(context=ctx, serialized_text=str(row["serialized_text"]))
+    if "candidate_id" in row and "serialized_text" in row:
+        ctx_payload = {k: v for k, v in row.items() if k in _DECISION_CONTEXT_KEYS}
+        ctx = DecisionContext.from_dict(ctx_payload)
+        return ClassifierInput(context=ctx, serialized_text=str(row["serialized_text"]))
+    raise ValueError(
+        "Dataset row must contain (context, serialized_text) or DecisionContext + serialized_text"
+    )
+
+
+def _calibrate_dataset_result(
+    cal_obj: CalibrationModel | CalibrationRegistry | None,
+    ctx: DecisionContext,
+    clf_raw: ClassifierResult,
+    policy: PolicyConfig,
+    mode: Any,
+) -> ClassifierResult:
+    if cal_obj is None or isinstance(clf_raw, ClassifierErrorResult):
+        return clf_raw
+    if isinstance(cal_obj, CalibrationRegistry):
+        cal_ver = (
+            policy.classifier.calibration
+            if policy.classifier.calibration
+            and clf_raw.classifier_version == policy.classifier.version
+            else None
+        )
+        return cal_obj.calibrate(ctx, clf_raw, mode=mode, calibration_version=cal_ver)
+    return cal_obj.calibrate(ctx, clf_raw, mode=mode)
+
+
+def _dataset_non_routed_state(routing: RoutingDecision) -> tuple[str, ReasonCode | None]:
+    if routing.outcome is Outcome.NONE:
+        t_state = "no_opportunity"
+    elif routing.outcome is Outcome.ABSTAIN:
+        t_state = "abstained"
+    elif routing.outcome is Outcome.SUPPRESS:
+        t_state = "suppressed"
+    else:
+        t_state = "ready"
+    t_reason = routing.reason_codes[0] if routing.reason_codes else None
+    return (t_state, t_reason)
+
+
+async def _render_dataset_candidate(
+    *,
+    ctx: DecisionContext,
+    routing: RoutingDecision,
+    snap: StateSnapshot,
+    policy: PolicyConfig,
+    tpl_map: Mapping[str, TemplateSpec],
+    provider: ProviderAdapter | None,
+    store: SQLiteStore | None,
+    run_id: str,
+    ledger_texts: Mapping[str, str],
+    ledger_categories: Mapping[str, Category],
+) -> tuple[SuggestionCandidate | None, RoutingDecision, ReasonCode | None]:
+    assert routing.category is not None
+    eff_routing = routing
+    cpol = policy.categories[routing.category]
+    tpl = tpl_map.get(cpol.template) if cpol.template else None
+    ready_ms = ctx.anchor_received_ms
+    cand: SuggestionCandidate | None = None
+    fail_reason: ReasonCode | None = None
+
+    if routing.route is Route.GENERATOR:
+        if provider is not None:
+            orig_sink = provider.egress_sink
+            orig_clock = provider.clock_ms
+            egress_recorded = False
+
+            def _ds_clock_ms(_r: int = ready_ms) -> int:
+                return _r
+
+            def _on_egress(
+                rec: EgressRecord,
+                _cid: str = ctx.candidate_id,
+                _orig: Callable[[EgressRecord], None] | None = orig_sink,
+            ) -> None:
+                nonlocal egress_recorded
+                if rec.candidate_id == _cid:
+                    egress_recorded = True
+                if store is not None:
+                    store.record_egress(run_id=run_id, record=rec)
+                if _orig is not None:
+                    _orig(rec)
+
+            provider.egress_sink = _on_egress
+            provider.clock_ms = _ds_clock_ms
+            try:
+                gen_out = await generate_question(
+                    ctx,
+                    routing.category,
+                    snap,
+                    policy,
+                    provider,
+                    clock_ms=_ds_clock_ms,
+                    store=store,
+                    templates=tpl_map,
+                    ledger_texts=ledger_texts,
+                    ledger_categories=ledger_categories,
+                )
+            finally:
+                provider.egress_sink = orig_sink
+                provider.clock_ms = orig_clock
+            cand = gen_out.candidate
+            if cand is None:
+                fail_reason = gen_out.terminal_reason or ReasonCode.GENERATOR_INVALID_OUTPUT
+            elif gen_out.fallback_used and not egress_recorded:
+                eff_routing = replace(routing, route=cand.route)
+            return (cand, eff_routing, fail_reason)
+        if tpl is not None:
+            eff_routing = replace(routing, route=Route.TEMPLATE)
+        else:
+            return (None, eff_routing, ReasonCode.INSUFFICIENT_BUDGET)
+
+    if tpl is None:
+        return (None, eff_routing, ReasonCode.SLOT_UNAVAILABLE)
+    rendered = render_template(
+        ctx,
+        routing.category,
+        snap,
+        tpl,
+        now_ms=ready_ms,
+        ready_ms=ready_ms,
+        display_ttl_ms=policy.display.display_ttl_ms,
+    )
+    if rendered.candidate is None:
+        return (None, eff_routing, rendered.unrendered_reason or ReasonCode.SLOT_UNAVAILABLE)
+    val = validate_template_candidate(
+        rendered.candidate,
+        snap,
+        max_words=tpl.max_words,
+        ledger_texts=ledger_texts,
+        ledger_categories=ledger_categories,
+    )
+    if val.valid:
+        return (rendered.candidate, eff_routing, None)
+    return (None, eff_routing, val.reason_code or ReasonCode.SLOT_UNAVAILABLE)
+
+
+def _ensure_dataset_segment_revs(
+    *,
+    state: CanonicalState,
+    applied_seg_revs: dict[str, int],
+    seq_counter: int,
+    refs: Sequence[SegmentRef],
+    text: str,
+    rx_ms: int,
+    session_id: str,
+    run_id: str,
+    retention: RetentionConfig,
+    store: SQLiteStore | None,
+    is_context: bool,
+) -> int:
+    for ref in refs:
+        cur_rev = applied_seg_revs.get(ref.segment_id, 0)
+        if cur_rev >= ref.revision:
+            continue
+        for rev in range(cur_rev + 1, ref.revision + 1):
+            seq_counter += 1
+            seg_text = (
+                text
+                if (rev == ref.revision and text)
+                else f"__rev_{rev}__ {text or ref.segment_id}"
+            )
+            start_ms = max(0, rx_ms - (1000 if is_context else 500))
+            end_ms = max(start_ms + 1, rx_ms - (500 if is_context else 0))
+            ev = CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                event_id=f"ds-{run_id}-{session_id}-{ref.segment_id}-r{rev}-{seq_counter}",
+                session_id=session_id,
+                source_id="dataset_replay",
+                kind=EventKind.SEGMENT,
+                received_ms=rx_ms,
+                source_sequence=seq_counter,
+                segment_id=ref.segment_id,
+                source_revision=rev,
+                stability=Stability.COMMITTED,
+                channel=1,
+                speaker_id="S1",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                text=seg_text,
+            )
+            res_apply = state.apply(ev)
+            if res_apply.accepted:
+                snap_now = state.snapshot()
+                actual_rev = (
+                    snap_now.segments_by_id[ref.segment_id].revision
+                    if ref.segment_id in snap_now.segments_by_id
+                    else rev
+                )
+                applied_seg_revs[ref.segment_id] = actual_rev
+                if store is not None:
+                    store.record_canonical_event(
+                        run_id=run_id,
+                        event=ev,
+                        retention=retention,
+                        canonical_revision=actual_rev,
+                    )
+    return seq_counter
+
+
+async def _simulate_one_dataset_session(
+    *,
+    sid: str,
+    items: list[tuple[ClassifierInput, ClassifierResult]],
+    sess_brief: SessionBrief,
+    policy: PolicyConfig,
+    cal_obj: CalibrationModel | CalibrationRegistry | None,
+    tpl_map: Mapping[str, TemplateSpec],
+    store: SQLiteStore | None,
+    run_id: str,
+    mode: Mode,
+    provider: ProviderAdapter | None,
+    eff_health: HealthState,
+    stage_latency_ms: float,
+) -> ReplayResult:
+    state = CanonicalState(sess_brief)
+    applied_seg_revs: dict[str, int] = {}
+    seq_counter = 0
+    evt_seq = 0
+    ledger_texts: dict[str, str] = {}
+    ledger_categories: dict[str, Category] = {}
+    prior_anchor_texts: dict[str, str] = {}
+    displayed_times: list[int] = []
+    displayed_cards: list[DisplayedCardEvent] = []
+    active_until_ms: int | None = None
+    last_proactive_display_ms: int | None = None
+    decisions_count = 0
+    routed_count = 0
+    withdrawn_count = 0
+    expired_count = 0
+
+    for cin, clf_raw in items:
+        ctx = cin.context
+        anchor_text = _extract_anchor_text_from_serialized(cin.serialized_text)
+        seq_counter = _ensure_dataset_segment_revs(
+            state=state,
+            applied_seg_revs=applied_seg_revs,
+            seq_counter=seq_counter,
+            refs=ctx.context_refs,
+            text="",
+            rx_ms=max(0, ctx.anchor_received_ms - 500),
+            session_id=sid,
+            run_id=run_id,
+            retention=sess_brief.retention,
+            store=store,
+            is_context=True,
+        )
+        seq_counter = _ensure_dataset_segment_revs(
+            state=state,
+            applied_seg_revs=applied_seg_revs,
+            seq_counter=seq_counter,
+            refs=ctx.anchor_refs,
+            text=anchor_text,
+            rx_ms=ctx.anchor_received_ms,
+            session_id=sid,
+            run_id=run_id,
+            retention=sess_brief.retention,
+            store=store,
+            is_context=False,
+        )
+        snap = state.snapshot()
+        clf_res = _calibrate_dataset_result(cal_obj, ctx, clf_raw, policy, snap.brief.mode)
+        decisions_count += 1
+        routing = route_candidate(
+            ctx,
+            clf_res,
+            snap,
+            policy,
+            mode=mode,
+            health=eff_health,
+            now_ms=ctx.anchor_received_ms,
+            ledger_texts=ledger_texts,
+            ledger_categories=ledger_categories,
+            prior_anchor_texts=prior_anchor_texts,
+            anchor_text=anchor_text or None,
+            recent_displayed_ms=displayed_times,
+        )
+        if routing.outcome is not Outcome.ROUTE or routing.category is None:
+            t_state, t_reason = _dataset_non_routed_state(routing)
+            if store is not None:
+                store.record_decision(
+                    run_id=run_id,
+                    context=ctx,
+                    terminal_state=t_state,
+                    terminal_reason=t_reason,
+                    classifier=clf_res,
+                    routing=routing,
+                    serialized_text=cin.serialized_text,
+                    retention=sess_brief.retention,
+                )
+            continue
+
+        cand, eff_routing, fail_reason = await _render_dataset_candidate(
+            ctx=ctx,
+            routing=routing,
+            snap=snap,
+            policy=policy,
+            tpl_map=tpl_map,
+            provider=provider,
+            store=store,
+            run_id=run_id,
+            ledger_texts=ledger_texts,
+            ledger_categories=ledger_categories,
+        )
+        if cand is None:
+            t_reason = fail_reason or ReasonCode.SLOT_UNAVAILABLE
+            t_state = "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
+            if t_state == "suppressed":
+                eff_routing = replace(
+                    eff_routing, outcome=Outcome.SUPPRESS, route=None, reason_codes=(t_reason,)
+                )
+            if store is not None:
+                store.record_decision(
+                    run_id=run_id,
+                    context=ctx,
+                    terminal_state=t_state,
+                    terminal_reason=t_reason,
+                    classifier=clf_res,
+                    routing=eff_routing,
+                    serialized_text=cin.serialized_text,
+                    retention=sess_brief.retention,
+                )
+            continue
+
+        routed_count += 1
+        is_manual = ctx.origin is Origin.MANUAL
+        display_ms = (
+            ctx.anchor_received_ms
+            if is_manual
+            else ctx.anchor_received_ms + policy.display.settle_ms
+        )
+        if not is_manual:
+            if active_until_ms is not None:
+                display_ms = max(display_ms, active_until_ms)
+            if last_proactive_display_ms is not None:
+                display_ms = max(display_ms, last_proactive_display_ms + policy.display.cooldown_ms)
+
+        if display_ms > ctx.display_by_ms:
+            expired_count += 1
+            if store is not None:
+                store.record_decision(
+                    run_id=run_id,
+                    context=ctx,
+                    terminal_state="expired",
+                    terminal_reason=ReasonCode.DISPLAY_BY_PASSED,
+                    classifier=clf_res,
+                    routing=eff_routing,
+                    serialized_text=cin.serialized_text,
+                    retention=sess_brief.retention,
+                )
+            continue
+
+        cap = effective_max_cards_per_10_min(snap.brief, policy)
+        recent = [t for t in displayed_times if (display_ms - t) <= 600_000]
+        if not is_manual and (cap <= 0 or len(recent) >= cap):
+            withdrawn_count += 1
+            sup_rt = replace(
+                eff_routing,
+                outcome=Outcome.SUPPRESS,
+                route=None,
+                reason_codes=(ReasonCode.PROACTIVE_DISABLED,),
+            )
+            if store is not None:
+                store.record_decision(
+                    run_id=run_id,
+                    context=ctx,
+                    terminal_state="suppressed",
+                    terminal_reason=ReasonCode.PROACTIVE_DISABLED,
+                    classifier=clf_res,
+                    routing=sup_rt,
+                    serialized_text=cin.serialized_text,
+                    retention=sess_brief.retention,
+                )
+            continue
+
+        state.register_suggestion(cand)
+        ledger_texts[cand.suggestion_id] = cand.text
+        ledger_categories[cand.suggestion_id] = cand.category
+        if anchor_text:
+            prior_anchor_texts[cand.candidate_id] = anchor_text
+        evt_seq += 1
+        disp_ev = LedgerEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id=f"ds-{run_id}-disp-{evt_seq:06d}",
+            suggestion_id=cand.suggestion_id,
+            transition=LedgerState.DISPLAYED,
+            cause=ReasonCode.MANUAL_REQUEST if is_manual else ReasonCode.SETTLE_TIMEOUT,
+            at_ms=display_ms,
+            evidence_refs=cand.evidence_refs,
+        )
+        state.apply(disp_ev.to_canonical_event(sid, received_ms=display_ms))
+        exp_ms = display_ms + cand.display_ttl_ms
+        evt_seq += 1
+        exp_ev = LedgerEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id=f"ds-{run_id}-exp-{evt_seq:06d}",
+            suggestion_id=cand.suggestion_id,
+            transition=LedgerState.EXPIRED,
+            cause=ReasonCode.DISPLAY_TTL_PASSED,
+            at_ms=exp_ms,
+            evidence_refs=cand.evidence_refs,
+        )
+        state.apply(exp_ev.to_canonical_event(sid, received_ms=exp_ms))
+        expired_count += 1
+        if not is_manual:
+            last_proactive_display_ms = display_ms
+        active_until_ms = exp_ms
+        displayed_times.append(display_ms)
+        displayed_cards.append(
+            DisplayedCardEvent(
+                suggestion_id=cand.suggestion_id,
+                candidate_id=cand.candidate_id,
+                session_id=sid,
+                category=cand.category,
+                display_ms=display_ms,
+                evidence_refs=cand.evidence_refs,
+                text=cand.text,
+                route=cand.route,
+                origin=cand.origin,
+            )
+        )
+        if store is not None:
+            store.record_suggestion(
+                session_id=sid,
+                run_id=run_id,
+                suggestion=cand,
+                current_state="ready",
+                terminal_reason=None,
+                transitions=(),
+                retention=sess_brief.retention,
+            )
+            store.record_ledger_event(session_id=sid, run_id=run_id, event=disp_ev)
+            store.record_ledger_event(session_id=sid, run_id=run_id, event=exp_ev)
+            store.record_decision(
+                run_id=run_id,
+                context=ctx,
+                terminal_state="expired",
+                terminal_reason=ReasonCode.DISPLAY_TTL_PASSED,
+                classifier=clf_res,
+                routing=eff_routing,
+                serialized_text=cin.serialized_text,
+                retention=sess_brief.retention,
+            )
+
+    final_snap = state.snapshot()
+    rx_times = [c.context.anchor_received_ms for c, _ in items]
+    dur_ms = max(1, (max(rx_times) - min(rx_times)) if len(rx_times) >= 2 else 1)
+    started_ms = min(rx_times, default=0)
+    ended_ms = max([*rx_times, *displayed_times], default=started_ms)
+    if store is not None:
+        store.upsert_session(
+            brief=final_snap.brief,
+            run_id=run_id,
+            runtime_mode=mode,
+            effective_max_cards_per_10_min=effective_max_cards_per_10_min(final_snap.brief, policy),
+            health_timeline=[
+                {
+                    "at_ms": started_ms,
+                    "state": eff_health.value,
+                    "health": eff_health.value,
+                    "reason": "dataset_replay",
+                }
+            ],
+            reducer_counters=final_snap.counters,
+            revision_history=final_snap.revision_history,
+            started_ms=started_ms,
+            ended_ms=ended_ms,
+        )
+    return ReplayResult(
+        session_id=sid,
+        run_id=run_id,
+        duration_ms=dur_ms,
+        displayed_cards=tuple(displayed_cards),
+        decisions_count=decisions_count,
+        dropped_count=0,
+        routed_count=routed_count,
+        withdrawn_count=withdrawn_count,
+        expired_count=expired_count,
+        latencies_ms=(stage_latency_ms,),
+    )
+
+
+async def async_simulate_dataset_replay(
+    dataset_rows: Sequence[Mapping[str, Any]],
+    policy: PolicyConfig,
+    classifier: OpportunityClassifier,
+    *,
+    brief: SessionBrief | None = None,
+    calibration: CalibrationModel | CalibrationRegistry | None = None,
+    templates: Mapping[str, TemplateSpec] | None = None,
+    store: SQLiteStore | None = None,
+    run_id: str = "replay",
+    mode: Mode = Mode.PROACTIVE,
+    provider: ProviderAdapter | None = None,
+    health: HealthState | None = None,
+    simulated_latency_ms: float | None = None,
+    cache_classifier: bool = True,
+) -> list[ReplayResult]:
+    """Run policy-level replay evaluation over pre-built DecisionContext dataset rows."""
+    inputs = [_parse_dataset_classifier_input(row) for row in dataset_rows]
+    if not inputs:
+        return []
+    tpl_map = dict(templates) if templates is not None else load_templates_dir()
+    cal_obj: CalibrationModel | CalibrationRegistry | None = (
+        calibration
+        if calibration is not None
+        else (default_calibration_registry() if policy.classifier.calibration else None)
+    )
+    local_blocked = (
+        provider is not None and provider.config.local_only and provider.config.effective_is_hosted
+    )
+    if health is not None:
+        eff_health = health
+    elif local_blocked or provider is None:
+        eff_health = HealthState.TEMPLATE_ONLY
+    else:
+        eff_health = provider.health_state
+
+    t0 = time.perf_counter()
+    if cache_classifier and store is not None:
+        clf_results = await classify_batch_cached(classifier, inputs, store=store)
+    else:
+        clf_results = await classifier.classify_batch(inputs)
+    measured_ms = max(0.0, (time.perf_counter() - t0) * 1000.0)
+    stage_ms = float(
+        max(0, int(round(simulated_latency_ms)))
+        if simulated_latency_ms is not None
+        else measured_ms
+    )
+
+    by_session: dict[str, list[tuple[ClassifierInput, ClassifierResult]]] = {}
+    for cin, clf_raw in zip(inputs, clf_results, strict=True):
+        by_session.setdefault(cin.context.session_id, []).append((cin, clf_raw))
+
+    results: list[ReplayResult] = []
+    for sid in sorted(by_session):
+        sess_brief = (
+            replace(brief, session_id=sid)
+            if brief is not None
+            else SessionBrief(
+                schema_version=SCHEMA_VERSION,
+                session_id=sid,
+                objective="Evaluate dataset replay candidates.",
+                recipient=RecipientConfig(participant_id="ME", role="participant"),
+                mode=policy.mode,
+                retention=RetentionConfig(),
+                attention=AttentionConfig(max_cards_per_10_min=3, proactive=True),
+            )
+        )
+        items = sorted(
+            by_session[sid],
+            key=lambda pair: (pair[0].context.anchor_received_ms, pair[0].context.candidate_id),
+        )
+        results.append(
+            await _simulate_one_dataset_session(
+                sid=sid,
+                items=items,
+                sess_brief=sess_brief,
+                policy=policy,
+                cal_obj=cal_obj,
+                tpl_map=tpl_map,
+                store=store,
+                run_id=run_id,
+                mode=mode,
+                provider=provider,
+                eff_health=eff_health,
+                stage_latency_ms=stage_ms,
+            )
+        )
+    return results
+
+
+def simulate_dataset_replay(
+    dataset_rows: Sequence[Mapping[str, Any]],
+    policy: PolicyConfig,
+    classifier: OpportunityClassifier,
+    **kwargs: Any,
+) -> list[ReplayResult]:
+    """Synchronous wrapper for async_simulate_dataset_replay."""
+    return asyncio.run(async_simulate_dataset_replay(dataset_rows, policy, classifier, **kwargs))
 
 
 def _policy_with_t_display(policy: PolicyConfig, t_display: float) -> PolicyConfig:

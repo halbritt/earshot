@@ -26,7 +26,12 @@ from coach.calibration import (
     fit_platt_calibrator,
 )
 from coach.canonical_state import CanonicalState
-from coach.context_builder import BUILDER_VERSION, PREFILTER_VERSION, build_decision_contexts
+from coach.context_builder import (
+    BUILDER_VERSION,
+    PREFILTER_VERSION,
+    build_decision_contexts,
+    extract_slots_span_rules_v0,
+)
 from coach.contracts import (
     AnnotationPass,
     AttentionConfig,
@@ -1641,3 +1646,44 @@ async def test_modernbert_train_masked_bce_reload_and_hf_embedder(
             model_name_or_path=str(out_dir),
             categories=(Category.SUCCESS_CRITERION,),
         )
+
+
+async def test_rules_classifier_finish_date_topic_time_resolution_and_define_metric() -> None:
+    policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    state = CanonicalState(
+        _make_brief(known_facts=(KnownFact(key="launch_date", value="March 3"),))
+    )
+    state.apply(
+        _seg("t1", "We also need a finish date for the database migration.", start_ms=1000, seq=1)
+    )
+    state.apply(_seg("t2", "Database migration will finish by March 10.", start_ms=2000, seq=2))
+    state.apply(
+        _seg("t3", "We also need a target date for the schema cleanup.", start_ms=3000, seq=3)
+    )
+    state.apply(
+        _seg("t4", "We also need a target date for the database migration.", start_ms=4000, seq=4)
+    )
+    state.apply(
+        _seg("t5", "We should define a metric for load test acceptance.", start_ms=5000, seq=5)
+    )
+    state.apply(_seg("t6", "We must ship the billing service.", start_ms=6000, seq=6))
+    snap = state.snapshot()
+    built = build_decision_contexts(snap, policy=policy)
+    clf = create_classifier("rules_v0")
+    res = await clf.classify_batch(built)
+
+    by_seg = {
+        b.context.anchor_refs[0].segment_id: r
+        for b, r in zip(built, res, strict=True)
+        if b.context is not None
+    }
+    assert by_seg["t1"].raw_scores.categories["CONFIRM_TIME"] >= 0.80
+    assert by_seg["t3"].raw_scores.categories["CONFIRM_TIME"] >= 0.80
+    assert by_seg["t4"].raw_scores.categories["CONFIRM_TIME"] < 0.25
+    assert by_seg["t5"].raw_scores.categories["SUCCESS_CRITERION"] >= 0.80
+    assert by_seg["t6"].raw_scores.categories["CONFIRM_TIME"] < 0.25
+
+    t1_slots = extract_slots_span_rules_v0([snap.segments_by_id["t1"]], Category.CONFIRM_TIME)
+    assert t1_slots["action"].text == "the database migration"
+    t5_slots = extract_slots_span_rules_v0([snap.segments_by_id["t5"]], Category.SUCCESS_CRITERION)
+    assert t5_slots["proposal"].text == "load test acceptance"

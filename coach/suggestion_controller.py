@@ -2791,6 +2791,29 @@ class SuggestionController:
         ):
             self._set_health(HealthState.NO_TRANSCRIPT, "no_transcript_timeout")
 
+        if (
+            self._health is HealthState.NO_TRANSCRIPT
+            and self._proactive_idle.is_set()
+            and self._mode is not Mode.OFF_THE_RECORD
+        ):
+            unprocessed = self._cursor.unprocessed_segments(snap)
+            if unprocessed:
+                anchors = coalesce_anchors(
+                    snap,
+                    max_candidate_age_ms=self._policy.display.max_candidate_age_ms,
+                    tokenizer=self._classifier.tokenizer,
+                    speaker_boundary_end_ms=self._speaker_boundary_end_ms,
+                    segments_subset=unprocessed,
+                )
+                for anchor in anchors:
+                    if anchor.display_by_ms <= now_ms:
+                        self._retire_anchor(
+                            anchor,
+                            state_version=snap.state_version,
+                            reason=ReasonCode.EXPIRED_UNEVALUATED,
+                        )
+                        self._cursor.mark_covered(anchor.segments)
+
         # 1. Revalidate active card
         if self._active is not None:
             fail_reason, _ = self._revalidate_item(self._active, snap, now_ms, is_active=True)
@@ -3217,8 +3240,14 @@ class SuggestionController:
             speaker_boundary_end_ms=self._speaker_boundary_end_ms,
             segments_subset=unprocessed,
         )
+        now_ms = self._clock.now_ms()
         for anchor in anchors:
-            self._retire_anchor(anchor, state_version=snap.state_version, reason=reason)
+            eff_reason = (
+                ReasonCode.EXPIRED_UNEVALUATED
+                if reason is ReasonCode.SESSION_ENDED and anchor.display_by_ms <= now_ms
+                else reason
+            )
+            self._retire_anchor(anchor, state_version=snap.state_version, reason=eff_reason)
             self._cursor.mark_covered(anchor.segments)
 
     async def _close_open_items_for_halt(self) -> None:
