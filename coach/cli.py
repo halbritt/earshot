@@ -1116,6 +1116,11 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     mode = Mode(args.mode)
     _ = _recorder_maxsize_from_env()
     _pace_replay_events(events, args.speed)
+    use_measured_latency = (
+        args.simulated_latency_ms is None
+        and args.speed is not None
+        and str(args.speed).strip().lower() != "stepped"
+    )
 
     grouped_events: dict[str, list[CanonicalEvent]] = {}
     for ev in events:
@@ -1143,6 +1148,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                         provider=sess_provider,
                         simulated_latency_ms=args.simulated_latency_ms,
                         cache_classifier=not args.no_cache,
+                        measure_latency=use_measured_latency,
                     )
                 finally:
                     if sess_provider is not None:
@@ -1243,6 +1249,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                         provider=sweep_provider,
                         simulated_latency_ms=args.simulated_latency_ms,
                         cache_classifier=not args.no_cache,
+                        measure_latency=use_measured_latency,
                     )
                 finally:
                     if sweep_provider is not None:

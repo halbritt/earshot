@@ -1099,6 +1099,7 @@ def test_boundary_c6_generic_referent_exact_6000ms_vs_6001ms_age(
             events,
             filename=f"c6_{suffix}.jsonl",
             policy_overrides={"display": {"settle_ms": settle_ms, "max_candidate_age_ms": 8000}},
+            extra_args=("--simulated-latency-ms", "0"),
         )
         assert res.returncode == 0
         with open_db(e2e_workspace["db_path"]) as conn:
@@ -1228,6 +1229,7 @@ def test_boundary_d2_speaker_settle_ms_2000ms_boundary(
             events,
             filename=f"d2_{label}.jsonl",
             policy_overrides={"abstain": {"speaker_settle_ms": 2000}},
+            extra_args=("--simulated-latency-ms", "0"),
         )
         assert res.returncode == 0
         with open_db(e2e_workspace["db_path"]) as conn:
@@ -1806,6 +1808,7 @@ def test_boundary_f2_display_by_ms_boundary_never_revives_expired(
                 "max_cards_per_10_min": 5,
             }
         },
+        extra_args=("--simulated-latency-ms", "0"),
     )
     assert res.returncode == 0
     with open_db(e2e_workspace["db_path"]) as conn:

@@ -653,12 +653,16 @@ def _sample_stage_latency_ms(
     simulated_latency_ms: float | None,
     latency_distribution_ms: Sequence[float] | None,
     rng: random.Random,
+    *,
+    measure_latency: bool = False,
 ) -> int:
     if simulated_latency_ms is not None:
         return max(0, int(round(simulated_latency_ms)))
     if latency_distribution_ms:
         return max(0, int(round(float(rng.choice(latency_distribution_ms)))))
-    return max(0, int(round(measured_ms)))
+    if measure_latency:
+        return max(0, int(round(measured_ms)))
+    return 0
 
 
 def _replay_anchor_sort_key(
@@ -703,6 +707,7 @@ class _ReplaySim:
         latency_distribution_ms: Sequence[float] | None,
         rng: random.Random,
         cache_classifier: bool,
+        measure_latency: bool = False,
     ) -> None:
         self.brief = brief
         self.ordered = ordered
@@ -719,6 +724,7 @@ class _ReplaySim:
         self.latency_distribution_ms = latency_distribution_ms
         self.rng = rng
         self.cache_classifier = cache_classifier
+        self.measure_latency = measure_latency
         self.state = CanonicalState(brief)
         self.cursor = CoverageCursor()
         self.tok = classifier.tokenizer or WhitespaceTokenizer()
@@ -1969,7 +1975,11 @@ class _ReplaySim:
             clf_results = await self.classifier.classify_batch(c_inputs)
         measured_ms = max(0.0, (time.perf_counter() - t0) * 1000.0)
         stage_ms = _sample_stage_latency_ms(
-            measured_ms, self.simulated_latency_ms, self.latency_distribution_ms, self.rng
+            measured_ms,
+            self.simulated_latency_ms,
+            self.latency_distribution_ms,
+            self.rng,
+            measure_latency=self.measure_latency,
         )
         all_err = all(isinstance(r, ClassifierErrorResult) for r in clf_results)
         if (
@@ -1983,7 +1993,10 @@ class _ReplaySim:
             stage_ms = 1
 
         self.sim_now_ms += stage_ms
-        self.latencies_ms.append(float(stage_ms))
+        if self.simulated_latency_ms is not None or self.latency_distribution_ms:
+            self.latencies_ms.append(float(stage_ms))
+        else:
+            self.latencies_ms.append(measured_ms)
         while (
             self.next_ev_idx < len(self.ordered)
             and self.ordered[self.next_ev_idx].received_ms <= self.sim_now_ms
@@ -2309,6 +2322,7 @@ async def async_simulate_replay(
     latency_distribution_ms: Sequence[float] | None = None,
     rng_seed: int = 0,
     cache_classifier: bool = True,
+    measure_latency: bool = False,
 ) -> ReplayResult:
     """Run deterministic policy-level replay simulation with honest latency accounting (§12.6)."""
     tpl_map = dict(templates) if templates is not None else load_templates_dir()
@@ -2343,6 +2357,7 @@ async def async_simulate_replay(
         latency_distribution_ms=latency_distribution_ms,
         rng=random.Random(rng_seed),
         cache_classifier=cache_classifier,
+        measure_latency=measure_latency,
     )
     return await sim.run()
 
@@ -3156,6 +3171,7 @@ async def async_sweep_t_display(
     simulated_latency_ms: float | None = None,
     latency_distribution_ms: Sequence[float] | None = None,
     cache_classifier: bool = True,
+    measure_latency: bool = False,
 ) -> list[dict[str, Any]]:
     """Sweep `t_display` through policy-level replay using an isolated store (§12.8)."""
     if not t_display_values:
@@ -3187,6 +3203,7 @@ async def async_sweep_t_display(
                         simulated_latency_ms=simulated_latency_ms,
                         latency_distribution_ms=latency_distribution_ms,
                         cache_classifier=cache_classifier,
+                        measure_latency=measure_latency,
                     )
                 finally:
                     if iter_provider is not None:

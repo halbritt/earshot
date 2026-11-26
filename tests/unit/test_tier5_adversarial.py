@@ -4582,3 +4582,183 @@ def test_peecee_realtime_and_deepgram_handle_null_and_nonfinite_numeric_fields()
     assert any(ev.kind is EventKind.SEGMENT and ev.text == "test message" for ev in dg_evs)
     dg_end = dg.normalize({"type": "UtteranceEnd", "last_word_end": None}, received_ms=2300)
     assert len(dg_end) == 1 and dg_end[0].kind is EventKind.BOUNDARY
+
+
+def test_replay_default_timing_deterministic_under_slow_classifier() -> None:
+    import random
+
+    from coach.replay_evaluator import _ReplaySim
+    from coach.template_renderer import load_templates_dir
+
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        abstain=replace(base_pol.abstain, speaker_settle_ms=2000),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+    )
+    tpl_map = load_templates_dir(Path("policies/templates"))
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="t5-det-lat",
+        mode=policy.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+    )
+
+    class _SleepyOwnerClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        def __init__(self, sleep_s: float) -> None:
+            self.sleep_s = sleep_s
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierResult]:
+            if self.sleep_s > 0.0:
+                await asyncio.sleep(self.sleep_s)
+            out: list[ClassifierResult] = []
+            for raw in contexts:
+                ctx = coerce_classifier_input(raw).context
+                sc = ScoreSet(opportunity=0.95, categories={"CONFIRM_OWNER": 0.95})
+                out.append(
+                    ClassifierResult(
+                        schema_version=SCHEMA_VERSION,
+                        candidate_id=ctx.candidate_id,
+                        based_on_state_version=ctx.based_on_state_version,
+                        classifier_version=self.classifier_version,
+                        raw_scores=sc,
+                        calibration_version=policy.classifier.calibration,
+                        calibrated_scores=sc,
+                        latency_ms=1.0,
+                        input_refs=ctx.anchor_refs,
+                    )
+                )
+            return out
+
+    events = [
+        _seg_ev(
+            "t5-det-lat",
+            "ev-1",
+            "seg-1",
+            "We reviewed the notes yesterday.",
+            speaker="speaker-c",
+            rx_ms=500,
+            start_ms=100,
+            end_ms=400,
+            rev=1,
+            seq=1,
+        ),
+        CanonicalEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id="ev-upd",
+            session_id="t5-det-lat",
+            kind=EventKind.SPEAKER_UPDATE,
+            stability=Stability.COMMITTED,
+            segment_id="seg-1",
+            source_revision=2,
+            speaker_id="speaker-b",
+            speaker_confidence=0.95,
+            received_ms=600,
+            source_sequence=2,
+        ),
+        _seg_ev(
+            "t5-det-lat",
+            "ev-rev",
+            "seg-1",
+            "Someone should own the cutover plan.",
+            speaker="speaker-b",
+            rx_ms=2600,
+            start_ms=100,
+            end_ms=400,
+            rev=3,
+            seq=3,
+        ),
+    ]
+
+    async def _run_sim(
+        sleep_s: float,
+        sim_lat: float | None,
+        lat_dist: Sequence[float] | None,
+        run_id: str,
+        *,
+        measure_latency: bool = False,
+    ) -> tuple[int, Any, list[dict[str, Any]]]:
+        db = SQLiteStore(":memory:")
+        try:
+            sim = _ReplaySim(
+                brief=brief,
+                ordered=events,
+                policy=policy,
+                classifier=_SleepyOwnerClf(sleep_s),  # type: ignore[arg-type]
+                cal_obj=None,
+                tpl_map=tpl_map,
+                store=db,
+                run_id=run_id,
+                mode=Mode.PROACTIVE,
+                provider=None,
+                health=None,
+                simulated_latency_ms=sim_lat,
+                latency_distribution_ms=lat_dist,
+                rng=random.Random(0),
+                cache_classifier=False,
+                measure_latency=measure_latency,
+            )
+            res = await sim.run()
+            assert check_conservation_invariants(db, "t5-det-lat", run_id).passed
+            return sim.sim_now_ms, res, db.get_decisions("t5-det-lat", run_id)
+        finally:
+            db.close()
+
+    now_fast, res_fast, decs_fast = asyncio.run(_run_sim(0.0, None, None, "r-fast"))
+    now_slow, res_slow, decs_slow = asyncio.run(_run_sim(0.008, None, None, "r-slow"))
+    assert now_fast == 2600 and now_slow == 2600
+    assert decs_fast[-1]["outcome"] == "ABSTAIN"
+    assert decs_slow[-1]["outcome"] == "ABSTAIN"
+    assert decs_slow[-1]["terminal_reason"] == "speaker_uncertain"
+    assert res_fast.displayed_cards == res_slow.displayed_cards == ()
+    assert len(res_slow.latencies_ms) == 1 and all(x >= 5.0 for x in res_slow.latencies_ms)
+
+    # Sync simulate_replay wrapper matches default determinism under slow classifier
+    with SQLiteStore(":memory:") as sync_db:
+        sync_res = simulate_replay(
+            brief,
+            events,
+            policy,
+            _SleepyOwnerClf(0.008),  # type: ignore[arg-type]
+            templates=tpl_map,
+            store=sync_db,
+            run_id="r-sync-slow",
+            simulated_latency_ms=None,
+            cache_classifier=False,
+        )
+        sync_decs = sync_db.get_decisions("t5-det-lat", "r-sync-slow")
+        assert sync_decs[-1]["outcome"] == "ABSTAIN"
+        assert sync_decs[-1]["terminal_reason"] == "speaker_uncertain"
+        assert sync_res.displayed_cards == ()
+        assert len(sync_res.latencies_ms) == 1 and all(x >= 5.0 for x in sync_res.latencies_ms)
+        assert check_conservation_invariants(sync_db, "t5-det-lat", "r-sync-slow").passed
+
+    # Explicit simulated_latency_ms=200.0 & latency_distribution_ms=[200.0] still advance sim_now_ms
+    now_exp, res_exp, decs_exp = asyncio.run(_run_sim(0.0, 200.0, None, "r-exp"))
+    assert decs_exp[-1]["outcome"] == "ROUTE"
+    assert len(res_exp.displayed_cards) == 1
+    assert res_exp.displayed_cards[0].display_ms == 2800
+    assert now_exp == 2800 + policy.display.display_ttl_ms
+    assert res_exp.latencies_ms == (200.0,)
+
+    now_dist, res_dist, decs_dist = asyncio.run(_run_sim(0.0, None, [200.0], "r-dist"))
+    assert decs_dist[-1]["outcome"] == "ROUTE"
+    assert len(res_dist.displayed_cards) == 1
+    assert res_dist.displayed_cards[0].display_ms == 2800
+    assert now_dist == 2800 + policy.display.display_ttl_ms
+    assert res_dist.latencies_ms == (200.0,)
+
+    # Paced mode (measure_latency=True) advances sim_now_ms by real measured_ms
+    now_meas, res_meas, decs_meas = asyncio.run(
+        _run_sim(0.008, None, None, "r-meas", measure_latency=True)
+    )
+    assert decs_meas[-1]["outcome"] == "ROUTE"
+    assert len(res_meas.displayed_cards) == 1
+    assert res_meas.displayed_cards[0].display_ms >= 2605
+    assert now_meas == res_meas.displayed_cards[0].display_ms + policy.display.display_ttl_ms
