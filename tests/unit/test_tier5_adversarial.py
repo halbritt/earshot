@@ -5133,3 +5133,366 @@ async def test_dataset_replay_consecutive_clf_errors_escalates_to_manual_only() 
             assert check_conservation_invariants(db_gen, "ds-err-esc", "ds-allerr-man").passed
     finally:
         await prov_gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_dataset_replay_paused_and_off_record_retire_and_record_health() -> None:
+    policy = load_policy(POLICY_PATH)
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="ds-mode-ret",
+        mode=policy.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+    )
+    st = CanonicalState(brief)
+    st.apply(
+        _seg_ev(
+            "ds-mode-ret",
+            "ev-1",
+            "seg-1",
+            "Someone needs to own the deployment checklist.",
+            speaker="speaker-a",
+            rx_ms=1000,
+            start_ms=500,
+            end_ms=900,
+            seq=1,
+        )
+    )
+    snap = st.snapshot()
+    built = build_decision_context(snap, [snap.segments[0]], policy=policy)
+    assert built.context is not None and built.serialized_text is not None
+    rows = [{"context": built.context.to_dict(), "serialized_text": built.serialized_text}]
+
+    class _HitClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierResult]:
+            out: list[ClassifierResult] = []
+            for raw in contexts:
+                ctx = coerce_classifier_input(raw).context
+                sc = ScoreSet(opportunity=0.95, categories={"CONFIRM_OWNER": 0.95})
+                out.append(
+                    ClassifierResult(
+                        schema_version=SCHEMA_VERSION,
+                        candidate_id=ctx.candidate_id,
+                        based_on_state_version=ctx.based_on_state_version,
+                        classifier_version=self.classifier_version,
+                        raw_scores=sc,
+                        calibration_version=policy.classifier.calibration,
+                        calibrated_scores=sc,
+                        latency_ms=1.0,
+                        input_refs=ctx.anchor_refs,
+                    )
+                )
+            return out
+
+    with SQLiteStore(":memory:") as db_p:
+        res_p = await async_simulate_dataset_replay(
+            rows,
+            policy,
+            _HitClf(),  # type: ignore[arg-type]
+            brief=brief,
+            store=db_p,
+            run_id="ds-paused",
+            mode=Mode.PAUSED,
+            cache_classifier=False,
+        )
+        assert res_p[0].displayed_cards == ()
+        decs_p = db_p.get_decisions("ds-mode-ret", "ds-paused")
+        assert len(decs_p) == 1 and decs_p[0]["terminal_state"] == "retired"
+        sess_p = db_p.get_session("ds-mode-ret", "ds-paused")
+        assert sess_p is not None
+        tl_p = json.loads(sess_p["health_timeline_json"])
+        assert tl_p[0]["state"] == HealthState.PAUSED.value
+        assert tl_p[0]["reason"] == "paused"
+        assert check_conservation_invariants(db_p, "ds-mode-ret", "ds-paused").passed
+
+    with SQLiteStore(":memory:") as db_otr:
+        res_otr = await async_simulate_dataset_replay(
+            rows,
+            policy,
+            _HitClf(),  # type: ignore[arg-type]
+            brief=brief,
+            store=db_otr,
+            run_id="ds-otr",
+            mode=Mode.OFF_THE_RECORD,
+            cache_classifier=False,
+        )
+        assert res_otr[0].displayed_cards == ()
+        decs_otr = db_otr.get_decisions("ds-mode-ret", "ds-otr")
+        assert len(decs_otr) == 1
+        assert decs_otr[0]["terminal_state"] == "retired"
+        assert decs_otr[0]["terminal_reason"] == ReasonCode.OFF_RECORD.value
+        assert check_conservation_invariants(db_otr, "ds-mode-ret", "ds-otr").passed
+
+
+@pytest.mark.asyncio
+async def test_dataset_replay_manual_fallback_parity() -> None:
+    from coach.replay_evaluator import (
+        _parse_dataset_classifier_input,
+        _simulate_one_dataset_session,
+    )
+    from coach.template_renderer import load_templates_dir
+
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(
+            base_pol.generator,
+            enabled=True,
+            breaker=replace(base_pol.generator.breaker, consecutive_failures=1, open_ms=60_000),
+        ),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+    )
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="ds-man-fb",
+        mode=policy.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+    )
+    st = CanonicalState(brief)
+    st.apply(
+        _seg_ev(
+            "ds-man-fb",
+            "ev-1",
+            "seg-1",
+            "Someone needs to own the deployment checklist.",
+            speaker="speaker-a",
+            rx_ms=1000,
+            start_ms=500,
+            end_ms=900,
+            seq=1,
+        )
+    )
+    snap = st.snapshot()
+    built_pro = build_decision_context(snap, [snap.segments[0]], policy=policy)
+    built_man = build_decision_context(
+        snap, [snap.segments[0]], policy=policy, origin=Origin.MANUAL
+    )
+    assert built_pro.context is not None and built_pro.serialized_text is not None
+    assert built_man.context is not None and built_man.serialized_text is not None
+    pro_row = {"context": built_pro.context.to_dict(), "serialized_text": built_pro.serialized_text}
+    man_ctx = replace(
+        built_man.context, candidate_id="man-fb-1", anchor_received_ms=1000, display_by_ms=13000
+    )
+    man_rows = [
+        pro_row,
+        {"context": man_ctx.to_dict(), "serialized_text": built_man.serialized_text},
+    ]
+
+    class _ErrClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierErrorResult]:
+            return [
+                make_classifier_error_result(
+                    coerce_classifier_input(raw).context,
+                    self.classifier_version,
+                    error="backend_error",
+                    retryable=False,
+                )
+                for raw in contexts
+            ]
+
+    def _ok_gen(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "question": "Who owns the deployment checklist?",
+                                    "evidence_segment_ids": ["seg-1"],
+                                    "decline_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 25, "completion_tokens": 10},
+            },
+        )
+
+    prov_ok = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+            breaker_consecutive_failures=1,
+            breaker_open_ms=60_000,
+        ),
+        transport=httpx.MockTransport(_ok_gen),
+    )
+    try:
+        # 1) HealthState.OK + ClassifierErrorResult -> generator fallback displays card
+        with SQLiteStore(":memory:") as db_ok:
+            res_ok = await async_simulate_dataset_replay(
+                man_rows,
+                policy,
+                _ErrClf(),  # type: ignore[arg-type]
+                brief=brief,
+                store=db_ok,
+                run_id="ds-man-ok",
+                provider=prov_ok,
+                health=HealthState.OK,
+                cache_classifier=False,
+            )
+            assert len(res_ok[0].displayed_cards) == 1
+            assert res_ok[0].displayed_cards[0].route is Route.GENERATOR
+            assert len(db_ok.get_egress_records("ds-man-fb", "ds-man-ok")) == 1
+            assert check_conservation_invariants(db_ok, "ds-man-fb", "ds-man-ok").passed
+    finally:
+        await prov_ok.aclose()
+
+    # 2) HealthState.MANUAL_ONLY + BreakerState.OPEN + ClassifierErrorResult -> template fallback
+    prov_open = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+            breaker_consecutive_failures=1,
+            breaker_open_ms=60_000,
+        ),
+        transport=httpx.MockTransport(_ok_gen),
+    )
+    prov_open._record_failure(900)
+    assert prov_open.breaker_state is BreakerState.OPEN
+    try:
+        cin_pro = _parse_dataset_classifier_input(man_rows[0])
+        cin = _parse_dataset_classifier_input(man_rows[1])
+        err_pro = make_classifier_error_result(
+            cin_pro.context, policy.classifier.version, error="backend_error", retryable=False
+        )
+        err_res = make_classifier_error_result(
+            cin.context, policy.classifier.version, error="backend_error", retryable=False
+        )
+        with SQLiteStore(":memory:") as db_mo:
+            res_mo = await _simulate_one_dataset_session(
+                sid="ds-man-fb",
+                items=[(cin_pro, err_pro), (cin, err_res)],
+                sess_brief=brief,
+                policy=policy,
+                cal_obj=None,
+                tpl_map=load_templates_dir(Path("policies/templates")),
+                store=db_mo,
+                run_id="ds-man-mo-open",
+                mode=Mode.PROACTIVE,
+                provider=prov_open,
+                eff_health=HealthState.MANUAL_ONLY,
+                stage_latency_ms=1.0,
+                health_override=HealthState.MANUAL_ONLY,
+                local_blocked=False,
+            )
+            assert len(res_mo.displayed_cards) == 1
+            assert res_mo.displayed_cards[0].origin is Origin.MANUAL
+            assert res_mo.displayed_cards[0].route is Route.TEMPLATE
+            decs_mo = db_mo.get_decisions("ds-man-fb", "ds-man-mo-open")
+            man_dec_mo = next(d for d in decs_mo if d["origin"] == "manual")
+            assert man_dec_mo["route"] == Route.TEMPLATE.value
+            assert db_mo.get_egress_records("ds-man-fb", "ds-man-mo-open") == []
+            assert check_conservation_invariants(db_mo, "ds-man-fb", "ds-man-mo-open").passed
+    finally:
+        await prov_open.aclose()
+
+    # 3) HealthState.TEMPLATE_ONLY: OPEN blocks fallback, HALF_OPEN probes generator & recovers OK
+    prov_probe = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+            breaker_consecutive_failures=1,
+            breaker_open_ms=60_000,
+        ),
+        transport=httpx.MockTransport(_ok_gen),
+    )
+    prov_probe._record_failure(900)
+    try:
+        cin_pro_to = _parse_dataset_classifier_input(man_rows[0])
+        cin_open = _parse_dataset_classifier_input(man_rows[1])
+        err_pro_to = make_classifier_error_result(
+            cin_pro_to.context, policy.classifier.version, error="backend_error", retryable=False
+        )
+        err_open = make_classifier_error_result(
+            cin_open.context, policy.classifier.version, error="backend_error", retryable=False
+        )
+        with SQLiteStore(":memory:") as db_to:
+            res_to = await _simulate_one_dataset_session(
+                sid="ds-man-fb",
+                items=[(cin_pro_to, err_pro_to), (cin_open, err_open)],
+                sess_brief=brief,
+                policy=policy,
+                cal_obj=None,
+                tpl_map=load_templates_dir(Path("policies/templates")),
+                store=db_to,
+                run_id="ds-man-to-open",
+                mode=Mode.PROACTIVE,
+                provider=prov_probe,
+                eff_health=HealthState.TEMPLATE_ONLY,
+                stage_latency_ms=1.0,
+                health_override=None,
+                local_blocked=False,
+            )
+            assert res_to.displayed_cards == ()
+            decs_to = db_to.get_decisions("ds-man-fb", "ds-man-to-open")
+            man_dec_to = next(d for d in decs_to if d["origin"] == "manual")
+            assert man_dec_to["terminal_state"] == "abstained"
+            assert man_dec_to["terminal_reason"] == ReasonCode.CLASSIFIER_ERROR.value
+            assert check_conservation_invariants(db_to, "ds-man-fb", "ds-man-to-open").passed
+
+        later_pro = replace(built_pro.context, anchor_received_ms=70_000, display_by_ms=78_000)
+        later_ctx = replace(man_ctx, anchor_received_ms=70_000, display_by_ms=82_000)
+        cin_pro_ho = _parse_dataset_classifier_input(
+            {"context": later_pro.to_dict(), "serialized_text": built_pro.serialized_text}
+        )
+        cin_ho = _parse_dataset_classifier_input(
+            {"context": later_ctx.to_dict(), "serialized_text": built_man.serialized_text}
+        )
+        err_pro_ho = make_classifier_error_result(
+            cin_pro_ho.context, policy.classifier.version, error="backend_error", retryable=False
+        )
+        err_ho = make_classifier_error_result(
+            cin_ho.context, policy.classifier.version, error="backend_error", retryable=False
+        )
+        with SQLiteStore(":memory:") as db_ho:
+            res_ho = await _simulate_one_dataset_session(
+                sid="ds-man-fb",
+                items=[(cin_pro_ho, err_pro_ho), (cin_ho, err_ho)],
+                sess_brief=brief,
+                policy=policy,
+                cal_obj=None,
+                tpl_map=load_templates_dir(Path("policies/templates")),
+                store=db_ho,
+                run_id="ds-man-to-ho",
+                mode=Mode.PROACTIVE,
+                provider=prov_probe,
+                eff_health=HealthState.TEMPLATE_ONLY,
+                stage_latency_ms=1.0,
+                health_override=None,
+                local_blocked=False,
+            )
+            assert len(res_ho.displayed_cards) == 1
+            assert res_ho.displayed_cards[0].origin is Origin.MANUAL
+            assert res_ho.displayed_cards[0].route is Route.GENERATOR
+            sess_ho = db_ho.get_session("ds-man-fb", "ds-man-to-ho")
+            assert sess_ho is not None
+            tl_ho = json.loads(sess_ho["health_timeline_json"])
+            assert [e["state"] for e in tl_ho] == ["template_only", "ok"]
+            assert check_conservation_invariants(db_ho, "ds-man-fb", "ds-man-to-ho").passed
+    finally:
+        await prov_probe.aclose()

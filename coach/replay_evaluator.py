@@ -736,22 +736,29 @@ class _ReplaySim:
         )
         if health is not None:
             self.eff_health = health
+        elif mode is Mode.PAUSED:
+            self.eff_health = HealthState.PAUSED
         elif self.local_blocked or provider is None:
             self.eff_health = HealthState.TEMPLATE_ONLY
         else:
             self.eff_health = provider.health_state
         self.sim_now_ms = ordered[0].received_ms if ordered else 0
         self.next_ev_idx = 0
+        init_reason = (
+            "paused"
+            if self.eff_health is HealthState.PAUSED
+            else (
+                "local_only"
+                if self.local_blocked
+                else ("init" if provider is not None else "no_provider")
+            )
+        )
         self.health_timeline: list[dict[str, Any]] = [
             {
                 "at_ms": self.sim_now_ms,
                 "state": self.eff_health.value,
                 "health": self.eff_health.value,
-                "reason": (
-                    "local_only"
-                    if self.local_blocked
-                    else ("init" if provider is not None else "no_provider")
-                ),
+                "reason": init_reason,
             }
         ]
         self.speaker_update_times: dict[str, int] = {}
@@ -2735,7 +2742,7 @@ async def _simulate_one_dataset_session(
             "at_ms": started_ms,
             "state": cur_health.value,
             "health": cur_health.value,
-            "reason": "dataset_replay",
+            "reason": "paused" if cur_health is HealthState.PAUSED else "dataset_replay",
         }
     ]
 
@@ -2783,23 +2790,28 @@ async def _simulate_one_dataset_session(
             )
         ) or (
             not is_manual
-            and cur_health
-            in {
-                HealthState.MANUAL_ONLY,
-                HealthState.PAUSED,
-                HealthState.NO_TRANSCRIPT,
-            }
+            and (
+                cur_health
+                in {
+                    HealthState.MANUAL_ONLY,
+                    HealthState.PAUSED,
+                    HealthState.NO_TRANSCRIPT,
+                }
+                or mode in {Mode.PAUSED, Mode.OFF_THE_RECORD}
+            )
         ):
             if store is not None:
+                if mode is Mode.OFF_THE_RECORD:
+                    retire_reason = ReasonCode.OFF_RECORD
+                elif ctx.display_by_ms <= last_rx_ms:
+                    retire_reason = ReasonCode.EXPIRED_UNEVALUATED
+                else:
+                    retire_reason = ReasonCode.SESSION_ENDED
                 store.record_decision(
                     run_id=run_id,
                     context=ctx,
                     terminal_state="retired",
-                    terminal_reason=(
-                        ReasonCode.EXPIRED_UNEVALUATED
-                        if ctx.display_by_ms <= last_rx_ms
-                        else ReasonCode.SESSION_ENDED
-                    ),
+                    terminal_reason=retire_reason,
                     classifier=None,
                     routing=None,
                     serialized_text=cin.serialized_text,
@@ -2831,6 +2843,7 @@ async def _simulate_one_dataset_session(
 
         clf_res = _calibrate_dataset_result(cal_obj, ctx, clf_raw, policy, snap.brief.mode)
         route_health = cur_health
+        allow_fb_probe = False
         if (
             health_override is None
             and provider is not None
@@ -2844,6 +2857,7 @@ async def _simulate_one_dataset_session(
                 and provider.half_open_probe_available
             ):
                 route_health = HealthState.OK
+                allow_fb_probe = True
             else:
                 prov_health = provider.health_state
                 if prov_health in {HealthState.OK, HealthState.TEMPLATE_ONLY}:
@@ -2858,57 +2872,50 @@ async def _simulate_one_dataset_session(
                                 "reason": "breaker",
                             }
                         )
-        manual_fallback_routing: RoutingDecision | None = None
+        routing = route_candidate(
+            ctx,
+            clf_res,
+            snap,
+            policy,
+            mode=mode,
+            health=route_health,
+            now_ms=ctx.anchor_received_ms,
+            ledger_texts=ledger_texts,
+            ledger_categories=ledger_categories,
+            prior_anchor_texts=prior_anchor_texts,
+            anchor_text=anchor_text or None,
+            recent_displayed_ms=displayed_times,
+        )
         if (
             is_manual
-            and cur_health is HealthState.MANUAL_ONLY
-            and isinstance(clf_raw, ClassifierErrorResult)
+            and routing.outcome is not Outcome.ROUTE
+            and routing.outcome is not Outcome.SUPPRESS
+            and ReasonCode.SPEAKER_UNCERTAIN not in routing.reason_codes
+            and (cur_health is not HealthState.TEMPLATE_ONLY or allow_fb_probe)
             and provider is not None
             and policy.generator.enabled
             and not local_blocked
             and policy.categories
         ):
-            m_brk = provider.advance_clock(ctx.anchor_received_ms)
-            if provider.health_state is HealthState.OK or (
-                m_brk is BreakerState.HALF_OPEN and provider.half_open_probe_available
-            ):
-                m_cat = (
-                    Category.FOLLOW_UP
-                    if Category.FOLLOW_UP in policy.categories
-                    else next(iter(policy.categories))
-                )
-                manual_fallback_routing = RoutingDecision(
-                    schema_version=SCHEMA_VERSION,
-                    candidate_id=ctx.candidate_id,
-                    policy_version=policy.policy_version,
-                    policy_sha256=policy.policy_sha256,
-                    based_on_state_version=snap.state_version,
-                    outcome=Outcome.ROUTE,
-                    route=Route.GENERATOR,
-                    category=m_cat,
-                    reason_codes=(ReasonCode.MANUAL_REQUEST,),
-                    abstain_reasons=(),
-                    thresholds=None,
-                    decided_ms=ctx.anchor_received_ms,
-                )
-        routing = (
-            manual_fallback_routing
-            if manual_fallback_routing is not None
-            else route_candidate(
-                ctx,
-                clf_res,
-                snap,
-                policy,
-                mode=mode,
-                health=route_health,
-                now_ms=ctx.anchor_received_ms,
-                ledger_texts=ledger_texts,
-                ledger_categories=ledger_categories,
-                prior_anchor_texts=prior_anchor_texts,
-                anchor_text=anchor_text or None,
-                recent_displayed_ms=displayed_times,
+            m_cat = (
+                Category.FOLLOW_UP
+                if Category.FOLLOW_UP in policy.categories
+                else next(iter(policy.categories))
             )
-        )
+            routing = RoutingDecision(
+                schema_version=SCHEMA_VERSION,
+                candidate_id=ctx.candidate_id,
+                policy_version=policy.policy_version,
+                policy_sha256=policy.policy_sha256,
+                based_on_state_version=snap.state_version,
+                outcome=Outcome.ROUTE,
+                route=Route.GENERATOR,
+                category=m_cat,
+                reason_codes=(ReasonCode.MANUAL_REQUEST,),
+                abstain_reasons=(),
+                thresholds=None,
+                decided_ms=ctx.anchor_received_ms,
+            )
         if routing.outcome is not Outcome.ROUTE or routing.category is None:
             t_state, t_reason = _dataset_non_routed_state(routing)
             if store is not None:
@@ -3193,9 +3200,13 @@ async def async_simulate_dataset_replay(
             health
             if health is not None
             else (
-                HealthState.TEMPLATE_ONLY
-                if (local_blocked or iter_provider is None)
-                else iter_provider.health_state
+                HealthState.PAUSED
+                if mode is Mode.PAUSED
+                else (
+                    HealthState.TEMPLATE_ONLY
+                    if (local_blocked or iter_provider is None)
+                    else iter_provider.health_state
+                )
             )
         )
         try:
