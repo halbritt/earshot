@@ -79,11 +79,12 @@ from coach.provider_adapter import ProviderAdapter, ProviderConfig, ProviderErro
 from coach.replay_evaluator import (
     DisplayedCardEvent,
     EvalLookCounter,
+    ReplayResult,
+    async_simulate_replay,
     match_opportunities,
     paired_conversation_bootstrap,
     run_latency_benchmark,
     simulate_dataset_replay,
-    simulate_replay,
     split_by_conversation,
     split_by_series,
     sweep_dataset_t_display,
@@ -1124,23 +1125,34 @@ def _cmd_replay(args: argparse.Namespace) -> int:
 
     try:
         with SQLiteStore(args.db) as store:
+
+            async def _run_session_replay(
+                sess_brief: SessionBrief, sess_evs: list[CanonicalEvent]
+            ) -> ReplayResult:
+                sess_provider = provider.clone_isolated() if provider is not None else None
+                try:
+                    return await async_simulate_replay(
+                        sess_brief,
+                        sess_evs,
+                        policy,
+                        clf,
+                        calibration=cal_obj,
+                        store=store,
+                        run_id=run_id,
+                        mode=mode,
+                        provider=sess_provider,
+                        simulated_latency_ms=args.simulated_latency_ms,
+                        cache_classifier=not args.no_cache,
+                    )
+                finally:
+                    if sess_provider is not None:
+                        await sess_provider.cancel_recovery()
+
             session_results = []
             session_briefs: list[tuple[SessionBrief, list[CanonicalEvent]]] = []
             for sid, sess_evs in grouped_events.items():
                 sess_brief = replace(brief, session_id=sid)
-                res_s = simulate_replay(
-                    sess_brief,
-                    sess_evs,
-                    policy,
-                    clf,
-                    calibration=cal_obj,
-                    store=store,
-                    run_id=run_id,
-                    mode=mode,
-                    provider=provider,
-                    simulated_latency_ms=args.simulated_latency_ms,
-                    cache_classifier=not args.no_cache,
-                )
+                res_s = asyncio.run(_run_session_replay(sess_brief, sess_evs))
                 session_results.append(res_s)
                 session_briefs.append((sess_brief, sess_evs))
 
@@ -1153,7 +1165,10 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             ]
             all_inv_passed = all(i.passed for i in invs)
             inv = invs[0]
-            report = build_session_report(store, res.session_id, run_id)
+            reports = [
+                build_session_report(store, r.session_id, run_id).to_dict() for r in session_results
+            ]
+            report = reports[0]
 
             payload = {
                 "session_id": res.session_id,
@@ -1179,8 +1194,11 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                     for c in all_cards
                 ],
                 "invariants": {**inv.to_dict(), "passed": all_inv_passed},
-                "report": report.to_dict(),
+                "report": report,
             }
+            if len(session_results) > 1:
+                payload["session_ids"] = [r.session_id for r in session_results]
+                payload["reports"] = reports
 
             labels: list[LabelRecord] = load_labels_jsonl(args.labels) if args.labels else []
             if args.labels:

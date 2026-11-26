@@ -701,8 +701,8 @@ def test_simulate_replay_wakes_for_open_tail_anchor_display_by_before_far_future
         assert res.decisions_count == 1
         decs = store.get_decisions(brief.session_id, "r-open")
         assert len(decs) == 1
-        assert decs[0]["terminal_state"] == "retired"
-        assert decs[0]["terminal_reason"] == "expired_unevaluated"
+        assert decs[0]["terminal_state"] == "expired"
+        assert decs[0]["terminal_reason"] == "display_by_passed"
         assert decs[0]["based_on_state_version"] == 1
 
 
@@ -1128,20 +1128,25 @@ def test_async_sweep_dataset_t_display_isolates_provider_breaker_state(tmp_path:
                 provider=provider,
             )
             assert [pt["t_display"] for pt in curve] == [0.3, 0.6]
-            # 2 failing calls per sweep iteration (breaker_consecutive_failures=2 trips on row 2)
-            assert http_calls == 4
+            # 3 independent sessions * 2 sweep iterations = 6 HTTP calls (each session gets an isolated breaker)
+            assert http_calls == 6
             assert provider.breaker_state is BreakerState.CLOSED
             assert provider.health_state is HealthState.OK
             assert not shared_client.is_closed
 
-            # Even when caller's provider is already OPEN / TEMPLATE_ONLY from a prior replay,
-            # async_sweep_dataset_t_display runs isolated and makes fresh HTTP calls.
+            # Even when caller's provider is already OPEN / TEMPLATE_ONLY,
+            # async_simulate_dataset_replay and async_sweep_dataset_t_display run isolated per session.
             open_provider = ProviderAdapter(
                 config=provider.config,
                 transport=transport,
                 client=shared_client,
                 validate_on_init=False,
             )
+            open_provider._record_failure(100)
+            open_provider._record_failure(200)
+            assert open_provider.breaker_state is BreakerState.OPEN
+            assert open_provider.health_state is HealthState.TEMPLATE_ONLY
+
             http_calls = 0
             await async_simulate_dataset_replay(
                 dataset_rows,
@@ -1149,7 +1154,7 @@ def test_async_sweep_dataset_t_display_isolates_provider_breaker_state(tmp_path:
                 clf,
                 provider=open_provider,
             )
-            assert http_calls == 2
+            assert http_calls == 3
             assert open_provider.breaker_state is BreakerState.OPEN
             assert open_provider.health_state is HealthState.TEMPLATE_ONLY
 
@@ -1163,7 +1168,7 @@ def test_async_sweep_dataset_t_display_isolates_provider_breaker_state(tmp_path:
                 provider=open_provider,
             )
             assert [pt["t_display"] for pt in curve_after_open] == [0.3, 0.6]
-            assert http_calls == 4
+            assert http_calls == 6
             assert open_provider.breaker_state is BreakerState.OPEN
             assert open_provider.health_state is HealthState.TEMPLATE_ONLY
             assert not shared_client.is_closed

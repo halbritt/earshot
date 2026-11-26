@@ -701,6 +701,7 @@ class SuggestionController:
     async def drain(self, *, timeout_s: float = 5.0) -> None:
         """Wait until queued ingest events, proactive job, and recorder are idle (for tests/EOF)."""
         await asyncio.wait_for(self._ingest_queue.join(), timeout=timeout_s)
+        await asyncio.wait_for(self._manual_queue.join(), timeout=timeout_s)
         await self.tick()
         if self._proactive_wake.is_set() or not self._proactive_idle.is_set():
             await asyncio.sleep(0)
@@ -978,6 +979,12 @@ class SuggestionController:
             reason_code=reason,
         )
 
+    def _update_prev_anchor(self, norm_text: str, seg_revs: dict[str, int], rx_ms: int) -> None:
+        if self._prev_anchor_rx_ms is None or rx_ms >= self._prev_anchor_rx_ms:
+            self._prev_anchor_norm_text = norm_text
+            self._prev_anchor_seg_revs = seg_revs
+            self._prev_anchor_rx_ms = rx_ms
+
     async def _run_proactive_once(self) -> bool:
         if self._mode not in {Mode.PROACTIVE, Mode.QUIET, Mode.SHADOW}:
             return False
@@ -1029,11 +1036,16 @@ class SuggestionController:
                 seg_ids = {s.segment_id for s in anchor.segments}
                 seg_revs = {s.segment_id: s.revision for s in anchor.segments}
                 same_seg_rev = bool(seg_ids & batch_prev_seg_ids)
+                out_of_order = (
+                    batch_prev_rx_ms is not None and anchor.anchor_received_ms < batch_prev_rx_ms
+                )
                 gap_exceeded = (
                     batch_prev_rx_ms is not None
                     and (anchor.anchor_received_ms - batch_prev_rx_ms) > 30_000
                 )
-                eff_prev = None if (same_seg_rev or gap_exceeded) else batch_prev_norm
+                eff_prev = (
+                    None if (same_seg_rev or out_of_order or gap_exceeded) else batch_prev_norm
+                )
                 pf = run_prefilter(
                     anchor,
                     state_version=snap.state_version,
@@ -1043,9 +1055,9 @@ class SuggestionController:
                 batch_prev_seg_ids = seg_ids
                 batch_prev_rx_ms = anchor.anchor_received_ms
                 if not pf.passed and pf.drop_record is not None:
-                    self._prev_anchor_norm_text = pf.normalized_text
-                    self._prev_anchor_seg_revs = seg_revs
-                    self._prev_anchor_rx_ms = anchor.anchor_received_ms
+                    self._update_prev_anchor(
+                        pf.normalized_text, seg_revs, anchor.anchor_received_ms
+                    )
                     drop = pf.drop_record
                     dummy_ctx = DecisionContext(
                         schema_version=SCHEMA_VERSION,
@@ -1180,15 +1192,11 @@ class SuggestionController:
                         self._cursor.mark_covered(built.anchor.segments)
                         if ctx.candidate_id in norm_by_cand:
                             p_norm, p_revs, p_rx = norm_by_cand[ctx.candidate_id]
-                            self._prev_anchor_norm_text = p_norm
-                            self._prev_anchor_seg_revs = p_revs
-                            self._prev_anchor_rx_ms = p_rx
+                            self._update_prev_anchor(p_norm, p_revs, p_rx)
                         continue
                 if ctx.candidate_id in norm_by_cand:
                     p_norm, p_revs, p_rx = norm_by_cand[ctx.candidate_id]
-                    self._prev_anchor_norm_text = p_norm
-                    self._prev_anchor_seg_revs = p_revs
-                    self._prev_anchor_rx_ms = p_rx
+                    self._update_prev_anchor(p_norm, p_revs, p_rx)
                 eff_health = (
                     HealthState.OK if (probe_ready and not probe_reserved) else self._health
                 )
@@ -2639,6 +2647,21 @@ class SuggestionController:
             reason=ReasonCode.MANUAL_REQUEST,
         )
 
+    def _on_manual_future_done(self, fut: asyncio.Future[ManualResult]) -> None:
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc is not None:
+            self._manual_in_flight = False
+            self._manual_status = {"status": "error", "message": "Manual request failed."}
+            self._emit_tel(
+                level=TelemetryLevel.LIFECYCLE,
+                kind="manual_error",
+                stage="manual_lane",
+                payload={"error": str(exc)},
+            )
+            self._schedule_ui_broadcast()
+
     async def handle_ui_action(self, action: Mapping[str, Any]) -> dict[str, Any] | None:
         act = str(action.get("action") or "").strip().lower()
         now_ms = self._clock.now_ms()
@@ -2656,11 +2679,14 @@ class SuggestionController:
                     self._manual_in_flight = True
                     loop = asyncio.get_running_loop()
                     fut: asyncio.Future[ManualResult] = loop.create_future()
+                    fut.add_done_callback(self._on_manual_future_done)
                     try:
                         await self._manual_queue.put(fut)
                     except BaseException:
                         self._manual_in_flight = False
+                        fut.cancel()
                         raise
+                    await asyncio.sleep(0)
             else:
                 await self.trigger_manual()
             await self._flush_ui_broadcast()

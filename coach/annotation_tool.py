@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import random
 import secrets
 import threading
@@ -135,8 +136,8 @@ class Pass1Session:
         store: SQLiteStore | None = None,
         run_id: str = "annotate-pass1",
     ) -> None:
-        if speed <= 0.0:
-            raise AnnotationValidationError(f"speed must be > 0, got {speed}")
+        if not math.isfinite(speed) or speed <= 0.0:
+            raise AnnotationValidationError(f"speed must be finite and > 0, got {speed}")
         if initial_ms < 0:
             raise AnnotationValidationError(f"initial_ms must be >= 0, got {initial_ms}")
         self._brief = brief
@@ -253,9 +254,12 @@ class Pass1Session:
         state_version_override: int | None = None,
     ) -> LabelRecord:
         with self._lock:
+            if at_ms is not None and at_ms < 0:
+                raise AnnotationValidationError(f"at_ms must be >= 0, got {at_ms}")
             if at_ms is not None and at_ms > self._now_ms:
-                self._now_ms = at_ms
-                self._apply_up_to(self._now_ms)
+                raise AnnotationLockError(
+                    f"scroll_ahead_forbidden: cannot mark at {at_ms}ms past {self._now_ms}ms"
+                )
             snap = self._state.snapshot()
             recipient_ids = {"ME", snap.brief.recipient.participant_id}
             other_segs = [s for s in snap.segments if s.speaker_id not in recipient_ids]
@@ -471,7 +475,15 @@ def load_review_queue_items(
     ordered = sorted(events, key=lambda e: (e.received_ms, e.source_sequence, e.event_id))
     items: list[Pass2Item] = []
     for idx, entry in enumerate(review_queue, start=1):
+        target_revs: dict[str, int] = {}
+        for ref in entry.get("evidence_refs") or ():
+            if isinstance(ref, Mapping) and "segment_id" in ref:
+                sid_ref = str(ref["segment_id"])
+                rev_val = ref.get("revision")
+                if rev_val is not None:
+                    target_revs[sid_ref] = max(target_revs.get(sid_ref, 1), int(rev_val))
         seg_ids = {str(s) for s in (entry.get("segment_ids") or [])}
+        seg_ids.update(target_revs)
         if not seg_ids and entry.get("evidence_refs"):
             seg_ids = {
                 str(r["segment_id"])
@@ -482,13 +494,16 @@ def load_review_queue_items(
         anchor_rx: int | None = None
         for ev in ordered:
             state.apply(ev)
-            if (
-                ev.kind is EventKind.SEGMENT
-                and ev.stability is Stability.COMMITTED
-                and ev.segment_id in seg_ids
+            if ev.segment_id in seg_ids and (
+                (ev.kind is EventKind.SEGMENT and ev.stability is Stability.COMMITTED)
+                or ev.kind is EventKind.SPEAKER_UPDATE
             ):
                 snap_now = state.snapshot()
-                if seg_ids.issubset(snap_now.segments_by_id):
+                if seg_ids.issubset(snap_now.segments_by_id) and all(
+                    snap_now.segments_by_id[s].stability is Stability.COMMITTED
+                    and snap_now.segments_by_id[s].revision >= target_revs.get(s, 1)
+                    for s in seg_ids
+                ):
                     anchor_rx = ev.received_ms
                     break
         snap = state.snapshot()

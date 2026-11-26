@@ -93,6 +93,8 @@ class CardUIServer:
         on_action: ActionHandler | None = None,
         initial_state: UIStateSnapshot | None = None,
         emit_card_events: bool = False,
+        send_timeout_s: float = 1.0,
+        client_queue_maxsize: int = 64,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError(f"CardUIServer must bind strictly to 127.0.0.1, got {host!r}")
@@ -104,6 +106,8 @@ class CardUIServer:
         self._token = session_token or secrets.token_urlsafe(32)
         self._on_action = on_action
         self._emit_card_events = bool(emit_card_events)
+        self._send_timeout_s = max(0.05, float(send_timeout_s))
+        self._client_queue_maxsize = max(1, int(client_queue_maxsize))
         self._last_emitted_card_id: str | None = None
         self._broadcast_lock = asyncio.Lock()
         self._last_broadcast_seq: int = (
@@ -116,6 +120,9 @@ class CardUIServer:
         )
         self._server: Server | None = None
         self._clients: set[ServerConnection] = set()
+        self._client_queues: dict[ServerConnection, asyncio.Queue[tuple[str, ...]]] = {}
+        self._client_tasks: dict[ServerConnection, asyncio.Task[None]] = {}
+        self._close_tasks: set[asyncio.Task[None]] = set()
         self._static_cache: dict[str, bytes] = {
             "index.html": (STATIC_DIR / "index.html").read_bytes(),
             "app.js": (STATIC_DIR / "app.js").read_bytes(),
@@ -161,12 +168,71 @@ class CardUIServer:
         if self._server.sockets:
             self._bound_port = int(self._server.sockets[0].getsockname()[1])
 
+    @staticmethod
+    async def _close_ws_quiet(ws: ServerConnection) -> None:
+        with contextlib.suppress(OSError, ConnectionClosed):
+            await ws.close()
+
+    def _drop_client_sync(self, ws: ServerConnection, *, close: bool = False) -> None:
+        self._clients.discard(ws)
+        self._client_queues.pop(ws, None)
+        task = self._client_tasks.pop(ws, None)
+        cur = asyncio.current_task()
+        if task is not None and task is not cur and not task.done():
+            task.cancel()
+        if close:
+            close_task = asyncio.create_task(self._close_ws_quiet(ws))
+            self._close_tasks.add(close_task)
+            close_task.add_done_callback(self._close_tasks.discard)
+
+    async def _remove_client(self, ws: ServerConnection) -> None:
+        self._clients.discard(ws)
+        self._client_queues.pop(ws, None)
+        task = self._client_tasks.pop(ws, None)
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    def _ensure_client_queue(self, ws: ServerConnection) -> asyncio.Queue[tuple[str, ...]]:
+        q = self._client_queues.get(ws)
+        if q is None:
+            q = asyncio.Queue(maxsize=self._client_queue_maxsize)
+            self._client_queues[ws] = q
+            self._client_tasks[ws] = asyncio.create_task(self._client_writer(ws, q))
+        return q
+
+    async def _client_writer(
+        self, ws: ServerConnection, queue: asyncio.Queue[tuple[str, ...]]
+    ) -> None:
+        try:
+            while True:
+                frames = await queue.get()
+                try:
+                    for frame in frames:
+                        await asyncio.wait_for(ws.send(frame), timeout=self._send_timeout_s)
+                finally:
+                    queue.task_done()
+        except OSError, ConnectionClosed, TimeoutError:
+            self._drop_client_sync(ws, close=True)
+        except asyncio.CancelledError:
+            raise
+
     async def stop(self) -> None:
         clients = list(self._clients)
+        tasks = list(self._client_tasks.values()) + list(self._close_tasks)
+        self._clients.clear()
+        self._client_queues.clear()
+        self._client_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         for ws in clients:
             with contextlib.suppress(OSError, ConnectionClosed):
                 await ws.close()
-        self._clients.clear()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -289,19 +355,21 @@ class CardUIServer:
             if not self._clients:
                 return
             encoded = json.dumps(payload, sort_keys=True)
-            encoded_card = (
-                json.dumps(card_frame, sort_keys=True) if card_frame is not None else None
+            frames: tuple[str, ...] = (
+                (encoded, json.dumps(card_frame, sort_keys=True))
+                if card_frame is not None
+                else (encoded,)
             )
-            dead: list[ServerConnection] = []
+            stalled: list[ServerConnection] = []
             for ws in list(self._clients):
+                q = self._ensure_client_queue(ws)
                 try:
-                    await ws.send(encoded)
-                    if encoded_card is not None:
-                        await ws.send(encoded_card)
-                except OSError, ConnectionClosed:
-                    dead.append(ws)
-            for ws in dead:
-                self._clients.discard(ws)
+                    q.put_nowait(frames)
+                except asyncio.QueueFull:
+                    stalled.append(ws)
+            for ws in stalled:
+                self._drop_client_sync(ws, close=True)
+        await asyncio.sleep(0)
 
     def update_state(
         self,
@@ -321,17 +389,29 @@ class CardUIServer:
         else:
             self._state = {"type": "state", **dict(state)}
 
+    async def _send_ws_safe(self, websocket: ServerConnection, payload: Mapping[str, Any]) -> bool:
+        try:
+            await asyncio.wait_for(
+                websocket.send(json.dumps(payload)),
+                timeout=self._send_timeout_s,
+            )
+            return True
+        except OSError, ConnectionClosed, TimeoutError:
+            return False
+
     async def _ws_handler(self, websocket: ServerConnection) -> None:
         async with self._broadcast_lock:
             self._clients.add(websocket)
+            q = self._ensure_client_queue(websocket)
+            init_frames: list[str] = [json.dumps(self._state, sort_keys=True)]
+            if self._emit_card_events:
+                card_frame = self._build_card_frame(self._state)
+                if card_frame is not None:
+                    init_frames.append(json.dumps(card_frame, sort_keys=True))
             try:
-                await websocket.send(json.dumps(self._state, sort_keys=True))
-                if self._emit_card_events:
-                    card_frame = self._build_card_frame(self._state)
-                    if card_frame is not None:
-                        await websocket.send(json.dumps(card_frame, sort_keys=True))
-            except OSError, ConnectionClosed:
-                self._clients.discard(websocket)
+                q.put_nowait(tuple(init_frames))
+            except asyncio.QueueFull:
+                self._drop_client_sync(websocket, close=True)
                 return
         try:
             async for raw in websocket:
@@ -340,13 +420,20 @@ class CardUIServer:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
-                    await websocket.send(json.dumps({"type": "error", "error": "invalid_json"}))
+                    if not await self._send_ws_safe(
+                        websocket, {"type": "error", "error": "invalid_json"}
+                    ):
+                        break
                     continue
                 if not isinstance(msg, dict):
-                    await websocket.send(json.dumps({"type": "error", "error": "invalid_message"}))
+                    if not await self._send_ws_safe(
+                        websocket, {"type": "error", "error": "invalid_message"}
+                    ):
+                        break
                     continue
                 if msg.get("type") == "ping":
-                    await websocket.send(json.dumps({"type": "pong"}))
+                    if not await self._send_ws_safe(websocket, {"type": "pong"}):
+                        break
                     continue
                 if msg.get("type") == "action" and self._on_action is not None:
                     try:
@@ -356,6 +443,9 @@ class CardUIServer:
                         if isinstance(res, Mapping):
                             await self.broadcast_state(res)
                     except Exception as exc:
-                        await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
+                        if not await self._send_ws_safe(
+                            websocket, {"type": "error", "error": str(exc)}
+                        ):
+                            break
         finally:
-            self._clients.discard(websocket)
+            await self._remove_client(websocket)

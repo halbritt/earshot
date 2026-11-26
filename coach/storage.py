@@ -342,7 +342,7 @@ class SQLiteStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, run_id) DO UPDATE SET
                     recipient_id = excluded.recipient_id,
-                    brief_json = COALESCE(excluded.brief_json, sessions.brief_json),
+                    brief_json = excluded.brief_json,
                     mode = excluded.mode,
                     runtime_mode = excluded.runtime_mode,
                     consent_basis = excluded.consent_basis,

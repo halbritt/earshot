@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import math
 import random
 import re
 import resource
@@ -1033,7 +1034,7 @@ class _ReplaySim:
         classify_margin = max(50, lat_margin + 1)
         latest_eval_ms = anchor.display_by_ms - self.policy.display.settle_ms - classify_margin
         if latest_eval_ms <= anchor.anchor_received_ms:
-            return anchor.display_by_ms
+            return anchor.anchor_received_ms
         return min(anchor.anchor_received_ms + 2000, latest_eval_ms)
 
     def is_open_tail_anchor(self, anchor: AnchorSpan, snap: StateSnapshot) -> bool:
@@ -1664,23 +1665,36 @@ class _ReplaySim:
         has_overflow = len(live_anchors) > max_per_job
         selected = live_anchors[-max_per_job:]
 
+        batch_prev_norm = self.prev_anchor_norm
+        batch_prev_seg_ids = set(self.prev_anchor_seg_ids)
+        batch_prev_rx_ms = self.prev_anchor_rx_ms
         surviving: list[tuple[ContextBuildResult, str]] = []
         for anchor in selected:
             seg_ids = {s.segment_id for s in anchor.segments}
-            same_seg_rev = bool(seg_ids & self.prev_anchor_seg_ids)
-            gap_exceeded = (
-                self.prev_anchor_rx_ms is not None
-                and (anchor.anchor_received_ms - self.prev_anchor_rx_ms) > 30_000
+            same_seg_rev = bool(seg_ids & batch_prev_seg_ids)
+            out_of_order = (
+                batch_prev_rx_ms is not None and anchor.anchor_received_ms < batch_prev_rx_ms
             )
-            eff_prev = None if (same_seg_rev or gap_exceeded) else self.prev_anchor_norm
+            gap_exceeded = (
+                batch_prev_rx_ms is not None
+                and (anchor.anchor_received_ms - batch_prev_rx_ms) > 30_000
+            )
+            eff_prev = None if (same_seg_rev or out_of_order or gap_exceeded) else batch_prev_norm
             pf = run_prefilter(
                 anchor,
                 state_version=snap.state_version,
                 previous_anchor_norm_text=eff_prev,
             )
-            self.prev_anchor_norm = pf.normalized_text
-            self.prev_anchor_seg_ids = seg_ids
-            self.prev_anchor_rx_ms = anchor.anchor_received_ms
+            batch_prev_norm = pf.normalized_text
+            batch_prev_seg_ids = seg_ids
+            batch_prev_rx_ms = anchor.anchor_received_ms
+            if (
+                self.prev_anchor_rx_ms is None
+                or anchor.anchor_received_ms >= self.prev_anchor_rx_ms
+            ):
+                self.prev_anchor_norm = pf.normalized_text
+                self.prev_anchor_seg_ids = seg_ids
+                self.prev_anchor_rx_ms = anchor.anchor_received_ms
             if not pf.passed and pf.drop_record is not None:
                 self.decisions_count += 1
                 self.dropped_count += 1
@@ -2787,33 +2801,38 @@ async def async_simulate_dataset_replay(
             by_session[sid],
             key=lambda pair: (pair[0].context.anchor_received_ms, pair[0].context.candidate_id),
         )
+        iter_provider = provider.clone_isolated() if provider is not None else None
         sess_eff_health = (
             health
             if health is not None
             else (
                 HealthState.TEMPLATE_ONLY
-                if (local_blocked or provider is None)
-                else provider.health_state
+                if (local_blocked or iter_provider is None)
+                else iter_provider.health_state
             )
         )
-        results.append(
-            await _simulate_one_dataset_session(
-                sid=sid,
-                items=items,
-                sess_brief=sess_brief,
-                policy=policy,
-                cal_obj=cal_obj,
-                tpl_map=tpl_map,
-                store=store,
-                run_id=run_id,
-                mode=mode,
-                provider=provider,
-                eff_health=sess_eff_health,
-                stage_latency_ms=stage_ms,
-                health_override=health,
-                local_blocked=local_blocked,
+        try:
+            results.append(
+                await _simulate_one_dataset_session(
+                    sid=sid,
+                    items=items,
+                    sess_brief=sess_brief,
+                    policy=policy,
+                    cal_obj=cal_obj,
+                    tpl_map=tpl_map,
+                    store=store,
+                    run_id=run_id,
+                    mode=mode,
+                    provider=iter_provider,
+                    eff_health=sess_eff_health,
+                    stage_latency_ms=stage_ms,
+                    health_override=health,
+                    local_blocked=local_blocked,
+                )
             )
-        )
+        finally:
+            if iter_provider is not None:
+                await iter_provider.cancel_recovery()
     return results
 
 
@@ -2827,8 +2846,15 @@ def simulate_dataset_replay(
     return asyncio.run(async_simulate_dataset_replay(dataset_rows, policy, classifier, **kwargs))
 
 
+def _validate_t_display(value: float) -> float:
+    t = float(value)
+    if not math.isfinite(t) or t < 0.0 or t > 1.0:
+        raise ValueError(f"t_display must be finite and within [0.0, 1.0], got {value!r}")
+    return t
+
+
 def _policy_with_t_display(policy: PolicyConfig, t_display: float) -> PolicyConfig:
-    t_disp = min(1.0, max(0.0, float(t_display)))
+    t_disp = _validate_t_display(t_display)
     new_cats: dict[Category, CategoryPolicy] = {}
     for cat, cpol in policy.categories.items():
         t_comp = min(cpol.t_compute, t_disp)
@@ -2857,10 +2883,11 @@ async def async_sweep_t_display(
     """Sweep `t_display` through policy-level replay using an isolated store (§12.8)."""
     if not t_display_values:
         raise ValueError("t_display_values must be non-empty")
+    validated_t = sorted(_validate_t_display(v) for v in t_display_values)
     _ = store  # Isolation: sweep runs never pollute caller's persistent DB.
     curve: list[dict[str, Any]] = []
     with SQLiteStore(":memory:") as sweep_store:
-        for t_disp in sorted(float(v) for v in t_display_values):
+        for t_disp in validated_t:
             swept_policy = _policy_with_t_display(policy, t_disp)
             all_cards: list[DisplayedCardEvent] = []
             total_dur_ms = 0
@@ -2945,9 +2972,10 @@ async def async_sweep_dataset_t_display(
     """Sweep `t_display` through policy-level dataset replay using an isolated store (§12.8)."""
     if not t_display_values:
         raise ValueError("t_display_values must be non-empty")
+    validated_t = sorted(_validate_t_display(v) for v in t_display_values)
     curve: list[dict[str, Any]] = []
     with SQLiteStore(":memory:") as sweep_store:
-        for idx, t_disp in enumerate(sorted(float(v) for v in t_display_values)):
+        for idx, t_disp in enumerate(validated_t):
             swept_policy = _policy_with_t_display(policy, t_disp)
             iter_provider = provider.clone_isolated() if provider is not None else None
             try:

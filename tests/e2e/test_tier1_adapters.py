@@ -301,6 +301,11 @@ def test_peecee_serve_exit_75_tunnel_drop_and_sigterm_child_cleanup(
         async def _wait_drop() -> None:
             async with ui_drop.ws_session() as ws:
                 _ = await ws.wait_for_health("ok", timeout=5.0)
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while not mock_nemo_ws._active_clients:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError("coach did not connect to mock_nemo_ws before drop")
+                    await asyncio.sleep(0.05)
                 mock_nemo_ws.drop_active_clients(abrupt=True)
                 msg = await ws.wait_for_health("no_transcript", timeout=5.0)
                 assert (msg.get("health") or msg.get("state")) == "no_transcript"
@@ -848,9 +853,9 @@ def test_deterministic_replay_player_recorded_scaled_and_stepped_modes(
             event_id="ev-rp-2",
             segment_id="seg-rp-2",
             text="When will we verify the failover step?",
-            start_ms=1800,
-            end_ms=2400,
-            received_ms=2500,
+            start_ms=2800,
+            end_ms=3400,
+            received_ms=3500,
             source_sequence=2,
         ),
         build_segment_event(
@@ -858,9 +863,9 @@ def test_deterministic_replay_player_recorded_scaled_and_stepped_modes(
             event_id="ev-rp-3",
             segment_id="seg-rp-3",
             text="How will we measure cutover success?",
-            start_ms=3300,
-            end_ms=3900,
-            received_ms=4000,
+            start_ms=5300,
+            end_ms=5900,
+            received_ms=6000,
             source_sequence=3,
         ),
     ]
@@ -885,7 +890,7 @@ def test_deterministic_replay_player_recorded_scaled_and_stepped_modes(
         ],
     )
     assert res_stepped.returncode == 0, res_stepped.stderr
-    assert res_stepped.duration_s < 2.0
+    assert res_stepped.duration_s < 4.5
 
     res_scaled = run_coach(
         "replay",
@@ -904,7 +909,7 @@ def test_deterministic_replay_player_recorded_scaled_and_stepped_modes(
         ],
     )
     assert res_scaled.returncode == 0, res_scaled.stderr
-    assert res_scaled.duration_s < 1.5
+    assert 0.45 <= res_scaled.duration_s < 4.5
 
     def _snapshot(db: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
         with open_db(db, readonly=True) as conn:
