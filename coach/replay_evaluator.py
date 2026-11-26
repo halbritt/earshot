@@ -1482,6 +1482,7 @@ class _ReplaySim:
                     self.transition_active(LedgerState.WITHDRAWN, fail_reason, at_ms=now_ms)
 
         if self.deferred is not None:
+            snap = self.state.snapshot()
             def_item = self.deferred
             fail_reason, defer_reason = self.revalidate_item(
                 def_item, snap, now_ms, is_active=False
@@ -1499,9 +1500,9 @@ class _ReplaySim:
                         self.last_proactive_display_ms + self.policy.display.cooldown_ms
                     )
 
-        snap = self.state.snapshot()
         still_settling: list[_ReplayPendingItem] = []
         for item in self.settling:
+            snap = self.state.snapshot()
             fail_reason, defer_reason = self.revalidate_item(item, snap, now_ms, is_active=False)
             if fail_reason is not None:
                 self.close_pending(item, fail_reason, at_ms=now_ms)
@@ -2959,7 +2960,6 @@ async def _simulate_one_dataset_session(
             and routing.outcome is not Outcome.ROUTE
             and routing.outcome is not Outcome.SUPPRESS
             and ReasonCode.SPEAKER_UNCERTAIN not in routing.reason_codes
-            and _matches_do_not_suggest(anchor_text or "", None, snap.brief) is None
             and not anchor_has_recipient
             and (cur_health is not HealthState.TEMPLATE_ONLY or allow_fb_probe)
             and provider is not None
@@ -2972,20 +2972,36 @@ async def _simulate_one_dataset_session(
                 if Category.FOLLOW_UP in policy.categories
                 else next(iter(policy.categories))
             )
-            routing = RoutingDecision(
-                schema_version=SCHEMA_VERSION,
-                candidate_id=ctx.candidate_id,
-                policy_version=policy.policy_version,
-                policy_sha256=policy.policy_sha256,
-                based_on_state_version=snap.state_version,
-                outcome=Outcome.ROUTE,
-                route=Route.GENERATOR,
-                category=m_cat,
-                reason_codes=(ReasonCode.MANUAL_REQUEST,),
-                abstain_reasons=(),
-                thresholds=None,
-                decided_ms=ctx.anchor_received_ms,
-            )
+            if _matches_do_not_suggest(anchor_text or "", m_cat, snap.brief) is not None:
+                routing = RoutingDecision(
+                    schema_version=SCHEMA_VERSION,
+                    candidate_id=ctx.candidate_id,
+                    policy_version=policy.policy_version,
+                    policy_sha256=policy.policy_sha256,
+                    based_on_state_version=snap.state_version,
+                    outcome=Outcome.SUPPRESS,
+                    route=None,
+                    category=None,
+                    reason_codes=(ReasonCode.DO_NOT_SUGGEST,),
+                    abstain_reasons=(),
+                    thresholds=None,
+                    decided_ms=ctx.anchor_received_ms,
+                )
+            else:
+                routing = RoutingDecision(
+                    schema_version=SCHEMA_VERSION,
+                    candidate_id=ctx.candidate_id,
+                    policy_version=policy.policy_version,
+                    policy_sha256=policy.policy_sha256,
+                    based_on_state_version=snap.state_version,
+                    outcome=Outcome.ROUTE,
+                    route=Route.GENERATOR,
+                    category=m_cat,
+                    reason_codes=(ReasonCode.MANUAL_REQUEST,),
+                    abstain_reasons=(),
+                    thresholds=None,
+                    decided_ms=ctx.anchor_received_ms,
+                )
         if routing.outcome is not Outcome.ROUTE or routing.category is None:
             t_state, t_reason = _dataset_non_routed_state(routing)
             if store is not None:

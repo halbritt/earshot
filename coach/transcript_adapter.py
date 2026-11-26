@@ -1040,7 +1040,7 @@ class NemotronSegmenter:
         )
         self._last_speaker_id = binding.speaker_id
 
-        confs = [float(w.confidence) for w in words]
+        confs = [c for w in words if (c := _coerce_opt_finite_float(w.confidence)) is not None]
         mean_conf = sum(confs) / len(confs) if confs else 1.0
         low_gate = self._gate_is_low_quality(start_ms, end_ms)
         low_conf = low_gate or (

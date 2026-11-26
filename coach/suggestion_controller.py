@@ -2543,6 +2543,11 @@ class SuggestionController:
                 cur_snap = self._state.snapshot()
                 allow_fb_probe = self._half_open_probe_ready()
                 if self._health is not HealthState.TEMPLATE_ONLY or allow_fb_probe:
+                    m_cat = (
+                        Category.FOLLOW_UP
+                        if Category.FOLLOW_UP in self._policy.categories
+                        else next(iter(self._policy.categories))
+                    )
                     recipient_ids = {"ME", cur_snap.brief.recipient.participant_id}
                     non_routed_cids = {
                         b.context.candidate_id
@@ -2554,7 +2559,9 @@ class SuggestionController:
                         cid = b_cand.context.candidate_id
                         if cid in rejected_cand_ids:
                             continue
-                        is_dns = _matches_do_not_suggest(txt_cand, None, cur_snap.brief) is not None
+                        is_dns = (
+                            _matches_do_not_suggest(txt_cand, m_cat, cur_snap.brief) is not None
+                        )
                         is_rec = any(
                             (seg := cur_snap.segments_by_id.get(r.segment_id)) is not None
                             and seg.speaker_id in recipient_ids
@@ -2569,6 +2576,20 @@ class SuggestionController:
                             rejected_cand_ids.add(cid)
                             if fb_empty_reason is None:
                                 fb_empty_reason = rej_reason
+                            rej_rt = RoutingDecision(
+                                schema_version=SCHEMA_VERSION,
+                                candidate_id=cid,
+                                policy_version=self._policy.policy_version,
+                                policy_sha256=self._policy.policy_sha256,
+                                based_on_state_version=cur_snap.state_version,
+                                outcome=Outcome.SUPPRESS if is_dns else Outcome.ABSTAIN,
+                                route=None,
+                                category=None,
+                                reason_codes=(rej_reason,),
+                                abstain_reasons=() if is_dns else (rej_reason,),
+                                thresholds=None,
+                                decided_ms=self._clock.now_ms(),
+                            )
                             if cid not in non_routed_cids:
                                 dummy_rej_clf = ClassifierResult(
                                     schema_version=SCHEMA_VERSION,
@@ -2583,22 +2604,18 @@ class SuggestionController:
                                         b_cand.context.anchor_refs + b_cand.context.context_refs
                                     ),
                                 )
-                                rej_rt = RoutingDecision(
-                                    schema_version=SCHEMA_VERSION,
-                                    candidate_id=cid,
-                                    policy_version=self._policy.policy_version,
-                                    policy_sha256=self._policy.policy_sha256,
-                                    based_on_state_version=cur_snap.state_version,
-                                    outcome=Outcome.SUPPRESS if is_dns else Outcome.ABSTAIN,
-                                    route=None,
-                                    category=None,
-                                    reason_codes=(rej_reason,),
-                                    abstain_reasons=() if is_dns else (rej_reason,),
-                                    thresholds=None,
-                                    decided_ms=self._clock.now_ms(),
-                                )
                                 non_routed_manual.append((b_cand, dummy_rej_clf, rej_rt))
                                 non_routed_cids.add(cid)
+                            elif is_dns:
+                                non_routed_manual = [
+                                    (
+                                        (b_item, clf_item, rej_rt)
+                                        if b_item.context is not None
+                                        and b_item.context.candidate_id == cid
+                                        else (b_item, clf_item, rt_item)
+                                    )
+                                    for b_item, clf_item, rt_item in non_routed_manual
+                                ]
                             continue
                         st = self._check_manual_staleness_locked(
                             ctx=b_cand.context,
@@ -3267,6 +3284,7 @@ class SuggestionController:
 
         # 2. Revalidate deferred slot
         if self._deferred is not None:
+            snap = self._state.snapshot()
             def_item = self._deferred
             fail_reason, defer_reason = self._revalidate_item(
                 def_item, snap, now_ms, is_active=False
@@ -3287,9 +3305,9 @@ class SuggestionController:
                     )
 
         # 3. Advance settling candidates (boundary early release or settle timeout)
-        snap = self._state.snapshot()
         still_settling: list[_PendingItem] = []
         for item in self._settling:
+            snap = self._state.snapshot()
             fail_reason, defer_reason = self._revalidate_item(item, snap, now_ms, is_active=False)
             if fail_reason is not None:
                 await self._close_pending(item, fail_reason, at_ms=now_ms)

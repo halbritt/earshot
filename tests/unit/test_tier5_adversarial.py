@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import urllib.request
 from collections.abc import Mapping, Sequence
@@ -87,7 +88,16 @@ from coach.routing_policy import load_policy, route_candidate
 from coach.storage import SQLiteStore
 from coach.suggestion_controller import SuggestionController
 from coach.telemetry import check_conservation_invariants
-from coach.transcript_adapter import ManualClock, ReplayPlayer, ReplayTimingMode
+from coach.transcript_adapter import (
+    AsrWord,
+    DeepgramNormalizer,
+    ManualClock,
+    NemotronSegmenter,
+    ReplayPlayer,
+    ReplayTimingMode,
+    SegmenterConfig,
+    _extract_nemo_words,
+)
 from coach.ui import CardUIServer, UIStateSnapshot
 
 POLICY_PATH = Path("policies/policy-v0-a.yaml")
@@ -5988,3 +5998,564 @@ async def test_dataset_replay_reconstructs_me_and_uncertain_anchor_speakers() ->
         assert decs_u[0]["outcome"] == Outcome.ABSTAIN.value
         assert decs_u[0]["terminal_reason"] == ReasonCode.SPEAKER_UNCERTAIN.value
         assert check_conservation_invariants(db_u, sid_u, "r-q").passed
+
+
+@pytest.mark.asyncio
+async def test_settling_batch_duplicate_preserves_deferred_card() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        display=replace(
+            base_pol.display,
+            settle_ms=500,
+            cooldown_ms=0,
+            display_ttl_ms=1000,
+            max_cards_per_10_min=10,
+            max_candidate_age_ms=15000,
+        ),
+        categories={
+            **base_pol.categories,
+            Category.CONFIRM_OWNER: replace(
+                base_pol.categories[Category.CONFIRM_OWNER],
+                route=Route.GENERATOR,
+            ),
+        },
+    )
+
+    class _BatchClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierResult]:
+            out: list[ClassifierResult] = []
+            for raw in contexts:
+                inp = coerce_classifier_input(raw)
+                ctx = inp.context
+                anchor_part = inp.serialized_text.split("[ANCHOR]")[-1].lower()
+                if "canary" in anchor_part:
+                    sc = ScoreSet(opportunity=0.90, categories={"SUCCESS_CRITERION": 0.90})
+                else:
+                    sc = ScoreSet(opportunity=0.95, categories={"CONFIRM_OWNER": 0.95})
+                out.append(
+                    ClassifierResult(
+                        schema_version=SCHEMA_VERSION,
+                        candidate_id=ctx.candidate_id,
+                        based_on_state_version=ctx.based_on_state_version,
+                        classifier_version=self.classifier_version,
+                        raw_scores=sc,
+                        calibration_version=policy.classifier.calibration,
+                        calibrated_scores=sc,
+                        latency_ms=1.0,
+                        input_refs=ctx.anchor_refs,
+                    )
+                )
+            return out
+
+    def _dup_gen(req: httpx.Request) -> httpx.Response:
+        body = req.content.decode("utf-8", errors="ignore")
+        ev_id = "seg-3" if "billing" in body else "seg-2"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "question": "Who will own deployment rollout right now?",
+                                    "evidence_segment_ids": [ev_id],
+                                    "decline_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+            },
+        )
+
+    def _make_events(sid: str) -> list[CanonicalEvent]:
+        return [
+            _seg_ev(
+                sid,
+                "ev-1",
+                "seg-1",
+                "We should verify canary rollout for payments works properly.",
+                speaker="speaker-a",
+                rx_ms=2000,
+                start_ms=1500,
+                end_ms=1900,
+                seq=1,
+            ),
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                event_id="ev-int-1",
+                session_id=sid,
+                kind=EventKind.SEGMENT,
+                stability=Stability.INTERIM,
+                received_ms=2100,
+                source_sequence=2,
+                source_id="test",
+                segment_id="seg-int",
+                source_revision=1,
+                channel=0,
+                speaker_id="speaker-b",
+                start_ms=2000,
+                end_ms=2100,
+                text="Wait the slo is",
+            ),
+            _seg_ev(
+                sid,
+                "ev-2",
+                "seg-2",
+                "Someone needs to handle deployment rollout for payments.",
+                speaker="speaker-a",
+                rx_ms=2600,
+                start_ms=2200,
+                end_ms=2550,
+                seq=3,
+            ),
+            _seg_ev(
+                sid,
+                "ev-3",
+                "seg-3",
+                "Please assign deployment rollout for billing soon.",
+                speaker="speaker-b",
+                rx_ms=2600,
+                start_ms=2560,
+                end_ms=2590,
+                seq=4,
+            ),
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                event_id="ev-int-commit",
+                session_id=sid,
+                kind=EventKind.SEGMENT,
+                stability=Stability.COMMITTED,
+                received_ms=3200,
+                source_sequence=5,
+                source_id="test",
+                segment_id="seg-int",
+                source_revision=2,
+                channel=0,
+                speaker_id="speaker-b",
+                start_ms=2000,
+                end_ms=3150,
+                text="Okay thanks.",
+            ),
+        ]
+
+    # Part A: SuggestionController live runtime
+    sid_ctrl = "settle-dup-ctrl"
+    brief_ctrl = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id=sid_ctrl,
+        mode=policy.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+    )
+    clk = ManualClock(2000)
+    db_ctrl = SQLiteStore(":memory:")
+    prov_ctrl = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+        ),
+        transport=httpx.MockTransport(_dup_gen),
+        clock_ms=clk.now_ms,
+    )
+    ctrl = SuggestionController(
+        brief=brief_ctrl,
+        policy=policy,
+        classifier=_BatchClf(),  # type: ignore[arg-type]
+        provider=prov_ctrl,
+        store=db_ctrl,
+        run_id="r-ctrl",
+        mode=Mode.PROACTIVE,
+        clock=clk,
+    )
+    evs_ctrl = _make_events(sid_ctrl)
+    await ctrl.start()
+    try:
+        await ctrl.submit_event(evs_ctrl[0])
+        await ctrl.submit_event(evs_ctrl[1])
+        await ctrl.drain()
+        clk.set_ms(2500)
+        await ctrl.tick(2500)
+        assert ctrl._deferred is not None
+        assert ctrl._deferred.cand.evidence_refs[0].segment_id == "seg-1"
+
+        clk.set_ms(2600)
+        await ctrl.submit_event(evs_ctrl[2])
+        await ctrl.submit_event(evs_ctrl[3])
+        await ctrl.drain()
+        assert len(ctrl._settling) == 2
+
+        clk.set_ms(3100)
+        await ctrl.tick(3100)
+        assert ctrl.active_card is not None
+        assert ctrl.active_card.text == "Who will own deployment rollout right now?"
+        assert ctrl._deferred is not None
+        assert ctrl._deferred.cand.evidence_refs[0].segment_id == "seg-1"
+
+        clk.set_ms(3200)
+        await ctrl.submit_event(evs_ctrl[4])
+        await ctrl.drain()
+        clk.set_ms(4100)
+        await ctrl.tick(4100)
+        assert ctrl.active_card is not None
+        assert "canary rollout for payments" in ctrl.active_card.text
+    finally:
+        await ctrl.stop()
+        await prov_ctrl.aclose()
+
+    sugs_ctrl = db_ctrl.get_suggestions(sid_ctrl, "r-ctrl")
+    by_seg_ctrl = {json.loads(s["evidence_refs_json"])[0]["segment_id"]: s for s in sugs_ctrl}
+    assert by_seg_ctrl["seg-2"]["current_state"] == "expired"
+    assert by_seg_ctrl["seg-3"]["current_state"] == "withdrawn"
+    assert by_seg_ctrl["seg-3"]["terminal_reason"] == ReasonCode.DUPLICATE.value
+    assert by_seg_ctrl["seg-1"]["current_state"] == "expired"
+    assert by_seg_ctrl["seg-1"]["terminal_reason"] != ReasonCode.DISPLACED_BY_BETTER.value
+    assert check_conservation_invariants(db_ctrl, sid_ctrl, "r-ctrl").passed
+    db_ctrl.close()
+
+    # Part B: _ReplaySim parity
+    sid_rep = "settle-dup-rep"
+    brief_rep = replace(brief_ctrl, session_id=sid_rep)
+    prov_rep = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+        ),
+        transport=httpx.MockTransport(_dup_gen),
+    )
+    try:
+        with SQLiteStore(":memory:") as db_rep:
+            res_rep = await async_simulate_replay(
+                brief_rep,
+                _make_events(sid_rep),
+                policy,
+                _BatchClf(),  # type: ignore[arg-type]
+                provider=prov_rep,
+                store=db_rep,
+                run_id="r-rep",
+            )
+            displayed_seg_ids = [c.evidence_refs[0].segment_id for c in res_rep.displayed_cards]
+            assert "seg-2" in displayed_seg_ids
+            assert "seg-1" in displayed_seg_ids
+            assert "seg-3" not in displayed_seg_ids
+            sugs_rep = db_rep.get_suggestions(sid_rep, "r-rep")
+            by_seg_rep = {json.loads(s["evidence_refs_json"])[0]["segment_id"]: s for s in sugs_rep}
+            assert by_seg_rep["seg-3"]["current_state"] == "withdrawn"
+            assert by_seg_rep["seg-3"]["terminal_reason"] == ReasonCode.DUPLICATE.value
+            assert by_seg_rep["seg-1"]["terminal_reason"] != ReasonCode.DISPLACED_BY_BETTER.value
+            assert check_conservation_invariants(db_rep, sid_rep, "r-rep").passed
+    finally:
+        await prov_rep.aclose()
+
+
+@pytest.mark.asyncio
+async def test_manual_fallback_blocks_do_not_suggest_fallback_category() -> None:
+    base_pol = load_policy(POLICY_PATH)
+    policy_with_followup = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+        categories={
+            **base_pol.categories,
+            Category.FOLLOW_UP: replace(
+                base_pol.categories[Category.CONFIRM_OWNER],
+                route=Route.GENERATOR,
+                template=None,
+            ),
+        },
+    )
+    policy_default_cat = replace(
+        base_pol,
+        generator=replace(base_pol.generator, enabled=True),
+        display=replace(base_pol.display, settle_ms=0, cooldown_ms=0),
+    )
+
+    class _ErrCatClf:
+        classifier_version = base_pol.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **_kwargs: Any
+        ) -> list[ClassifierErrorResult]:
+            return [
+                make_classifier_error_result(
+                    coerce_classifier_input(raw).context,
+                    self.classifier_version,
+                    error="backend_error",
+                    retryable=False,
+                )
+                for raw in contexts
+            ]
+
+    http_calls = 0
+
+    def _counting_gen(_req: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "question": "What should we clarify next?",
+                                    "evidence_segment_ids": ["seg-cat-dns"],
+                                    "decline_reason": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+            },
+        )
+
+    for tag, init_health, policy, dns_cat in [
+        ("manual-only-followup", HealthState.MANUAL_ONLY, policy_with_followup, "follow_up"),
+        ("ok-err-followup", HealthState.OK, policy_with_followup, "follow_up"),
+        ("ok-err-default", HealthState.OK, policy_default_cat, "confirm_owner"),
+    ]:
+        http_calls = 0
+        sid = f"man-cat-dns-{tag}"
+        run_id = f"r-{tag}"
+        brief = SessionBrief(
+            schema_version=SCHEMA_VERSION,
+            session_id=sid,
+            mode=policy.mode,
+            objective="Ship v1",
+            recipient=RecipientConfig("speaker-me"),
+            do_not_suggest=(dns_cat,),
+        )
+        clk = ManualClock(1000)
+        db = SQLiteStore(":memory:")
+        prov = ProviderAdapter(
+            ProviderConfig(
+                provider="local",
+                base_url="http://127.0.0.1:8000/v1",
+                model_id="qwen3:14b",
+                local_only=True,
+                use_streaming=False,
+            ),
+            transport=httpx.MockTransport(_counting_gen),
+        )
+        ctrl = SuggestionController(
+            brief=brief,
+            policy=policy,
+            classifier=_ErrCatClf(),  # type: ignore[arg-type]
+            provider=prov,
+            store=db,
+            run_id=run_id,
+            mode=Mode.PROACTIVE,
+            clock=clk,
+        )
+        await ctrl.start()
+        try:
+            if init_health is not HealthState.OK:
+                async with ctrl._state_lock:
+                    ctrl._set_health(init_health, "test_setup")
+            await ctrl.submit_event(
+                _seg_ev(
+                    sid,
+                    "ev-cat-dns",
+                    "seg-cat-dns",
+                    "Someone needs to clarify the rollout checklist right now.",
+                    speaker="speaker-a",
+                    rx_ms=1000,
+                    start_ms=500,
+                    end_ms=900,
+                    seq=1,
+                )
+            )
+            await ctrl.drain()
+            res = await ctrl.trigger_manual()
+            assert res.status == "empty", (tag, res)
+            assert res.reason is ReasonCode.DO_NOT_SUGGEST, (tag, res)
+            assert ctrl.active_card is None
+            await ctrl.drain()
+        finally:
+            await ctrl.stop()
+            await prov.aclose()
+
+        assert http_calls == 0, tag
+        assert db.get_egress_records(sid, run_id) == [], tag
+        decs = db.get_decisions(sid, run_id)
+        man_decs = [d for d in decs if d.get("origin") == "manual"]
+        assert len(man_decs) == 1
+        assert man_decs[0]["outcome"] == Outcome.SUPPRESS.value
+        assert man_decs[0]["terminal_state"] == "suppressed"
+        assert man_decs[0]["terminal_reason"] == ReasonCode.DO_NOT_SUGGEST.value
+        assert check_conservation_invariants(db, sid, run_id).passed
+        db.close()
+
+    # Dataset replay parity: ErrClf + Origin.MANUAL fallback with do_not_suggest=("follow_up",)
+    http_calls = 0
+    ds_sid = "ds-cat-dns"
+    ds_run = "r-ds-cat-dns"
+    ds_brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id=ds_sid,
+        mode=policy_with_followup.mode,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-me"),
+        do_not_suggest=("follow_up",),
+    )
+    st = CanonicalState(ds_brief)
+    st.apply(
+        _seg_ev(
+            ds_sid,
+            "ev-cat-dns",
+            "seg-cat-dns",
+            "Someone needs to clarify the rollout checklist right now.",
+            speaker="speaker-a",
+            rx_ms=1000,
+            start_ms=500,
+            end_ms=900,
+            seq=1,
+        )
+    )
+    snap = st.snapshot()
+    b_pro = build_decision_context(
+        snap, [snap.segments_by_id["seg-cat-dns"]], policy=policy_with_followup
+    )
+    b_man = build_decision_context(
+        snap,
+        [snap.segments_by_id["seg-cat-dns"]],
+        policy=policy_with_followup,
+        origin=Origin.MANUAL,
+    )
+    assert b_pro.context is not None and b_pro.serialized_text is not None
+    assert b_man.context is not None and b_man.serialized_text is not None
+    man_ctx = replace(
+        b_man.context, candidate_id="man-cat-dns-1", anchor_received_ms=1000, display_by_ms=13000
+    )
+    rows = [
+        {"context": b_pro.context.to_dict(), "serialized_text": b_pro.serialized_text},
+        {"context": man_ctx.to_dict(), "serialized_text": b_man.serialized_text},
+    ]
+    prov_ds = ProviderAdapter(
+        ProviderConfig(
+            provider="local",
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="qwen3:14b",
+            local_only=True,
+            use_streaming=False,
+        ),
+        transport=httpx.MockTransport(_counting_gen),
+    )
+    try:
+        with SQLiteStore(":memory:") as db_ds:
+            ds_res = await async_simulate_dataset_replay(
+                rows,
+                policy_with_followup,
+                _ErrCatClf(),  # type: ignore[arg-type]
+                brief=ds_brief,
+                store=db_ds,
+                run_id=ds_run,
+                provider=prov_ds,
+                health=HealthState.OK,
+                cache_classifier=False,
+            )
+            assert ds_res[0].displayed_cards == ()
+            assert http_calls == 0
+            assert db_ds.get_egress_records(ds_sid, ds_run) == []
+            decs_ds = db_ds.get_decisions(ds_sid, ds_run)
+            man_dec_ds = next(d for d in decs_ds if d["origin"] == "manual")
+            assert man_dec_ds["outcome"] == Outcome.SUPPRESS.value
+            assert man_dec_ds["terminal_state"] == "suppressed"
+            assert man_dec_ds["terminal_reason"] == ReasonCode.DO_NOT_SUGGEST.value
+            assert check_conservation_invariants(db_ds, ds_sid, ds_run).passed
+    finally:
+        await prov_ds.aclose()
+
+
+def test_nemotron_segmenter_filters_non_finite_word_confidence() -> None:
+    seg = NemotronSegmenter(
+        session_id="nemo-nan",
+        config=SegmenterConfig(asr_confidence_floor=0.7),
+    )
+    evs_all_nan = seg.feed_words(
+        [
+            AsrWord("hello", 100, 500, speaker="1", confidence=float("nan")),
+            AsrWord("world", 520, 950, speaker="1", confidence=float("inf")),
+            AsrWord("today", 960, 1400, speaker="1", confidence=float("-inf")),
+        ],
+        received_ms=1500,
+        flush_end=True,
+    )
+    seg_evs_all = [e for e in evs_all_nan if e.kind is EventKind.SEGMENT]
+    assert len(seg_evs_all) == 1
+    assert seg_evs_all[0].asr_confidence is not None
+    assert math.isfinite(seg_evs_all[0].asr_confidence)
+    assert seg_evs_all[0].asr_confidence == 1.0
+    assert seg_evs_all[0].asr_low_confidence is False
+
+    evs_mixed = seg.feed_words(
+        [
+            AsrWord("check", 2000, 2400, speaker="1", confidence=0.5),
+            AsrWord("the", 2420, 2700, speaker="1", confidence=float("nan")),
+            AsrWord("logs", 2720, 3200, speaker="1", confidence=0.7),
+            AsrWord("now", 3220, 3600, speaker="1", confidence=float("inf")),
+        ],
+        received_ms=3700,
+        flush_end=True,
+    )
+    seg_evs_mixed = [e for e in evs_mixed if e.kind is EventKind.SEGMENT]
+    assert len(seg_evs_mixed) == 1
+    assert seg_evs_mixed[0].asr_confidence == pytest.approx(0.6)
+    assert seg_evs_mixed[0].asr_low_confidence is True
+
+    nemo_words = _extract_nemo_words(
+        {
+            "words": [
+                {"word": "alpha", "start": float("nan"), "end": 0.4, "confidence": float("nan")},
+                {"word": "beta", "start": 0.5, "end": float("inf"), "confidence": float("-inf")},
+            ]
+        }
+    )
+    assert len(nemo_words) == 2
+    assert all(math.isfinite(w.confidence) and w.confidence == 1.0 for w in nemo_words)
+
+    dg = DeepgramNormalizer(session_id="dg-nan", confidence_floor=0.7)
+    dg_evs = dg.normalize(
+        {
+            "type": "Results",
+            "is_final": True,
+            "speech_final": True,
+            "start": float("nan"),
+            "duration": float("inf"),
+            "channel": {
+                "alternatives": [
+                    {
+                        "transcript": "test message",
+                        "confidence": float("nan"),
+                        "words": [
+                            {"word": "test", "start": 0.1, "end": 0.4, "speaker": 0},
+                            {"word": "message", "start": 0.5, "end": 0.9, "speaker": 0},
+                        ],
+                    }
+                ]
+            },
+        },
+        received_ms=1000,
+    )
+    dg_segs = [e for e in dg_evs if e.kind is EventKind.SEGMENT]
+    assert len(dg_segs) == 1
+    assert dg_segs[0].asr_confidence is None
+    assert dg_segs[0].asr_low_confidence is False
