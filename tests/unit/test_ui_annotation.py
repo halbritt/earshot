@@ -451,3 +451,66 @@ async def test_card_ui_server_rejects_stale_seq_and_serializes_broadcasts() -> N
             assert m5_state["active_card"] is None
     finally:
         await srv.stop()
+
+
+async def test_card_ui_allowed_origins_binary_audio_feed_and_test_audio(tmp_path: Path) -> None:
+    audio_file = tmp_path / "sample.mp3"
+    audio_file.write_bytes(b"0123456789ABCDEF")
+    received_audio: list[bytes] = []
+
+    async def _on_audio(chunk: bytes) -> None:
+        received_audio.append(chunk)
+
+    srv = CardUIServer(
+        session_id="s-live",
+        port=0,
+        allowed_origins=("https://proximal.tail0ecc2e.ts.net:8798",),
+        on_audio_chunk=_on_audio,
+        feed_provider=lambda: {
+            "segments": [{"segment_id": "seg-1", "speaker_id": "S1", "text": "hello"}],
+            "decisions": [],
+            "audio_rx_bytes": sum(len(c) for c in received_audio),
+        },
+        test_audio_path=audio_file,
+    )
+    await srv.start()
+    try:
+        base_http = f"http://127.0.0.1:{srv.port}"
+        async with httpx.AsyncClient() as client:
+            assert (await client.get(f"{base_http}/feed")).status_code == 401
+            r_feed = await client.get(f"{base_http}/feed?token={srv.token}")
+            assert r_feed.status_code == 200
+            assert r_feed.json()["has_test_audio"] is True
+            assert r_feed.json()["segments"][0]["text"] == "hello"
+
+            assert (await client.get(f"{base_http}/test-audio")).status_code == 401
+            r_full = await client.get(f"{base_http}/test-audio?token={srv.token}")
+            assert r_full.status_code == 200
+            assert r_full.content == b"0123456789ABCDEF"
+
+            r_range = await client.get(
+                f"{base_http}/test-audio?token={srv.token}",
+                headers={"Range": "bytes=4-7"},
+            )
+            assert r_range.status_code == 206
+            assert r_range.content == b"4567"
+            assert r_range.headers["Content-Range"] == "bytes 4-7/16"
+
+        with pytest.raises(InvalidStatus) as exc_bad_origin:
+            async with ws_connect(
+                srv.ws_url,
+                origin="https://evil.example",  # type: ignore[arg-type]
+            ):
+                pass
+        assert exc_bad_origin.value.response.status_code == 403
+
+        async with ws_connect(
+            srv.ws_url,
+            origin="https://proximal.tail0ecc2e.ts.net:8798",  # type: ignore[arg-type]
+        ) as ws:
+            _ = json.loads(await ws.recv())
+            await ws.send(b"\x01\x02\x03\x04")
+            await asyncio.sleep(0.05)
+        assert received_audio == [b"\x01\x02\x03\x04"]
+    finally:
+        await srv.stop()

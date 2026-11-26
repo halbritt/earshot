@@ -6,12 +6,14 @@ import asyncio
 import contextlib
 import hmac
 import json
+import mimetypes
+import re
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.asyncio.server import serve as ws_serve
@@ -40,11 +42,44 @@ _SECURITY_HEADERS = [
     ("Cache-Control", "no-store"),
     (
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; "
-        "connect-src 'self' ws://127.0.0.1:*; object-src 'none'; base-uri 'none'",
+        "default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self' blob:; "
+        "connect-src 'self' ws://127.0.0.1:* wss://127.0.0.1:*; object-src 'none'; base-uri 'none'",
     ),
 ]
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def _normalize_origin(raw: str) -> str:
+    parsed = urlsplit(raw.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return raw.strip().lower().rstrip("/")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _ws_connect_src(origin: str) -> str:
+    parsed = urlsplit(origin)
+    if not parsed.netloc:
+        return ""
+    ws_scheme = "wss" if parsed.scheme.lower() == "https" else "ws"
+    return f"{ws_scheme}://{parsed.netloc.lower()}"
+
+
+def _build_security_headers(allowed_origins: Sequence[str]) -> list[tuple[str, str]]:
+    connect_srcs = ["'self'", "ws://127.0.0.1:*", "wss://127.0.0.1:*"]
+    for orig in allowed_origins:
+        ws_url = _ws_connect_src(orig)
+        if ws_url and ws_url not in connect_srcs:
+            connect_srcs.append(ws_url)
+    csp = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self' blob:; "
+        f"connect-src {' '.join(connect_srcs)}; object-src 'none'; base-uri 'none'"
+    )
+    return [
+        ("X-Content-Type-Options", "nosniff"),
+        ("Cache-Control", "no-store"),
+        ("Content-Security-Policy", csp),
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +113,8 @@ class UIStateSnapshot:
 
 
 ActionHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None] | dict[str, Any] | None]
+AudioChunkHandler = Callable[[bytes], Awaitable[None] | None]
+FeedProvider = Callable[[], dict[str, Any]]
 
 
 class CardUIServer:
@@ -91,6 +128,10 @@ class CardUIServer:
         port: int = 8765,
         session_token: str | None = None,
         on_action: ActionHandler | None = None,
+        on_audio_chunk: AudioChunkHandler | None = None,
+        feed_provider: FeedProvider | None = None,
+        allowed_origins: Sequence[str] = (),
+        test_audio_path: str | Path | None = None,
         initial_state: UIStateSnapshot | None = None,
         emit_card_events: bool = False,
         send_timeout_s: float = 1.0,
@@ -105,6 +146,15 @@ class CardUIServer:
         self._bound_port = port
         self._token = session_token or secrets.token_urlsafe(32)
         self._on_action = on_action
+        self._on_audio_chunk = on_audio_chunk
+        self._feed_provider = feed_provider
+        self._allowed_origins = frozenset(
+            _normalize_origin(o) for o in allowed_origins if str(o).strip()
+        )
+        self._security_headers = _build_security_headers(sorted(self._allowed_origins))
+        self._test_audio_path: Path | None = (
+            Path(test_audio_path) if test_audio_path is not None else None
+        )
         self._emit_card_events = bool(emit_card_events)
         self._send_timeout_s = max(0.05, float(send_timeout_s))
         self._client_queue_maxsize = max(1, int(client_queue_maxsize))
@@ -155,6 +205,12 @@ class CardUIServer:
 
     def set_action_handler(self, handler: ActionHandler | None) -> None:
         self._on_action = handler
+
+    def set_audio_handler(self, handler: AudioChunkHandler | None) -> None:
+        self._on_audio_chunk = handler
+
+    def set_feed_provider(self, provider: FeedProvider | None) -> None:
+        self._feed_provider = provider
 
     async def start(self) -> None:
         if self._server is not None:
@@ -247,8 +303,64 @@ class CardUIServer:
         return vals[0] if vals else ""
 
     def _text_response(self, status: int, reason: str, content_type: str, body: bytes) -> Response:
-        headers = Headers([("Content-Type", content_type), *_SECURITY_HEADERS])
+        headers = Headers([("Content-Type", content_type), *self._security_headers])
         return Response(status, reason, headers, body)
+
+    def _serve_test_audio(self, request: Request) -> Response:
+        path = self._test_audio_path
+        if path is None or not path.is_file():
+            return self._text_response(
+                404, "Not Found", "text/plain; charset=utf-8", b"Not Found\n"
+            )
+        raw = path.read_bytes()
+        total = len(raw)
+        ctype, _ = mimetypes.guess_type(path.name)
+        if not ctype:
+            ctype = "audio/mpeg" if path.suffix.lower() == ".mp3" else "audio/wav"
+        range_hdr = request.headers.get("Range", "").strip()
+        if range_hdr:
+            m = _RANGE_RE.match(range_hdr)
+            if not m:
+                return Response(
+                    416,
+                    "Range Not Satisfiable",
+                    Headers([("Content-Range", f"bytes */{total}"), *self._security_headers]),
+                    b"",
+                )
+            start = int(m.group(1)) if m.group(1) else 0
+            end = int(m.group(2)) if m.group(2) else total - 1
+            if not m.group(1) and m.group(2):
+                suffix_len = int(m.group(2))
+                start = max(0, total - suffix_len)
+                end = total - 1
+            if start >= total or end < start:
+                return Response(
+                    416,
+                    "Range Not Satisfiable",
+                    Headers([("Content-Range", f"bytes */{total}"), *self._security_headers]),
+                    b"",
+                )
+            end = min(end, total - 1)
+            chunk = raw[start : end + 1]
+            hdrs = Headers(
+                [
+                    ("Content-Type", ctype),
+                    ("Accept-Ranges", "bytes"),
+                    ("Content-Range", f"bytes {start}-{end}/{total}"),
+                    ("Content-Length", str(len(chunk))),
+                    *self._security_headers,
+                ]
+            )
+            return Response(206, "Partial Content", hdrs, chunk)
+        hdrs = Headers(
+            [
+                ("Content-Type", ctype),
+                ("Accept-Ranges", "bytes"),
+                ("Content-Length", str(total)),
+                *self._security_headers,
+            ]
+        )
+        return Response(200, "OK", hdrs, raw)
 
     def _process_request(self, _connection: ServerConnection, request: Request) -> Response | None:
         supplied = self._extract_token(request)
@@ -271,15 +383,24 @@ class CardUIServer:
             origin = request.headers.get("Origin")
             if origin is not None:
                 origin_host = (urlsplit(origin).hostname or "").lower()
-                if origin_host not in _LOOPBACK_HOSTS:
+                if (
+                    origin_host not in _LOOPBACK_HOSTS
+                    and _normalize_origin(origin) not in self._allowed_origins
+                ):
                     return self._text_response(
                         403, "Forbidden", "text/plain; charset=utf-8", b"Forbidden Origin\n"
                     )
             return None
         if path in {"/", "/index.html"}:
-            return self._text_response(
-                200, "OK", "text/html; charset=utf-8", self._static_cache["index.html"]
+            tok_q = quote(self._token, safe="")
+            html = (
+                self._static_cache["index.html"]
+                .decode("utf-8")
+                .replace('href="./styles.css"', f'href="./styles.css?token={tok_q}"')
+                .replace('src="./app.js"', f'src="./app.js?token={tok_q}"')
+                .encode("utf-8")
             )
+            return self._text_response(200, "OK", "text/html; charset=utf-8", html)
         if path == "/app.js":
             return self._text_response(
                 200, "OK", "application/javascript; charset=utf-8", self._static_cache["app.js"]
@@ -291,6 +412,21 @@ class CardUIServer:
         if path in {"/state", "/api/state"}:
             body = json.dumps(self._state, sort_keys=True).encode("utf-8")
             return self._text_response(200, "OK", "application/json; charset=utf-8", body)
+        if path == "/feed":
+            feed_payload = (
+                self._feed_provider()
+                if self._feed_provider is not None
+                else {"segments": [], "decisions": []}
+            )
+            feed_payload = {
+                **feed_payload,
+                "has_test_audio": self._test_audio_path is not None
+                and self._test_audio_path.is_file(),
+            }
+            body = json.dumps(feed_payload, sort_keys=True).encode("utf-8")
+            return self._text_response(200, "OK", "application/json; charset=utf-8", body)
+        if path == "/test-audio":
+            return self._serve_test_audio(request)
         if path == "/health":
             body = json.dumps(
                 {
@@ -415,7 +551,17 @@ class CardUIServer:
                 return
         try:
             async for raw in websocket:
-                if not isinstance(raw, str):
+                if isinstance(raw, bytes):
+                    if self._on_audio_chunk is not None and raw:
+                        try:
+                            res_audio = self._on_audio_chunk(raw)
+                            if asyncio.iscoroutine(res_audio):
+                                await res_audio
+                        except Exception as exc:
+                            if not await self._send_ws_safe(
+                                websocket, {"type": "error", "error": str(exc)}
+                            ):
+                                break
                     continue
                 try:
                     msg = json.loads(raw)

@@ -3,54 +3,93 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Earshot Coach</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <title>Earshot Live Conversation Coach</title>
+  <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <main class="coach-shell">
     <header class="status-bar" aria-live="polite">
       <div class="status-group">
         <span id="health-badge" class="badge health-ok">health: ok</span>
-        <span id="mode-badge" class="badge mode-badge">mode: proactive</span>
+        <span id="mode-badge" class="badge mode-badge">mode: Proactive</span>
         <span id="health-reason" class="health-reason"></span>
       </div>
       <div class="controls-bar">
+        <select id="mode-select" aria-label="Coach runtime mode">
+          <option value="Proactive">Proactive</option>
+          <option value="Quiet">Quiet</option>
+          <option value="Shadow">Shadow</option>
+          <option value="Paused">Paused</option>
+          <option value="Off the record">Off the record</option>
+        </select>
         <button id="btn-manual" type="button" title="Manual suggestion (m)">Manual (m)</button>
         <button id="btn-off-record" type="button" title="Toggle off the record (o)">Off Record (o)</button>
       </div>
     </header>
 
+    <section class="audio-input-bar" aria-label="Live Audio Input">
+      <div class="audio-controls-row">
+        <button id="btn-mic" type="button" class="btn-primary">Start Live Mic</button>
+        <button id="btn-test-audio" type="button" class="hidden">Stream 5-Min Test Audio Live</button>
+        <label class="file-btn" for="file-audio-input">Load Local Audio<input id="file-audio-input" type="file" accept="audio/*" /></label>
+        <div class="meter-wrap" title="Live input level"><div id="mic-meter-fill" class="meter-fill"></div></div>
+        <span id="audio-source-status" class="audio-status">Audio idle</span>
+      </div>
+      <div id="live-audio-wrap" class="live-audio-wrap hidden">
+        <audio id="live-audio-el" controls crossorigin="anonymous"></audio>
+        <div class="seek-cues">
+          <button type="button" class="seek-cue-btn" data-seek="42">0:42 Webhook</button>
+          <button type="button" class="seek-cue-btn" data-seek="76">1:16 Banner</button>
+          <button type="button" class="seek-cue-btn" data-seek="110">1:50 Token Deadline</button>
+          <button type="button" class="seek-cue-btn" data-seek="156">2:36 Do-Not-Suggest</button>
+          <button type="button" class="seek-cue-btn" data-seek="194">3:14 Canary</button>
+        </div>
+      </div>
+    </section>
+
     <section id="manual-banner" class="manual-banner hidden" aria-live="polite"></section>
 
-    <section id="card-panel" class="card-panel hidden" aria-live="polite">
-      <div class="card-meta">
-        <span id="category-chip" class="category-chip"></span>
-        <span id="pinned-badge" class="pinned-badge hidden">PINNED</span>
-        <span id="origin-badge" class="origin-badge"></span>
-      </div>
-      <p id="card-question" class="card-question"></p>
-      <div class="card-actions">
-        <button id="btn-use" type="button">Use (u)</button>
-        <button id="btn-pin" type="button">Pin (p)</button>
-        <button id="btn-dismiss" type="button">Dismiss (d)</button>
-        <button id="btn-evidence" type="button" aria-expanded="false">Evidence (e)</button>
-      </div>
-      <div class="feedback-actions">
-        <button id="btn-fb-1" type="button">1: Too late</button>
-        <button id="btn-fb-2" type="button">2: Already answered</button>
-        <button id="btn-fb-3" type="button">3: Not relevant</button>
-        <button id="btn-fb-4" type="button">4: Badly phrased</button>
-      </div>
-      <section id="evidence-drawer" class="evidence-drawer hidden">
-        <div id="evidence-route" class="evidence-route"></div>
-        <ul id="evidence-list" class="evidence-list"></ul>
-      </section>
-    </section>
+    <div class="live-grid">
+      <section class="card-col">
+        <section id="card-panel" class="card-panel hidden" aria-live="polite">
+          <div class="card-meta">
+            <span id="category-chip" class="category-chip"></span>
+            <span id="pinned-badge" class="pinned-badge hidden">PINNED</span>
+            <span id="origin-badge" class="origin-badge"></span>
+          </div>
+          <p id="card-question" class="card-question"></p>
+          <div class="card-actions">
+            <button id="btn-use" type="button">Use (u)</button>
+            <button id="btn-pin" type="button">Pin (p)</button>
+            <button id="btn-dismiss" type="button">Dismiss (d)</button>
+            <button id="btn-evidence" type="button" aria-expanded="false">Evidence (e)</button>
+          </div>
+          <div class="feedback-actions">
+            <button id="btn-fb-1" type="button">1: Too late</button>
+            <button id="btn-fb-2" type="button">2: Already answered</button>
+            <button id="btn-fb-3" type="button">3: Not relevant</button>
+            <button id="btn-fb-4" type="button">4: Badly phrased</button>
+          </div>
+          <section id="evidence-drawer" class="evidence-drawer hidden">
+            <div id="evidence-route" class="evidence-route"></div>
+            <ul id="evidence-list" class="evidence-list"></ul>
+          </section>
+        </section>
 
-    <section id="empty-panel" class="empty-panel">
-      <p id="empty-message">Listening. No card to show.</p>
-    </section>
+        <section id="empty-panel" class="empty-panel">
+          <p id="empty-message">Listening. No card to show.</p>
+        </section>
+      </section>
+
+      <section class="inspector-panel" aria-label="Live Pipeline Inspector">
+        <div class="tabs-bar">
+          <button id="tab-asr" class="tab-btn active" type="button">Live ASR Stream</button>
+          <button id="tab-decisions" class="tab-btn" type="button">Live Coach Decisions</button>
+        </div>
+        <div id="inspector-list" class="inspector-list"></div>
+      </section>
+    </div>
   </main>
-  <script src="/app.js"></script>
+  <script src="./app.js"></script>
 </body>
 </html>

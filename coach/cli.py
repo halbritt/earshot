@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import asyncio
 import contextlib
 import json
@@ -40,7 +41,7 @@ from coach.calibration import (
     fit_platt_calibrator,
 )
 from coach.canonical_state import CanonicalState
-from coach.context_builder import PolicyConfig, build_decision_contexts
+from coach.context_builder import PolicyConfig, assign_speaker_roles, build_decision_contexts
 from coach.contracts import (
     PREDICTABLE_CATEGORIES,
     AnnotationPass,
@@ -106,6 +107,7 @@ from coach.transcript_adapter import (
     BinderConfig,
     Clock,
     DeepgramNormalizer,
+    EarshotGateSample,
     ManualClock,
     MonotonicSessionClock,
     NemotronSegmenter,
@@ -585,6 +587,63 @@ def _recorder_maxsize_from_env() -> int:
         return 1024
 
 
+def _build_live_feed_provider(
+    controller: SuggestionController,
+    store: SQLiteStore,
+    session_id: str,
+    run_id: str,
+    audio_stats: dict[str, int],
+) -> Callable[[], dict[str, Any]]:
+    def _provide() -> dict[str, Any]:
+        snap = controller.canonical_state.snapshot()
+        if controller.mode is Mode.OFF_THE_RECORD or snap.off_record:
+            return {"segments": [], "decisions": [], "audio_rx_bytes": audio_stats.get("bytes", 0)}
+        roles = assign_speaker_roles(snap)
+        segs: list[dict[str, Any]] = []
+        for seg in snap.segments[-30:]:
+            segs.append(
+                {
+                    "segment_id": seg.segment_id,
+                    "speaker_id": roles.get(seg.speaker_id, seg.speaker_id),
+                    "start_ms": seg.start_ms,
+                    "end_ms": seg.end_ms,
+                    "stability": str(seg.stability),
+                    "text": seg.text,
+                    "speaker_uncertain": seg.speaker_uncertain,
+                }
+            )
+        decs_out: list[dict[str, Any]] = []
+        for row in store.get_decisions(session_id, run_id)[-25:]:
+            anchor_text = ""
+            ser = row.get("serialized_text")
+            if isinstance(ser, str):
+                for line in ser.splitlines():
+                    if line.startswith("[ANCHOR]"):
+                        anchor_text = line[8:].strip()
+                        break
+            raw_sc = json.loads(str(row["raw_scores_json"])) if row.get("raw_scores_json") else None
+            decs_out.append(
+                {
+                    "candidate_id": str(row["candidate_id"]),
+                    "anchor_received_ms": int(row["anchor_received_ms"]),
+                    "outcome": row.get("outcome"),
+                    "category": row.get("category"),
+                    "terminal_state": str(row["terminal_state"]),
+                    "terminal_reason": row.get("terminal_reason"),
+                    "opportunity": float(raw_sc["opportunity"]) if raw_sc else None,
+                    "anchor_text": anchor_text,
+                }
+            )
+        decs_out.reverse()
+        return {
+            "segments": segs,
+            "decisions": decs_out,
+            "audio_rx_bytes": audio_stats.get("bytes", 0),
+        }
+
+    return _provide
+
+
 async def _serve_async(args: argparse.Namespace) -> int:
     brief = _load_brief_file(args.brief)
     policy, cal_obj = _load_policy_and_cal(args.policy, calibration_path=args.calibration)
@@ -609,6 +668,7 @@ async def _serve_async(args: argparse.Namespace) -> int:
     provider = _make_provider_from_args(args, policy, clock_ms=clock.now_ms)
     mode = Mode(args.mode)
     run_id = args.run_id or f"serve-{uuid.uuid4().hex[:10]}"
+    audio_stats: dict[str, int] = {"bytes": 0}
 
     with SQLiteStore(args.db) as store:
         rec_buf = BoundedRecorderBuffer(maxsize=_recorder_maxsize_from_env())
@@ -616,6 +676,8 @@ async def _serve_async(args: argparse.Namespace) -> int:
             session_id=brief.session_id,
             port=args.ui_port,
             session_token=args.ui_token,
+            allowed_origins=tuple(getattr(args, "ui_allow_origin", ()) or ()),
+            test_audio_path=getattr(args, "ui_test_audio", None),
             emit_card_events=True,
         )
         controller = SuggestionController(
@@ -630,6 +692,9 @@ async def _serve_async(args: argparse.Namespace) -> int:
             clock=clock,
             telemetry_buffer=rec_buf,
             ui_server=ui_server,
+        )
+        ui_server.set_feed_provider(
+            _build_live_feed_provider(controller, store, brief.session_id, run_id, audio_stats)
         )
         await ui_server.start()
         await controller.start()
@@ -667,6 +732,8 @@ async def _serve_async(args: argparse.Namespace) -> int:
                 controller,
                 stop_event,
                 clock=clock,
+                ui_server=ui_server,
+                audio_stats=audio_stats,
             )
         )
         stop_task = asyncio.create_task(stop_event.wait())
@@ -709,6 +776,52 @@ async def _serve_async(args: argparse.Namespace) -> int:
         return 0
 
 
+def _pcm16_rms_db(pcm_bytes: bytes) -> tuple[float, float]:
+    n = len(pcm_bytes) // 2
+    if n <= 0:
+        return 0.0, -90.0
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[: n * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    mean_sq = sum(s * s for s in samples) / n
+    rms = math.sqrt(mean_sq)
+    if rms <= 1.0:
+        return rms, -90.0
+    return rms, max(-90.0, min(0.0, 20.0 * math.log10(rms / 32768.0)))
+
+
+async def _pump_ui_audio_to_peecee(
+    adapter: PeeceeRealtimeAdapter,
+    audio_q: asyncio.Queue[bytes],
+    clock: Clock,
+    stop_event: asyncio.Event,
+) -> None:
+    hangover = 0
+    while not stop_event.is_set():
+        chunk = await audio_q.get()
+        try:
+            rms, level_db = _pcm16_rms_db(chunk)
+            if rms >= 200.0:
+                hangover = 3
+            elif hangover > 0:
+                hangover -= 1
+            gate = EarshotGateSample(
+                at_ms=clock.now_ms(),
+                speech_active=rms >= 200.0 or hangover > 0,
+                level_db=level_db,
+                playback_active=False,
+            )
+            await adapter.send_audio_pcm16(
+                chunk,
+                gate=gate,
+                pace_realtime=False,
+                pad_last=False,
+            )
+        finally:
+            audio_q.task_done()
+
+
 async def _run_serve_source(
     args: argparse.Namespace,
     brief: SessionBrief,
@@ -719,6 +832,8 @@ async def _run_serve_source(
     stop_event: asyncio.Event,
     *,
     clock: Clock,
+    ui_server: CardUIServer | None = None,
+    audio_stats: dict[str, int] | None = None,
 ) -> None:
     binder = _make_binder_from_env(brief)
     if args.source == "replay" or (args.source == "peecee" and args.stream_file):
@@ -826,51 +941,96 @@ async def _run_serve_source(
         args.ws_url is None and env_ws_url is None and exe_path.exists()
     )
     pc_cfg = PeeceeConfig(ws_url=ws_url, executable=exe_path)
-    proc = (
-        PeeceeSpeechProcess(
-            config=pc_cfg,
-            session_id=brief.session_id,
-            telemetry_sink=rec_buf,
-            health_callback=controller.report_adapter_health,
-        )
-        if should_spawn
-        else None
-    )
-    segmenter = NemotronSegmenter(session_id=brief.session_id, binder=binder)
-    adapter = PeeceeRealtimeAdapter(
-        session_id=brief.session_id,
-        config=pc_cfg,
-        segmenter=segmenter,
-        binder=binder,
-        clock=clock,
-        telemetry_sink=rec_buf,
-        raw_sink=raw_sink,
-        health_callback=controller.report_adapter_health,
-        process=proc,
-    )
-    wav_task: asyncio.Task[None] | None = None
-    try:
-        try:
-            await adapter.connect()
-        except (PeeceeLeaseUnavailableError, PeeceeProcessError, OSError) as exc:
-            await controller.report_adapter_health(
-                HealthState.NO_TRANSCRIPT, "peecee_connect_failed", {"err": str(exc)}
+    interactive_daemon = (not args.audio_wav) and (not args.exit_on_eof)
+    audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+    active_adapter: list[PeeceeRealtimeAdapter | None] = [None]
+
+    if ui_server is not None and not args.audio_wav:
+
+        def _on_ui_audio(chunk: bytes) -> None:
+            if controller.mode in {Mode.OFF_THE_RECORD, Mode.PAUSED}:
+                return
+            if audio_stats is not None:
+                audio_stats["bytes"] = audio_stats.get("bytes", 0) + len(chunk)
+            if audio_q.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    audio_q.get_nowait()
+                    audio_q.task_done()
+            with contextlib.suppress(asyncio.QueueFull):
+                audio_q.put_nowait(chunk)
+
+        async def _on_ui_action_with_commit(msg: dict[str, Any]) -> dict[str, Any] | None:
+            if str(msg.get("action") or "").strip().lower() == "commit_audio":
+                cur_ad = active_adapter[0]
+                if cur_ad is not None:
+                    with contextlib.suppress(Exception):
+                        await cur_ad.commit_audio()
+                return None
+            return await controller.handle_ui_action(msg)
+
+        ui_server.set_audio_handler(_on_ui_audio)
+        ui_server.set_action_handler(_on_ui_action_with_commit)
+
+    while not stop_event.is_set():
+        proc = (
+            PeeceeSpeechProcess(
+                config=pc_cfg,
+                session_id=brief.session_id,
+                telemetry_sink=rec_buf,
+                health_callback=controller.report_adapter_health,
             )
-            return
-        if args.audio_wav:
-            wav_task = asyncio.create_task(_stream_wav_to_peecee(adapter, args.audio_wav))
-        async for ev in adapter.events():
-            if stop_event.is_set():
-                break
-            await controller.submit_event(ev)
-        if wav_task is not None:
-            await wav_task
-    finally:
-        if wav_task is not None and not wav_task.done():
-            wav_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            if should_spawn
+            else None
+        )
+        segmenter = NemotronSegmenter(session_id=brief.session_id, binder=binder)
+        adapter = PeeceeRealtimeAdapter(
+            session_id=brief.session_id,
+            config=pc_cfg,
+            segmenter=segmenter,
+            binder=binder,
+            clock=clock,
+            telemetry_sink=rec_buf,
+            raw_sink=raw_sink,
+            health_callback=controller.report_adapter_health,
+            process=proc,
+        )
+        active_adapter[0] = adapter
+        wav_task: asyncio.Task[None] | None = None
+        pump_task: asyncio.Task[None] | None = None
+        try:
+            try:
+                await adapter.connect()
+            except (PeeceeLeaseUnavailableError, PeeceeProcessError, OSError) as exc:
+                await controller.report_adapter_health(
+                    HealthState.NO_TRANSCRIPT, "peecee_connect_failed", {"err": str(exc)}
+                )
+                if not interactive_daemon:
+                    return
+                await asyncio.sleep(3.0)
+                continue
+            if args.audio_wav:
+                wav_task = asyncio.create_task(_stream_wav_to_peecee(adapter, args.audio_wav))
+            elif ui_server is not None:
+                pump_task = asyncio.create_task(
+                    _pump_ui_audio_to_peecee(adapter, audio_q, clock, stop_event)
+                )
+            async for ev in adapter.events():
+                if stop_event.is_set():
+                    break
+                await controller.submit_event(ev)
+            if wav_task is not None:
                 await wav_task
-        await adapter.close()
+        finally:
+            active_adapter[0] = None
+            for bg_task in (wav_task, pump_task):
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await bg_task
+            await adapter.close()
+        if not interactive_daemon:
+            return
+        await asyncio.sleep(1.5)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -1845,6 +2005,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--peecee-cmd", default=None, help="Path to peecee-speech launcher")
     p_serve.add_argument("--ui-port", type=int, default=8765, help="Loopback UI port (0=ephemeral)")
     p_serve.add_argument("--ui-token", default=None, help="Optional fixed UI session token")
+    p_serve.add_argument(
+        "--ui-allow-origin",
+        action="append",
+        default=[],
+        help="Additional allowed browser Origin (e.g. Tailscale HTTPS URL)",
+    )
+    p_serve.add_argument(
+        "--ui-test-audio",
+        default=None,
+        help="Optional local audio file exposed at /test-audio for live browser streaming",
+    )
     p_serve.add_argument("--local-only", action="store_true", help="Block hosted generator calls")
     p_serve.add_argument(
         "--mode",

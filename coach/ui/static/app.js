@@ -6,9 +6,12 @@
   let ws = null;
   let currentState = null;
   let evidenceOpen = false;
+  let activeTab = "asr";
+  let lastFeed = { segments: [], decisions: [], has_test_audio: false, audio_rx_bytes: 0 };
 
   const healthBadge = document.getElementById("health-badge");
   const modeBadge = document.getElementById("mode-badge");
+  const modeSelect = document.getElementById("mode-select");
   const healthReason = document.getElementById("health-reason");
   const manualBanner = document.getElementById("manual-banner");
   const cardPanel = document.getElementById("card-panel");
@@ -23,6 +26,17 @@
   const evidenceList = document.getElementById("evidence-list");
   const btnEvidence = document.getElementById("btn-evidence");
 
+  const btnMic = document.getElementById("btn-mic");
+  const btnTestAudio = document.getElementById("btn-test-audio");
+  const fileAudioInput = document.getElementById("file-audio-input");
+  const micMeterFill = document.getElementById("mic-meter-fill");
+  const audioStatus = document.getElementById("audio-source-status");
+  const liveAudioWrap = document.getElementById("live-audio-wrap");
+  const liveAudioEl = document.getElementById("live-audio-el");
+  const tabAsr = document.getElementById("tab-asr");
+  const tabDecisions = document.getElementById("tab-decisions");
+  const inspectorList = document.getElementById("inspector-list");
+
   function healthClass(health) {
     if (health === "ok") return "badge health-ok";
     if (health === "no_transcript") return "badge health-err";
@@ -33,13 +47,21 @@
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 
+  function fmtMs(ms) {
+    const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, "0") + ":" + String(r).padStart(2, "0");
+  }
+
   function renderState(state) {
     currentState = state;
     const health = String(state.health || "ok");
-    const mode = String(state.mode || "proactive");
+    const mode = String(state.mode || "Proactive");
     healthBadge.className = healthClass(health);
     healthBadge.textContent = "health: " + health;
     modeBadge.textContent = "mode: " + mode;
+    if (modeSelect && modeSelect.value !== mode) modeSelect.value = mode;
     healthReason.textContent = state.health_reason ? String(state.health_reason) : "";
 
     const ms = state.manual_status;
@@ -67,11 +89,8 @@
     cardPanel.classList.remove("hidden");
     categoryChip.textContent = String(card.category_chip || card.category || "");
     originBadge.textContent = String(card.origin || "proactive");
-    if (card.pinned) {
-      pinnedBadge.classList.remove("hidden");
-    } else {
-      pinnedBadge.classList.add("hidden");
-    }
+    if (card.pinned) pinnedBadge.classList.remove("hidden");
+    else pinnedBadge.classList.add("hidden");
     cardQuestion.textContent = String(card.text || "");
 
     evidenceRoute.textContent = "Route: " + String(card.route || "template");
@@ -88,6 +107,217 @@
     evidenceDrawer.classList.toggle("hidden", !evidenceOpen);
     btnEvidence.setAttribute("aria-expanded", evidenceOpen ? "true" : "false");
   }
+
+  function renderInspector() {
+    if (lastFeed.has_test_audio) btnTestAudio.classList.remove("hidden");
+    clearChildren(inspectorList);
+    if (activeTab === "asr") {
+      const segs = Array.isArray(lastFeed.segments) ? lastFeed.segments : [];
+      if (!segs.length) {
+        const empty = document.createElement("div");
+        empty.className = "feed-row";
+        empty.textContent = "No live ASR segments yet. Click Start Live Mic or Stream 5-Min Test Audio Live.";
+        inspectorList.appendChild(empty);
+        return;
+      }
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const seg = segs[i];
+        const row = document.createElement("div");
+        row.className = "feed-row" + (seg.stability === "interim" ? " feed-interim" : "");
+        const meta = document.createElement("div");
+        meta.className = "feed-meta";
+        const spk = document.createElement("span");
+        spk.className = "feed-spk";
+        spk.textContent = String(seg.speaker_id || "S?") + (seg.speaker_uncertain ? " [uncertain]" : "");
+        const info = document.createElement("span");
+        info.textContent = fmtMs(seg.start_ms) + " · " + String(seg.stability || "");
+        meta.append(spk, info);
+        const body = document.createElement("div");
+        body.textContent = String(seg.text || "");
+        row.append(meta, body);
+        inspectorList.appendChild(row);
+      }
+    } else {
+      const decs = Array.isArray(lastFeed.decisions) ? lastFeed.decisions : [];
+      if (!decs.length) {
+        const empty = document.createElement("div");
+        empty.className = "feed-row";
+        empty.textContent = "No coach routing decisions yet.";
+        inspectorList.appendChild(empty);
+        return;
+      }
+      for (const d of decs) {
+        const row = document.createElement("div");
+        row.className = "feed-row";
+        const meta = document.createElement("div");
+        meta.className = "feed-meta";
+        const pill = document.createElement("span");
+        pill.className = "feed-spk";
+        pill.textContent = String(d.outcome || d.terminal_state || "DROPPED") + (d.category ? " · " + d.category : "");
+        const info = document.createElement("span");
+        const opp = typeof d.opportunity === "number" ? " · p=" + d.opportunity.toFixed(2) : "";
+        info.textContent = String(d.terminal_reason || d.terminal_state || "") + opp;
+        meta.append(pill, info);
+        const body = document.createElement("div");
+        body.textContent = String(d.anchor_text || "");
+        row.append(meta, body);
+        inspectorList.appendChild(row);
+      }
+    }
+  }
+
+  // --- Live 16 kHz PCM16 streaming (Mic & MediaElement) ---
+  let audioCtx = null;
+  let micStream = null;
+  let micSourceNode = null;
+  let mediaSourceNode = null;
+  let procNode = null;
+  let pcmAccumulator = [];
+  let activeAudioMode = "idle"; // "idle" | "mic" | "media"
+  const FRAME_SAMPLES_16K = 2560; // 160 ms @ 16 kHz
+
+  function ensureAudioCtx() {
+    if (!audioCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new Ctx();
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+    return audioCtx;
+  }
+
+  function pushFloatTo16kPcm(inputFloat, inRate) {
+    let peak = 0;
+    for (let i = 0; i < inputFloat.length; i++) {
+      const av = Math.abs(inputFloat[i]);
+      if (av > peak) peak = av;
+    }
+    micMeterFill.style.width = Math.min(100, Math.round(peak * 180)) + "%";
+
+    const ratio = inRate / 16000;
+    const outLen = Math.max(1, Math.floor(inputFloat.length / ratio));
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio;
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const s0 = inputFloat[idx] || 0;
+      const s1 = inputFloat[Math.min(idx + 1, inputFloat.length - 1)] || 0;
+      const sample = s0 + (s1 - s0) * frac;
+      const clamped = Math.max(-1, Math.min(1, sample));
+      pcmAccumulator.push(clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767));
+    }
+    while (pcmAccumulator.length >= FRAME_SAMPLES_16K) {
+      const frame = pcmAccumulator.splice(0, FRAME_SAMPLES_16K);
+      const buf = new Int16Array(frame);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(buf.buffer);
+      }
+    }
+  }
+
+  function stopMicStream() {
+    if (procNode) {
+      procNode.onaudioprocess = null;
+      try { procNode.disconnect(); } catch (_e) {}
+      procNode = null;
+    }
+    if (micSourceNode) {
+      try { micSourceNode.disconnect(); } catch (_e) {}
+      micSourceNode = null;
+    }
+    if (micStream) {
+      for (const tr of micStream.getTracks()) tr.stop();
+      micStream = null;
+    }
+    if (pcmAccumulator.length && ws && ws.readyState === WebSocket.OPEN) {
+      const buf = new Int16Array(pcmAccumulator.splice(0));
+      ws.send(buf.buffer);
+    }
+    if (activeAudioMode === "mic") {
+      sendAction("commit_audio");
+      activeAudioMode = "idle";
+      btnMic.textContent = "Start Live Mic";
+      btnMic.className = "btn-primary";
+      audioStatus.textContent = "Audio idle";
+      micMeterFill.style.width = "0%";
+    }
+  }
+
+  async function startMicStream() {
+    if (activeAudioMode === "mic") { stopMicStream(); return; }
+    if (!liveAudioEl.paused) liveAudioEl.pause();
+    const ctx = ensureAudioCtx();
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+      });
+    } catch (err) {
+      audioStatus.textContent = "Mic denied: " + String(err.message || err);
+      return;
+    }
+    pcmAccumulator = [];
+    micSourceNode = ctx.createMediaStreamSource(micStream);
+    procNode = ctx.createScriptProcessor(4096, 1, 1);
+    procNode.onaudioprocess = (ev) => {
+      if (activeAudioMode === "mic") pushFloatTo16kPcm(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
+    };
+    micSourceNode.connect(procNode);
+    procNode.connect(ctx.destination);
+    activeAudioMode = "mic";
+    btnMic.textContent = "Stop Mic";
+    btnMic.className = "btn-active";
+    audioStatus.textContent = "Streaming live mic -> peecee-speech";
+  }
+
+  function ensureMediaPipeline() {
+    const ctx = ensureAudioCtx();
+    if (!mediaSourceNode) {
+      mediaSourceNode = ctx.createMediaElementSource(liveAudioEl);
+      mediaSourceNode.connect(ctx.destination);
+    }
+    if (!procNode) {
+      procNode = ctx.createScriptProcessor(4096, 1, 1);
+      procNode.onaudioprocess = (ev) => {
+        if (activeAudioMode === "media" && !liveAudioEl.paused) {
+          pushFloatTo16kPcm(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
+        }
+      };
+      mediaSourceNode.connect(procNode);
+      procNode.connect(ctx.destination);
+    }
+  }
+
+  function loadMediaUrl(url, label) {
+    stopMicStream();
+    liveAudioWrap.classList.remove("hidden");
+    liveAudioEl.src = url;
+    audioStatus.textContent = "Loaded: " + label;
+    ensureMediaPipeline();
+    liveAudioEl.play().catch(() => {});
+  }
+
+  liveAudioEl.addEventListener("play", () => {
+    stopMicStream();
+    ensureMediaPipeline();
+    activeAudioMode = "media";
+    audioStatus.textContent = "Streaming audio -> peecee-speech";
+  });
+  liveAudioEl.addEventListener("pause", () => {
+    if (activeAudioMode === "media") {
+      if (pcmAccumulator.length && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(new Int16Array(pcmAccumulator.splice(0)).buffer);
+      }
+      sendAction("commit_audio");
+      activeAudioMode = "idle";
+      audioStatus.textContent = "Audio paused";
+      micMeterFill.style.width = "0%";
+    }
+  });
+  liveAudioEl.addEventListener("ended", () => {
+    if (activeAudioMode === "media") sendAction("commit_audio");
+    activeAudioMode = "idle";
+    audioStatus.textContent = "Audio finished";
+    micMeterFill.style.width = "0%";
+  });
 
   function sendAction(action, extra) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -114,17 +344,38 @@
   btnEvidence.addEventListener("click", toggleEvidence);
   document.getElementById("btn-manual").addEventListener("click", () => sendAction("manual"));
   document.getElementById("btn-off-record").addEventListener("click", () => sendAction("off_record"));
+  modeSelect.addEventListener("change", () => sendAction("mode", { mode: modeSelect.value }));
 
-  const feedbackMap = {
-    1: "too_late",
-    2: "already_answered",
-    3: "not_relevant",
-    4: "badly_phrased",
-  };
+  btnMic.addEventListener("click", () => { startMicStream(); });
+  btnTestAudio.addEventListener("click", () => {
+    loadMediaUrl("./test-audio?token=" + encodeURIComponent(token), "5-Min Test Conversation");
+  });
+  fileAudioInput.addEventListener("change", (ev) => {
+    const f = ev.target && ev.target.files && ev.target.files[0];
+    if (f) loadMediaUrl(URL.createObjectURL(f), f.name);
+  });
+  for (const cueBtn of document.querySelectorAll(".seek-cue-btn")) {
+    cueBtn.addEventListener("click", () => {
+      liveAudioEl.currentTime = Number(cueBtn.getAttribute("data-seek") || 0);
+      liveAudioEl.play().catch(() => {});
+    });
+  }
+  tabAsr.addEventListener("click", () => {
+    activeTab = "asr";
+    tabAsr.classList.add("active");
+    tabDecisions.classList.remove("active");
+    renderInspector();
+  });
+  tabDecisions.addEventListener("click", () => {
+    activeTab = "decisions";
+    tabDecisions.classList.add("active");
+    tabAsr.classList.remove("active");
+    renderInspector();
+  });
+
+  const feedbackMap = { 1: "too_late", 2: "already_answered", 3: "not_relevant", 4: "badly_phrased" };
   for (const [k, reason] of Object.entries(feedbackMap)) {
-    document
-      .getElementById("btn-fb-" + k)
-      .addEventListener("click", () => sendAction("dismiss", { feedback: reason }));
+    document.getElementById("btn-fb-" + k).addEventListener("click", () => sendAction("dismiss", { feedback: reason }));
   }
 
   document.addEventListener("keydown", (ev) => {
@@ -140,24 +391,34 @@
     else if (feedbackMap[ev.key]) sendAction("dismiss", { feedback: feedbackMap[ev.key] });
   });
 
+  async function pollFeed() {
+    try {
+      const resp = await fetch("./feed?token=" + encodeURIComponent(token));
+      if (resp.ok) {
+        lastFeed = await resp.json();
+        renderInspector();
+      }
+    } catch (_err) {}
+  }
+
   function connectWs() {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = proto + "//" + window.location.host + "/ws?token=" + encodeURIComponent(token);
     ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
     ws.addEventListener("message", (ev) => {
       try {
         const msg = JSON.parse(ev.data);
         if (msg && msg.type === "state") {
           renderState(msg);
+          pollFeed();
         }
-      } catch (_err) {
-        // Ignore malformed frame
-      }
+      } catch (_err) {}
     });
-    ws.addEventListener("close", () => {
-      setTimeout(connectWs, 1000);
-    });
+    ws.addEventListener("close", () => { setTimeout(connectWs, 1000); });
   }
 
   connectWs();
+  pollFeed();
+  setInterval(pollFeed, 600);
 })();
