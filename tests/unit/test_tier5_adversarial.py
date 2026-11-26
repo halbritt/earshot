@@ -3689,3 +3689,256 @@ async def test_replaysim_stray_off_record_end_does_not_clobber_active_stream() -
         assert check_conservation_invariants(db, brief.session_id, "r-stray-end").passed
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_stray_off_record_end_mid_flight_classify_does_not_strand_or_pollute_context(
+    tmp_path: Path,
+) -> None:
+    from coach.question_generator import build_generator_prompt
+    from coach.template_renderer import load_templates_dir
+
+    base_pol = load_policy(POLICY_PATH)
+    policy = replace(base_pol, display=replace(base_pol.display, settle_ms=100, cooldown_ms=0))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _GatedClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.seen_inputs: list[ClassifierInput] = []
+            self._inner = _FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96)
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **kwargs: Any
+        ) -> list[ClassifierResult]:
+            self.calls += 1
+            self.seen_inputs.extend(coerce_classifier_input(c) for c in contexts)
+            if self.calls == 1:
+                entered.set()
+                await release.wait()
+            return await self._inner.classify_batch(contexts, **kwargs)
+
+    clf = _GatedClf()
+    clock = ManualClock(1000)
+    sid = "s-stray-midflight"
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id=sid,
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+    store = SQLiteStore(tmp_path / "stray_mid.db")
+    ctrl = SuggestionController(
+        brief=brief,
+        policy=policy,
+        classifier=clf,  # type: ignore[arg-type]
+        templates=load_templates_dir(Path("policies/templates")),
+        store=store,
+        clock=clock,
+    )
+    await ctrl.start()
+    try:
+        seg1 = _seg_ev(
+            sid, "e1", "seg-1", "Someone needs to own the deployment checklist.", speaker="S1"
+        )
+        await ctrl.submit_event(seg1)
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        await ctrl.submit_event(
+            CanonicalEvent(
+                schema_version=SCHEMA_VERSION,
+                session_id=sid,
+                event_id="stray-end",
+                kind=EventKind.CONTROL,
+                subtype=ControlSubtype.OFF_RECORD_END,
+                received_ms=1100,
+                source_sequence=2,
+                source_id="probe",
+            )
+        )
+        await ctrl._ingest_queue.join()
+        release.set()
+        await ctrl.drain()
+        clock.advance(5_000)
+        await ctrl.tick()
+        await ctrl.drain()
+        assert clf.calls == 1
+        assert ctrl.health is HealthState.OK
+        assert ctrl.mode is Mode.PROACTIVE
+        snap = ctrl._state.snapshot()
+        assert snap.gaps == ()
+        assert snap.counters["gap"] == 0
+        assert ctrl.active_card is not None
+        assert ctrl.active_card.evidence_refs[0].segment_id == "seg-1"
+
+        seg2 = _seg_ev(
+            sid,
+            "e2",
+            "seg-2",
+            "Someone needs to pick the cutover date.",
+            speaker="S1",
+            rx_ms=7000,
+            start_ms=6100,
+            end_ms=6900,
+            seq=3,
+        )
+        await ctrl.submit_event(seg2)
+        await ctrl.drain()
+        clock.advance(5_000)
+        await ctrl.tick()
+        await ctrl.drain()
+        assert clf.calls == 2
+        for inp in clf.seen_inputs:
+            assert "[GAP: off_record]" not in inp.serialized_text
+            assert inp.context.flags["has_off_record_gap"] is False
+            assert inp.context.flags["has_gap"] is False
+        blocks, _ = build_generator_prompt(
+            clf.seen_inputs[-1].context, ctrl._state.snapshot(), Category.CONFIRM_OWNER, policy
+        )
+        assert "[GAP: off_record]" not in blocks.transcript_block
+    finally:
+        release.set()
+        await ctrl.stop()
+        assert check_conservation_invariants(store, sid, "live").passed
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_replaysim_stray_off_record_end_mid_flight_latency_200() -> None:
+    import random
+
+    from coach.calibration import default_calibration_registry
+    from coach.question_generator import build_generator_prompt
+    from coach.replay_evaluator import _ReplaySim
+    from coach.template_renderer import load_templates_dir
+
+    policy = load_policy(POLICY_PATH)
+    cal_obj = default_calibration_registry() if policy.classifier.calibration else None
+    tpl_map = load_templates_dir(Path("policies/templates"))
+    brief = SessionBrief(
+        schema_version=SCHEMA_VERSION,
+        session_id="rep-stray-lat",
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        objective="Ship v1",
+        recipient=RecipientConfig("speaker-rec"),
+    )
+
+    class _CountingClf:
+        classifier_version = policy.classifier.version
+        tokenizer = WhitespaceTokenizer()
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.seen_inputs: list[ClassifierInput] = []
+            self._inner = _FixedScoreClf(policy.classifier.version, Category.CONFIRM_OWNER, 0.96)
+
+        async def classify_batch(
+            self, contexts: Sequence[ContextBuildResult | ClassifierInput], **kwargs: Any
+        ) -> list[ClassifierResult]:
+            self.calls += 1
+            self.seen_inputs.extend(coerce_classifier_input(c) for c in contexts)
+            return await self._inner.classify_batch(contexts, **kwargs)
+
+    seg1 = _seg_ev(
+        "rep-stray-lat",
+        "e1",
+        "seg-1",
+        "Someone needs to own the deployment checklist.",
+        rx_ms=1000,
+        start_ms=100,
+        end_ms=900,
+        seq=1,
+    )
+    stray_otr_end = CanonicalEvent(
+        schema_version=SCHEMA_VERSION,
+        session_id="rep-stray-lat",
+        event_id="stray-end",
+        kind=EventKind.CONTROL,
+        subtype=ControlSubtype.OFF_RECORD_END,
+        received_ms=1100,
+        source_sequence=2,
+        source_id="probe",
+    )
+    seg2 = _seg_ev(
+        "rep-stray-lat",
+        "e2",
+        "seg-2",
+        "Someone needs to pick the cutover date.",
+        rx_ms=6000,
+        start_ms=5100,
+        end_ms=5900,
+        seq=3,
+    )
+
+    # (a) Single segment + mid-flight stray OFF_RECORD_END -> clf.calls == 1, no phantom gap
+    clf_a = _CountingClf()
+    db_a = SQLiteStore(":memory:")
+    try:
+        sim_a = _ReplaySim(
+            brief=brief,
+            ordered=[seg1, stray_otr_end],
+            policy=policy,
+            classifier=clf_a,  # type: ignore[arg-type]
+            cal_obj=cal_obj,
+            tpl_map=tpl_map,
+            store=db_a,
+            run_id="r-stray-a",
+            mode=Mode.PROACTIVE,
+            provider=None,
+            health=None,
+            simulated_latency_ms=200.0,
+            latency_distribution_ms=None,
+            rng=random.Random(0),
+            cache_classifier=False,
+        )
+        res_a = await sim_a.run()
+        assert clf_a.calls == 1
+        assert len(res_a.displayed_cards) == 1
+        assert res_a.displayed_cards[0].evidence_refs[0].segment_id == "seg-1"
+        assert sim_a.state.snapshot().gaps == ()
+        assert sim_a.state.snapshot().counters["gap"] == 0
+        assert check_conservation_invariants(db_a, brief.session_id, "r-stray-a").passed
+    finally:
+        db_a.close()
+
+    # (b) Subsequent segment after stray OFF_RECORD_END has no [GAP: off_record]
+    clf_b = _CountingClf()
+    db_b = SQLiteStore(":memory:")
+    try:
+        sim_b = _ReplaySim(
+            brief=brief,
+            ordered=[seg1, stray_otr_end, seg2],
+            policy=policy,
+            classifier=clf_b,  # type: ignore[arg-type]
+            cal_obj=cal_obj,
+            tpl_map=tpl_map,
+            store=db_b,
+            run_id="r-stray-b",
+            mode=Mode.PROACTIVE,
+            provider=None,
+            health=None,
+            simulated_latency_ms=200.0,
+            latency_distribution_ms=None,
+            rng=random.Random(0),
+            cache_classifier=False,
+        )
+        res_b = await sim_b.run()
+        assert clf_b.calls == 2
+        assert res_b.routed_count == 2
+        assert len(res_b.displayed_cards) >= 1
+        assert sim_b.state.snapshot().gaps == ()
+        assert sim_b.state.snapshot().counters["gap"] == 0
+        for inp in clf_b.seen_inputs:
+            assert "[GAP: off_record]" not in inp.serialized_text
+            assert inp.context.flags["has_off_record_gap"] is False
+        blocks, _ = build_generator_prompt(
+            clf_b.seen_inputs[-1].context, sim_b.state.snapshot(), Category.CONFIRM_OWNER, policy
+        )
+        assert "[GAP: off_record]" not in blocks.transcript_block
+        assert check_conservation_invariants(db_b, brief.session_id, "r-stray-b").passed
+    finally:
+        db_b.close()

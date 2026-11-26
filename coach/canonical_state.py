@@ -764,6 +764,12 @@ class CanonicalState:
                 accepted=True, state_version=self._state_version, material_change=True
             )
         if ev.subtype is ControlSubtype.OFF_RECORD_END:
+            if not self._off_record:
+                return ApplyResult(
+                    accepted=True,
+                    state_version=self._state_version,
+                    material_change=False,
+                )
             self._off_record = False
             self._gaps.append(
                 GapRecord(
