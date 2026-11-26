@@ -17,24 +17,32 @@ from typing import Any
 import numpy as np
 
 from coach.calibration import CalibrationModel, CalibrationRegistry, default_calibration_registry
-from coach.canonical_state import CanonicalState, SegmentRecord, StateSnapshot
+from coach.candidate_validator import validate_template_candidate
+from coach.canonical_state import CanonicalState, StateSnapshot
 from coach.context_builder import (
     _SENTENCE_FINAL_RE,
     DEFAULT_ANCHOR_MAX_TOKENS,
+    PREFILTER_VERSION,
+    AnchorSpan,
     CategoryPolicy,
     ContextBuildResult,
+    CoverageCursor,
     PolicyConfig,
     WhitespaceTokenizer,
     build_decision_context,
     build_decision_contexts,
+    coalesce_anchors,
     effective_max_cards_per_10_min,
     normalize_for_matching,
+    run_prefilter,
 )
 from coach.contracts import (
     SCHEMA_VERSION,
+    SUPPRESS_REASON_CODES,
     CanonicalEvent,
     Category,
     ClosedBy,
+    ControlSubtype,
     DecisionContext,
     EgressRecord,
     EventKind,
@@ -46,8 +54,8 @@ from coach.contracts import (
     Origin,
     Outcome,
     ReasonCode,
-    RetentionConfig,
     Route,
+    RoutingDecision,
     SegmentRef,
     SessionBrief,
     Stability,
@@ -61,23 +69,130 @@ from coach.opportunity_classifier import (
 )
 from coach.provider_adapter import BreakerState, ProviderAdapter
 from coach.question_generator import generate_question
-from coach.routing_policy import route_candidate
+from coach.routing_policy import is_equivalent_question, matches_resolution_cue, route_candidate
 from coach.storage import SQLiteStore
-from coach.template_renderer import TemplateSpec, load_templates_dir, render_template
-
-_RESOLUTION_CUE_TERMS = (
-    "i'll own",
-    "i will own",
-    "i'll handle",
-    "i will handle",
-    "i'll take",
-    "assigned to",
-    "let's do friday",
-    "by friday",
-    "deadline is",
-    "never mind",
-    "already decided",
+from coach.template_renderer import (
+    TemplateSpec,
+    load_templates_dir,
+    render_template,
 )
+
+_SHOWN_OR_ACTED_STATES: frozenset[LedgerState] = frozenset(
+    {
+        LedgerState.DISPLAYED,
+        LedgerState.PINNED,
+        LedgerState.DISMISSED,
+        LedgerState.USED,
+    }
+)
+_TERMINAL_LEDGER_STATES: frozenset[LedgerState] = frozenset(
+    {
+        LedgerState.DISMISSED,
+        LedgerState.RESOLVED,
+        LedgerState.WITHDRAWN,
+        LedgerState.EXPIRED,
+        LedgerState.OUTDATED,
+    }
+)
+_REPLAY_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "by",
+        "from",
+        "it",
+        "this",
+        "that",
+        "we",
+        "you",
+        "they",
+        "i",
+        "will",
+        "would",
+        "should",
+        "could",
+        "can",
+        "do",
+        "does",
+        "did",
+        "who",
+        "what",
+        "when",
+        "where",
+        "why",
+        "how",
+        "which",
+        "and",
+        "or",
+        "need",
+        "needs",
+    }
+)
+
+
+@dataclass(slots=True)
+class _ReplayPendingItem:
+    cand: SuggestionCandidate
+    context: DecisionContext
+    classifier: Any
+    routing: RoutingDecision
+    serialized_text: str
+    score: float
+    brief_snapshot: SessionBrief
+    anchor_text: str
+    anchor_speaker_id: str
+    anchor_last_key: tuple[int, int, int, str]
+    anchor_start_ms: int
+    anchor_received_ms: int
+    settle_end_ms: int
+    settled: bool = False
+    settle_cause: ReasonCode = ReasonCode.SETTLE_TIMEOUT
+    deferred_reason: ReasonCode | None = None
+    cooldown_end_ms: int | None = None
+
+
+@dataclass(slots=True)
+class _ReplayActiveItem:
+    cand: SuggestionCandidate
+    context: DecisionContext
+    classifier: Any
+    routing: RoutingDecision
+    serialized_text: str
+    brief_snapshot: SessionBrief
+    anchor_text: str
+    anchor_last_key: tuple[int, int, int, str]
+    anchor_start_ms: int
+    anchor_received_ms: int
+    displayed_at_ms: int
+    expires_at_ms: int
+    pinned: bool = False
+
+
+def _replay_content_tokens(text: str) -> set[str]:
+    return {t for t in normalize_for_matching(text).split() if t and t not in _REPLAY_STOPWORDS}
+
+
+def _replay_brief_material_key(brief: SessionBrief) -> tuple[Any, ...]:
+    return (
+        brief.objective,
+        tuple((f.key, f.value) for f in brief.known_facts),
+        brief.do_not_suggest,
+        brief.mode,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,42 +645,1339 @@ def _sample_stage_latency_ms(
     return max(0, int(round(measured_ms)))
 
 
-def _has_resolution_cue(text: str, template: TemplateSpec | None) -> bool:
-    low = text.lower()
-    cues = list(_RESOLUTION_CUE_TERMS)
-    if template is not None:
-        cues.extend(c.lower() for c in template.resolution_cues)
-    return any(cue in low for cue in cues)
+def _replay_anchor_sort_key(
+    ctx: DecisionContext, final_snap: StateSnapshot
+) -> tuple[int, int, int, int, str]:
+    if not ctx.anchor_refs:
+        return (ctx.anchor_received_ms, 0, 0, ctx.anchor_received_ms, ctx.candidate_id)
+    min_start = None
+    min_chan = None
+    min_seq = None
+    for ref in ctx.anchor_refs:
+        seg = final_snap.segments_by_id.get(ref.segment_id)
+        if seg is None:
+            continue
+        k = (seg.start_ms, seg.channel, seg.source_sequence)
+        if min_start is None or k < (min_start, min_chan or 0, min_seq or 0):
+            min_start, min_chan, min_seq = k
+    if min_start is None:
+        return (ctx.anchor_received_ms, 0, 0, ctx.anchor_received_ms, ctx.candidate_id)
+    assert min_chan is not None and min_seq is not None
+    return (min_start, min_chan, min_seq, ctx.anchor_received_ms, ctx.candidate_id)
 
 
-def _store_decision_from_routing(
-    store: SQLiteStore,
+class _ReplaySim:
+    """Causal discrete-event simulator matching SuggestionController semantics."""
+
+    def __init__(
+        self,
+        *,
+        brief: SessionBrief,
+        ordered: list[CanonicalEvent],
+        policy: PolicyConfig,
+        classifier: OpportunityClassifier,
+        cal_obj: CalibrationModel | CalibrationRegistry | None,
+        tpl_map: Mapping[str, TemplateSpec],
+        store: SQLiteStore | None,
+        run_id: str,
+        mode: Mode,
+        provider: ProviderAdapter | None,
+        health: HealthState | None,
+        simulated_latency_ms: float | None,
+        latency_distribution_ms: Sequence[float] | None,
+        rng: random.Random,
+        cache_classifier: bool,
+    ) -> None:
+        self.brief = brief
+        self.ordered = ordered
+        self.policy = policy
+        self.classifier = classifier
+        self.cal_obj = cal_obj
+        self.tpl_map = tpl_map
+        self.store = store
+        self.run_id = run_id
+        self.mode = mode
+        self.provider = provider
+        self.health_override = health
+        self.simulated_latency_ms = simulated_latency_ms
+        self.latency_distribution_ms = latency_distribution_ms
+        self.rng = rng
+        self.cache_classifier = cache_classifier
+        self.state = CanonicalState(brief)
+        self.cursor = CoverageCursor()
+        self.tok = classifier.tokenizer or WhitespaceTokenizer()
+        self.recipient_ids = {"ME", brief.recipient.participant_id}
+        self.local_blocked = (
+            provider is not None
+            and provider.config.local_only
+            and provider.config.effective_is_hosted
+        )
+        if health is not None:
+            self.eff_health = health
+        elif self.local_blocked or provider is None:
+            self.eff_health = HealthState.TEMPLATE_ONLY
+        else:
+            self.eff_health = provider.health_state
+        self.sim_now_ms = ordered[0].received_ms if ordered else 0
+        self.next_ev_idx = 0
+        self.health_timeline: list[dict[str, Any]] = [
+            {
+                "at_ms": self.sim_now_ms,
+                "state": self.eff_health.value,
+                "health": self.eff_health.value,
+                "reason": (
+                    "local_only"
+                    if self.local_blocked
+                    else ("init" if provider is not None else "no_provider")
+                ),
+            }
+        ]
+        self.speaker_update_times: dict[str, int] = {}
+        self.speaker_boundary_end_ms: dict[str, int] = {}
+        self.speaker_boundary_rx_ms: dict[str, int] = {}
+        self.global_boundary_rx_ms: int = -1
+        self.last_gap_ms: int | None = None
+        self.recipient_speaking = False
+        self.recipient_speaking_until_ms = 0
+        self.prev_anchor_norm: str | None = None
+        self.prev_anchor_seg_ids: set[str] = set()
+        self.prev_anchor_rx_ms: int | None = None
+        self.settling: list[_ReplayPendingItem] = []
+        self.deferred: _ReplayPendingItem | None = None
+        self.active: _ReplayActiveItem | None = None
+        self.last_proactive_display_ms: int | None = None
+        self.displayed_times: list[int] = []
+        self.displayed_cards: list[DisplayedCardEvent] = []
+        self.latencies_ms: list[float] = []
+        self.decisions_count = 0
+        self.dropped_count = 0
+        self.routed_count = 0
+        self.withdrawn_count = 0
+        self.expired_count = 0
+        self.consecutive_clf_errors = 0
+        self.classifier_error_threshold = 3
+        self.suggestions_by_id: dict[str, SuggestionCandidate] = {}
+        self.ledger_texts: dict[str, str] = {}
+        self.ledger_categories: dict[str, Category] = {}
+        self.prior_anchor_texts: dict[str, str] = {}
+        self.pending_decisions: list[dict[str, Any]] = []
+        self.decision_idx_by_cand: dict[str, int] = {}
+        self.evt_seq = 0
+
+    def next_evt_id(self, prefix: str) -> str:
+        self.evt_seq += 1
+        return f"{prefix}-rep-{self.evt_seq:06d}"
+
+    def record_health(self, new_state: HealthState, at_ms: int, reason: str) -> None:
+        self.eff_health = new_state
+        if self.health_timeline[-1]["state"] != new_state.value:
+            self.health_timeline.append(
+                {
+                    "at_ms": at_ms,
+                    "state": new_state.value,
+                    "health": new_state.value,
+                    "reason": reason,
+                }
+            )
+
+    def upsert_decision(
+        self,
+        *,
+        context: DecisionContext,
+        terminal_state: str,
+        terminal_reason: ReasonCode | None,
+        classifier: Any = None,
+        routing: RoutingDecision | None = None,
+        serialized_text: str | None = None,
+    ) -> None:
+        rec = {
+            "context": context,
+            "terminal_state": terminal_state,
+            "terminal_reason": terminal_reason,
+            "classifier": classifier,
+            "routing": routing,
+            "serialized_text": serialized_text,
+        }
+        if context.candidate_id in self.decision_idx_by_cand:
+            self.pending_decisions[self.decision_idx_by_cand[context.candidate_id]] = rec
+        else:
+            self.decision_idx_by_cand[context.candidate_id] = len(self.pending_decisions)
+            self.pending_decisions.append(rec)
+
+    def record_non_routed(
+        self,
+        ctx: DecisionContext,
+        clf_res: Any,
+        routing: RoutingDecision,
+        serialized_text: str | None,
+    ) -> None:
+        if routing.outcome is Outcome.NONE:
+            t_state = "no_opportunity"
+        elif routing.outcome is Outcome.ABSTAIN:
+            t_state = "abstained"
+        elif routing.outcome is Outcome.SUPPRESS:
+            t_state = "suppressed"
+        else:
+            t_state = "ready"
+        t_reason = routing.reason_codes[0] if routing.reason_codes else None
+        self.upsert_decision(
+            context=ctx,
+            terminal_state=t_state,
+            terminal_reason=t_reason,
+            classifier=clf_res,
+            routing=routing,
+            serialized_text=serialized_text,
+        )
+
+    def retire_anchor(self, anchor: AnchorSpan, *, state_version: int, reason: ReasonCode) -> None:
+        self.decisions_count += 1
+        ctx = _replay_make_dummy_context(
+            candidate_id=anchor.candidate_id,
+            session_id=self.brief.session_id,
+            state_version=state_version,
+            builder_version=self.policy.classifier.version,
+            prefilter_version=PREFILTER_VERSION,
+            anchor_refs=anchor.anchor_refs,
+            anchor_received_ms=anchor.anchor_received_ms,
+            display_by_ms=anchor.display_by_ms,
+            sha="retired",
+        )
+        self.upsert_decision(context=ctx, terminal_state="retired", terminal_reason=reason)
+
+    def retire_uncovered_segments(self, snap: StateSnapshot, reason: ReasonCode) -> None:
+        unproc = self.cursor.unprocessed_segments(snap)
+        if not unproc:
+            return
+        anchors = coalesce_anchors(
+            snap,
+            max_candidate_age_ms=self.policy.display.max_candidate_age_ms,
+            tokenizer=self.tok,
+            speaker_boundary_end_ms=self.speaker_boundary_end_ms,
+            segments_subset=unproc,
+        )
+        for anchor in anchors:
+            self.retire_anchor(anchor, state_version=snap.state_version, reason=reason)
+            self.cursor.mark_covered(anchor.segments)
+
+    def close_open_items_for_halt(self, *, at_ms: int) -> None:
+        if self.active is not None:
+            self.transition_active(LedgerState.WITHDRAWN, ReasonCode.OBJECTIVE_CHANGED, at_ms=at_ms)
+        if self.deferred is not None:
+            d = self.deferred
+            self.deferred = None
+            self.close_pending(d, ReasonCode.EVIDENCE_REVISION_CHANGED, at_ms=at_ms)
+        if self.settling:
+            items = list(self.settling)
+            self.settling.clear()
+            for item in items:
+                self.close_pending(item, ReasonCode.EVIDENCE_REVISION_CHANGED, at_ms=at_ms)
+
+    def _apply_external_ledger(self, ev: CanonicalEvent) -> None:
+        assert ev.suggestion_id is not None and ev.transition is not None and ev.cause is not None
+        if self.store is not None:
+            self.store.record_ledger_event(
+                session_id=self.brief.session_id,
+                run_id=self.run_id,
+                event=LedgerEvent(
+                    schema_version=SCHEMA_VERSION,
+                    event_id=ev.event_id,
+                    suggestion_id=ev.suggestion_id,
+                    transition=ev.transition,
+                    cause=ev.cause,
+                    at_ms=ev.at_ms or ev.received_ms,
+                    evidence_refs=ev.evidence_refs,
+                    feedback=ev.feedback,
+                ),
+            )
+        is_closing = ev.transition in _TERMINAL_LEDGER_STATES or ev.transition is LedgerState.USED
+        if is_closing:
+            self.prev_anchor_norm = None
+        if self.active is not None and self.active.cand.suggestion_id == ev.suggestion_id:
+            if ev.transition is LedgerState.PINNED:
+                self.active.pinned = True
+            elif is_closing:
+                act = self.active
+                if ev.transition is not LedgerState.USED:
+                    self.active = None
+                self.upsert_decision(
+                    context=act.context,
+                    terminal_state=str(ev.transition),
+                    terminal_reason=ev.cause,
+                    classifier=act.classifier,
+                    routing=act.routing,
+                    serialized_text=act.serialized_text,
+                )
+        if (
+            self.deferred is not None
+            and self.deferred.cand.suggestion_id == ev.suggestion_id
+            and is_closing
+        ):
+            d = self.deferred
+            self.deferred = None
+            self.upsert_decision(
+                context=d.context,
+                terminal_state=str(ev.transition),
+                terminal_reason=ev.cause,
+                classifier=d.classifier,
+                routing=d.routing,
+                serialized_text=d.serialized_text,
+            )
+        for i, item in enumerate(self.settling):
+            if item.cand.suggestion_id == ev.suggestion_id and is_closing:
+                self.settling.pop(i)
+                self.upsert_decision(
+                    context=item.context,
+                    terminal_state=str(ev.transition),
+                    terminal_reason=ev.cause,
+                    classifier=item.classifier,
+                    routing=item.routing,
+                    serialized_text=item.serialized_text,
+                )
+                break
+
+    def ingest_event(self, ev: CanonicalEvent) -> None:
+        apply_res = self.state.apply(ev)
+        snap = self.state.snapshot()
+        if not apply_res.accepted:
+            if apply_res.drop_reason == "off_record":
+                self.decisions_count += 1
+                otr_ctx = _replay_make_dummy_context(
+                    candidate_id=f"otr-{ev.event_id}",
+                    session_id=self.brief.session_id,
+                    state_version=snap.state_version,
+                    builder_version=self.policy.classifier.version,
+                    prefilter_version=PREFILTER_VERSION,
+                    anchor_refs=(),
+                    anchor_received_ms=ev.received_ms,
+                    display_by_ms=ev.received_ms,
+                    flags={"has_off_record_gap": True},
+                    sha="off_record",
+                )
+                self.upsert_decision(
+                    context=otr_ctx,
+                    terminal_state="retired",
+                    terminal_reason=ReasonCode.OFF_RECORD,
+                )
+            return
+
+        if self.store is not None:
+            can_rev: int | None = None
+            if ev.segment_id and ev.segment_id in snap.segments_by_id:
+                can_rev = snap.segments_by_id[ev.segment_id].revision
+            self.store.record_canonical_event(
+                run_id=self.run_id,
+                event=ev,
+                retention=self.brief.retention,
+                canonical_revision=can_rev,
+            )
+
+        if ev.kind is EventKind.CONTROL:
+            if ev.subtype in {ControlSubtype.GAP, ControlSubtype.RECONNECT}:
+                self.last_gap_ms = ev.received_ms
+                self.recipient_speaking = False
+                self.prev_anchor_norm = None
+            elif ev.subtype is ControlSubtype.OFF_RECORD_START:
+                self.close_open_items_for_halt(at_ms=ev.received_ms)
+                self.retire_uncovered_segments(snap, ReasonCode.OFF_RECORD)
+                self.prev_anchor_norm = None
+                self.prev_anchor_seg_ids.clear()
+                self.prev_anchor_rx_ms = None
+        elif ev.kind is EventKind.BOUNDARY:
+            if ev.speaker_id is not None and ev.end_ms is not None:
+                prev_b = self.speaker_boundary_end_ms.get(ev.speaker_id)
+                if prev_b is None or ev.end_ms > prev_b:
+                    self.speaker_boundary_end_ms[ev.speaker_id] = ev.end_ms
+            if ev.speaker_id is not None:
+                prev_rx = self.speaker_boundary_rx_ms.get(ev.speaker_id, -1)
+                if ev.received_ms > prev_rx:
+                    self.speaker_boundary_rx_ms[ev.speaker_id] = ev.received_ms
+            elif ev.received_ms > self.global_boundary_rx_ms:
+                self.global_boundary_rx_ms = ev.received_ms
+            if ev.speaker_id is None or ev.speaker_id in self.recipient_ids:
+                self.recipient_speaking = False
+        elif ev.kind is EventKind.SPEAKER_UPDATE and ev.segment_id:
+            self.speaker_update_times[ev.segment_id] = ev.received_ms
+        elif ev.kind is EventKind.SEGMENT and ev.speaker_id in self.recipient_ids:
+            if ev.stability is Stability.INTERIM:
+                self.recipient_speaking = True
+            elif ev.stability is Stability.COMMITTED and ev.segment_id:
+                self.recipient_speaking = False
+                self.recipient_speaking_until_ms = max(
+                    self.recipient_speaking_until_ms, ev.received_ms + 1400
+                )
+        elif ev.kind is EventKind.LEDGER and ev.suggestion_id:
+            self._apply_external_ledger(ev)
+
+        if apply_res.material_change and apply_res.affected_segment_id is not None:
+            self.cursor.note_material_segment(apply_res.affected_segment_id)
+
+    def is_open_tail_anchor(self, anchor: AnchorSpan, snap: StateSnapshot) -> bool:
+        if self.next_ev_idx >= len(self.ordered) or snap.off_record:
+            return False
+        if anchor.display_by_ms <= self.sim_now_ms:
+            return False
+        if self.tok.count_tokens(anchor.joined_text) >= DEFAULT_ANCHOR_MAX_TOKENS:
+            return False
+        for seg in anchor.segments:
+            if seg.boundary is not None or _SENTENCE_FINAL_RE.search(seg.text) is not None:
+                return False
+        last_s = anchor.segments[-1]
+        bnd_end = self.speaker_boundary_end_ms.get(last_s.speaker_id)
+        if bnd_end is not None and bnd_end >= last_s.end_ms:
+            return False
+        bnd_rx = max(
+            self.speaker_boundary_rx_ms.get(last_s.speaker_id, -1),
+            self.global_boundary_rx_ms,
+        )
+        if bnd_rx >= last_s.received_ms:
+            return False
+        if self.recipient_speaking:
+            return False
+        last_key = CoverageCursor.seg_key(last_s)
+        for seg in snap.segments:
+            if seg.speaker_id in self.recipient_ids and CoverageCursor.seg_key(seg) > last_key:
+                return False
+        return True
+
+    def display_moment_block(self, now_ms: int, snap: StateSnapshot) -> ReasonCode | None:
+        if self.recipient_speaking or now_ms < self.recipient_speaking_until_ms:
+            return ReasonCode.RECIPIENT_SPEAKING
+        if self.active is not None:
+            return ReasonCode.CARD_ACTIVE
+        if self.last_proactive_display_ms is not None:
+            cooldown_end = self.last_proactive_display_ms + self.policy.display.cooldown_ms
+            if now_ms < cooldown_end:
+                return ReasonCode.COOLDOWN
+        cap = effective_max_cards_per_10_min(snap.brief, self.policy)
+        recent = [t for t in self.displayed_times if (now_ms - t) <= 600_000]
+        if cap <= 0 or len(recent) >= cap:
+            return ReasonCode.CARD_ACTIVE
+        return None
+
+    def revalidate_item(
+        self,
+        item: _ReplayPendingItem | _ReplayActiveItem,
+        snap: StateSnapshot,
+        now_ms: int,
+        *,
+        is_active: bool,
+    ) -> tuple[ReasonCode | None, ReasonCode | None]:
+        cand = item.cand
+        if is_active:
+            assert isinstance(item, _ReplayActiveItem)
+            if not item.pinned and now_ms >= item.expires_at_ms:
+                return (ReasonCode.DISPLAY_TTL_PASSED, None)
+        else:
+            if now_ms >= cand.display_by_ms:
+                return (ReasonCode.DISPLAY_BY_PASSED, None)
+            if self.last_gap_ms is not None and item.anchor_received_ms < self.last_gap_ms:
+                return (ReasonCode.DISPLAY_BY_PASSED, None)
+
+        for ref in cand.evidence_refs:
+            seg = snap.segments_by_id.get(ref.segment_id)
+            if seg is None or seg.revision != ref.revision or seg.speaker_id in self.recipient_ids:
+                return (ReasonCode.EVIDENCE_REVISION_CHANGED, None)
+
+        if _replay_brief_material_key(snap.brief) != _replay_brief_material_key(
+            item.brief_snapshot
+        ):
+            return (ReasonCode.OBJECTIVE_CHANGED, None)
+
+        ev_ids = {r.segment_id for r in cand.evidence_refs}
+        norm_q = normalize_for_matching(cand.text)
+        q_toks = _replay_content_tokens(cand.text)
+        for entry in snap.ledger.values():
+            if (
+                entry.suggestion_id == cand.suggestion_id
+                or entry.state not in _SHOWN_OR_ACTED_STATES
+            ):
+                continue
+            e_cat = self.ledger_categories.get(entry.suggestion_id)
+            if e_cat is None and entry.suggestion_id in self.suggestions_by_id:
+                e_cat = self.suggestions_by_id[entry.suggestion_id].category
+            e_ev = {r.segment_id for r in entry.evidence_refs}
+            if e_cat is cand.category and (ev_ids & e_ev):
+                return (ReasonCode.DUPLICATE, None)
+            prev_txt = self.ledger_texts.get(entry.suggestion_id)
+            if prev_txt is None and entry.suggestion_id in self.suggestions_by_id:
+                prev_txt = self.suggestions_by_id[entry.suggestion_id].text
+            if prev_txt:
+                if normalize_for_matching(prev_txt) == norm_q:
+                    return (ReasonCode.DUPLICATE, None)
+                p_toks = _replay_content_tokens(prev_txt)
+                if q_toks and p_toks and (len(q_toks & p_toks) / len(q_toks | p_toks)) >= 0.75:
+                    return (ReasonCode.NEAR_DUPLICATE, None)
+
+        cpol = self.policy.categories.get(cand.category)
+        tpl = self.tpl_map.get(cpol.template) if cpol and cpol.template else None
+        anc_toks = _replay_content_tokens(item.anchor_text)
+        for seg in snap.segments:
+            if CoverageCursor.seg_key(seg) > item.anchor_last_key and (
+                matches_resolution_cue(seg.text, cand.category, tpl)
+                or (
+                    cand.category is Category.CONFIRM_TIME
+                    and matches_resolution_cue(seg.text, Category.CONFIRM_OWNER, None)
+                    and bool(anc_toks & _replay_content_tokens(seg.text))
+                )
+            ):
+                return (ReasonCode.POSSIBLY_RESOLVED, None)
+        if not is_active:
+            for int_seg in snap.interim_segments.values():
+                if (
+                    int_seg.segment_id not in ev_ids
+                    and (
+                        int_seg.start_ms >= item.anchor_start_ms
+                        or int_seg.received_ms >= item.anchor_received_ms
+                    )
+                    and matches_resolution_cue(int_seg.text, cand.category, tpl)
+                ):
+                    return (None, ReasonCode.INTERIM_RESOLUTION_HINT)
+
+        for seg in snap.segments:
+            if (
+                seg.speaker_id in self.recipient_ids
+                and CoverageCursor.seg_key(seg) > item.anchor_last_key
+                and is_equivalent_question(seg.text, cand.text, cand.category)
+            ):
+                return (ReasonCode.EQUIVALENT_QUESTION_ASKED, None)
+
+        if (
+            not is_active
+            and cand.template_id is not None
+            and not cand.grounded_slots
+            and tpl is not None
+            and cand.text == tpl.generic.text
+            and (
+                now_ms < item.anchor_received_ms
+                or (now_ms - item.anchor_received_ms) > tpl.generic.allowed_when.max_anchor_age_ms
+            )
+        ):
+            return (ReasonCode.GENERIC_REFERENT_UNCLEAR, None)
+
+        return (None, None)
+
+    def offer_deferred(self, item: _ReplayPendingItem, reason: ReasonCode, *, at_ms: int) -> None:
+        if self.deferred is not None:
+            if item.score > self.deferred.score:
+                old = self.deferred
+                self.deferred = None
+                self.close_pending(old, ReasonCode.DISPLACED_BY_BETTER, at_ms=at_ms)
+            else:
+                self.close_pending(item, ReasonCode.DISPLACED_BY_BETTER, at_ms=at_ms)
+                return
+
+        entry = self.state.snapshot().ledger.get(item.cand.suggestion_id)
+        if entry is not None and entry.state is LedgerState.READY:
+            def_ev = LedgerEvent(
+                schema_version=SCHEMA_VERSION,
+                event_id=self.next_evt_id("def"),
+                suggestion_id=item.cand.suggestion_id,
+                transition=LedgerState.DEFERRED,
+                cause=reason,
+                at_ms=at_ms,
+                evidence_refs=item.cand.evidence_refs,
+            )
+            self.state.apply(def_ev.to_canonical_event(self.brief.session_id, received_ms=at_ms))
+            if self.store is not None:
+                self.store.record_ledger_event(
+                    session_id=self.brief.session_id, run_id=self.run_id, event=def_ev
+                )
+
+        item.deferred_reason = reason
+        if reason is ReasonCode.COOLDOWN and self.last_proactive_display_ms is not None:
+            item.cooldown_end_ms = self.last_proactive_display_ms + self.policy.display.cooldown_ms
+        else:
+            item.cooldown_end_ms = None
+        self.deferred = item
+
+    def display_pending(self, item: _ReplayPendingItem, *, cause: ReasonCode, at_ms: int) -> None:
+        disp_ev = LedgerEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id=self.next_evt_id("disp"),
+            suggestion_id=item.cand.suggestion_id,
+            transition=LedgerState.DISPLAYED,
+            cause=cause,
+            at_ms=at_ms,
+            evidence_refs=item.cand.evidence_refs,
+        )
+        self.state.apply(disp_ev.to_canonical_event(self.brief.session_id, received_ms=at_ms))
+        if self.store is not None:
+            self.store.record_ledger_event(
+                session_id=self.brief.session_id, run_id=self.run_id, event=disp_ev
+            )
+        self.ledger_texts[item.cand.suggestion_id] = item.cand.text
+        self.ledger_categories[item.cand.suggestion_id] = item.cand.category
+        if item.anchor_text:
+            self.prior_anchor_texts[item.cand.candidate_id] = item.anchor_text
+        self.prev_anchor_norm = None
+        self.last_proactive_display_ms = at_ms
+        self.displayed_times.append(at_ms)
+        self.displayed_cards.append(
+            DisplayedCardEvent(
+                suggestion_id=item.cand.suggestion_id,
+                candidate_id=item.cand.candidate_id,
+                session_id=self.brief.session_id,
+                category=item.cand.category,
+                display_ms=at_ms,
+                evidence_refs=item.cand.evidence_refs,
+                text=item.cand.text,
+                route=item.cand.route,
+                origin=item.cand.origin,
+            )
+        )
+        self.active = _ReplayActiveItem(
+            cand=item.cand,
+            context=item.context,
+            classifier=item.classifier,
+            routing=item.routing,
+            serialized_text=item.serialized_text,
+            brief_snapshot=item.brief_snapshot,
+            anchor_text=item.anchor_text,
+            anchor_last_key=item.anchor_last_key,
+            anchor_start_ms=item.anchor_start_ms,
+            anchor_received_ms=item.anchor_received_ms,
+            displayed_at_ms=at_ms,
+            expires_at_ms=at_ms + item.cand.display_ttl_ms,
+        )
+
+    def close_pending(self, item: _ReplayPendingItem, reason: ReasonCode, *, at_ms: int) -> None:
+        if reason is ReasonCode.GENERIC_REFERENT_UNCLEAR:
+            if self.store is not None:
+                self.store.record_suggestion(
+                    session_id=self.brief.session_id,
+                    run_id=self.run_id,
+                    suggestion=item.cand,
+                    current_state="unrendered",
+                    terminal_reason=ReasonCode.GENERIC_REFERENT_UNCLEAR,
+                    transitions=(),
+                    retention=self.brief.retention,
+                )
+            self.upsert_decision(
+                context=item.context,
+                terminal_state="unrendered",
+                terminal_reason=ReasonCode.GENERIC_REFERENT_UNCLEAR,
+                classifier=item.classifier,
+                routing=item.routing,
+                serialized_text=item.serialized_text,
+            )
+            return
+
+        if reason in {ReasonCode.DISPLAY_BY_PASSED, ReasonCode.DISPLAY_TTL_PASSED}:
+            t_state_enum = LedgerState.EXPIRED
+            t_reason = ReasonCode.DISPLAY_BY_PASSED
+            dec_state = "expired"
+            self.expired_count += 1
+        else:
+            t_state_enum = LedgerState.WITHDRAWN
+            t_reason = reason
+            dec_state = "withdrawn"
+            self.withdrawn_count += 1
+
+        ev = LedgerEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id=self.next_evt_id("cls"),
+            suggestion_id=item.cand.suggestion_id,
+            transition=t_state_enum,
+            cause=t_reason,
+            at_ms=at_ms,
+            evidence_refs=item.cand.evidence_refs,
+        )
+        self.state.apply(ev.to_canonical_event(self.brief.session_id, received_ms=at_ms))
+        if self.store is not None:
+            self.store.record_ledger_event(
+                session_id=self.brief.session_id, run_id=self.run_id, event=ev
+            )
+        self.upsert_decision(
+            context=item.context,
+            terminal_state=dec_state,
+            terminal_reason=t_reason,
+            classifier=item.classifier,
+            routing=item.routing,
+            serialized_text=item.serialized_text,
+        )
+
+    def transition_active(
+        self, target_state: LedgerState, cause: ReasonCode, *, at_ms: int
+    ) -> None:
+        act = self.active
+        if act is None:
+            return
+        self.active = None
+        if target_state is LedgerState.EXPIRED:
+            self.expired_count += 1
+        elif target_state is LedgerState.WITHDRAWN:
+            self.withdrawn_count += 1
+        ev = LedgerEvent(
+            schema_version=SCHEMA_VERSION,
+            event_id=self.next_evt_id("act"),
+            suggestion_id=act.cand.suggestion_id,
+            transition=target_state,
+            cause=cause,
+            at_ms=at_ms,
+            evidence_refs=act.cand.evidence_refs,
+        )
+        self.state.apply(ev.to_canonical_event(self.brief.session_id, received_ms=at_ms))
+        if self.store is not None:
+            self.store.record_ledger_event(
+                session_id=self.brief.session_id, run_id=self.run_id, event=ev
+            )
+        self.upsert_decision(
+            context=act.context,
+            terminal_state=str(target_state),
+            terminal_reason=cause,
+            classifier=act.classifier,
+            routing=act.routing,
+            serialized_text=act.serialized_text,
+        )
+
+    def advance_display_timers(self, now_ms: int) -> None:
+        snap = self.state.snapshot()
+        if self.active is not None:
+            fail_reason, _ = self.revalidate_item(self.active, snap, now_ms, is_active=True)
+            if fail_reason is not None:
+                if fail_reason is ReasonCode.DISPLAY_TTL_PASSED:
+                    self.transition_active(
+                        LedgerState.EXPIRED, ReasonCode.DISPLAY_TTL_PASSED, at_ms=now_ms
+                    )
+                elif fail_reason in {
+                    ReasonCode.POSSIBLY_RESOLVED,
+                    ReasonCode.EQUIVALENT_QUESTION_ASKED,
+                }:
+                    self.transition_active(
+                        LedgerState.RESOLVED, ReasonCode.RESOLUTION_CUE, at_ms=now_ms
+                    )
+                elif self.active.pinned:
+                    self.transition_active(
+                        LedgerState.OUTDATED, ReasonCode.RESOLUTION_CUE, at_ms=now_ms
+                    )
+                else:
+                    self.transition_active(LedgerState.WITHDRAWN, fail_reason, at_ms=now_ms)
+
+        if self.deferred is not None:
+            def_item = self.deferred
+            fail_reason, defer_reason = self.revalidate_item(
+                def_item, snap, now_ms, is_active=False
+            )
+            if fail_reason is not None:
+                self.deferred = None
+                self.close_pending(def_item, fail_reason, at_ms=now_ms)
+            elif defer_reason is None:
+                gate = self.display_moment_block(now_ms, snap)
+                if gate is None:
+                    self.deferred = None
+                    self.display_pending(def_item, cause=ReasonCode.DEFERRED_RELEASED, at_ms=now_ms)
+                elif gate is ReasonCode.COOLDOWN and self.last_proactive_display_ms is not None:
+                    def_item.cooldown_end_ms = (
+                        self.last_proactive_display_ms + self.policy.display.cooldown_ms
+                    )
+
+        snap = self.state.snapshot()
+        still_settling: list[_ReplayPendingItem] = []
+        for item in self.settling:
+            fail_reason, defer_reason = self.revalidate_item(item, snap, now_ms, is_active=False)
+            if fail_reason is not None:
+                self.close_pending(item, fail_reason, at_ms=now_ms)
+                continue
+            bnd_rx = max(
+                self.speaker_boundary_rx_ms.get(item.anchor_speaker_id, -1),
+                self.global_boundary_rx_ms,
+            )
+            if bnd_rx > item.anchor_received_ms and now_ms < item.settle_end_ms:
+                item.settled = True
+                item.settle_cause = ReasonCode.BOUNDARY_AFTER_SETTLE
+            elif now_ms >= item.settle_end_ms:
+                item.settled = True
+                item.settle_cause = ReasonCode.SETTLE_TIMEOUT
+            if not item.settled:
+                still_settling.append(item)
+                continue
+            if defer_reason is not None:
+                self.offer_deferred(item, defer_reason, at_ms=now_ms)
+                continue
+            gate = self.display_moment_block(now_ms, snap)
+            if gate is not None:
+                self.offer_deferred(item, gate, at_ms=now_ms)
+                continue
+            self.display_pending(item, cause=item.settle_cause, at_ms=now_ms)
+        self.settling = still_settling
+
+    async def _render_and_enqueue(
+        self,
+        *,
+        ctx: DecisionContext,
+        clf_res: Any,
+        routing: RoutingDecision,
+        snap: StateSnapshot,
+        serialized_text: str,
+        anchor: AnchorSpan,
+    ) -> None:
+        assert routing.category is not None
+        eff_routing = routing
+        cpol = self.policy.categories[routing.category]
+        tpl = self.tpl_map.get(cpol.template) if cpol.template else None
+        ready_ms = self.sim_now_ms
+        cand: SuggestionCandidate | None = None
+        fail_reason: ReasonCode | None = None
+
+        if routing.route is Route.GENERATOR:
+            if self.provider is not None:
+                orig_sink = self.provider.egress_sink
+                orig_clock = self.provider.clock_ms
+                egress_recorded = False
+
+                def _replay_clock_ms(_r: int = ready_ms) -> int:
+                    return _r
+
+                def _on_egress(
+                    rec: EgressRecord,
+                    _cid: str = ctx.candidate_id,
+                    _orig: Callable[[EgressRecord], None] | None = orig_sink,
+                ) -> None:
+                    nonlocal egress_recorded
+                    if rec.candidate_id == _cid:
+                        egress_recorded = True
+                    if self.store is not None:
+                        self.store.record_egress(run_id=self.run_id, record=rec)
+                    if _orig is not None:
+                        _orig(rec)
+
+                self.provider.egress_sink = _on_egress
+                self.provider.clock_ms = _replay_clock_ms
+                try:
+                    gen_out = await generate_question(
+                        ctx,
+                        routing.category,
+                        snap,
+                        self.policy,
+                        self.provider,
+                        clock_ms=_replay_clock_ms,
+                        store=self.store,
+                        templates=self.tpl_map,
+                        ledger_texts=self.ledger_texts,
+                        ledger_categories=self.ledger_categories,
+                    )
+                finally:
+                    self.provider.egress_sink = orig_sink
+                    self.provider.clock_ms = orig_clock
+                    if self.health_override is None and not self.local_blocked:
+                        new_h = self.provider.health_state
+                        if new_h is not self.eff_health:
+                            self.record_health(new_h, ready_ms, "generator_breaker")
+                cand = gen_out.candidate
+                if cand is None:
+                    fail_reason = gen_out.terminal_reason or ReasonCode.GENERATOR_INVALID_OUTPUT
+                elif gen_out.fallback_used and not egress_recorded:
+                    eff_routing = replace(routing, route=cand.route)
+            elif tpl is not None:
+                eff_routing = replace(routing, route=Route.TEMPLATE)
+                rendered = render_template(
+                    ctx,
+                    routing.category,
+                    snap,
+                    tpl,
+                    now_ms=ready_ms,
+                    ready_ms=ready_ms,
+                    display_ttl_ms=self.policy.display.display_ttl_ms,
+                )
+                cand = rendered.candidate
+                if cand is None:
+                    fail_reason = rendered.unrendered_reason or ReasonCode.SLOT_UNAVAILABLE
+            else:
+                fail_reason = ReasonCode.INSUFFICIENT_BUDGET
+        else:
+            if tpl is None:
+                fail_reason = ReasonCode.SLOT_UNAVAILABLE
+            else:
+                rendered = render_template(
+                    ctx,
+                    routing.category,
+                    snap,
+                    tpl,
+                    now_ms=ready_ms,
+                    ready_ms=ready_ms,
+                    display_ttl_ms=self.policy.display.display_ttl_ms,
+                )
+                if rendered.candidate is None:
+                    fail_reason = rendered.unrendered_reason or ReasonCode.SLOT_UNAVAILABLE
+                else:
+                    val = validate_template_candidate(
+                        rendered.candidate,
+                        snap,
+                        max_words=tpl.max_words,
+                        ledger_texts=self.ledger_texts,
+                        ledger_categories=self.ledger_categories,
+                    )
+                    if val.valid:
+                        cand = rendered.candidate
+                    else:
+                        fail_reason = val.reason_code or ReasonCode.SLOT_UNAVAILABLE
+
+        if cand is None:
+            t_reason = fail_reason or ReasonCode.SLOT_UNAVAILABLE
+            t_state = "suppressed" if t_reason in SUPPRESS_REASON_CODES else "unrendered"
+            if t_state == "suppressed":
+                eff_routing = replace(
+                    eff_routing,
+                    outcome=Outcome.SUPPRESS,
+                    route=None,
+                    reason_codes=(t_reason,),
+                )
+            self.upsert_decision(
+                context=ctx,
+                terminal_state=t_state,
+                terminal_reason=t_reason,
+                classifier=clf_res,
+                routing=eff_routing,
+                serialized_text=serialized_text,
+            )
+            return
+
+        self.routed_count += 1
+        self.state.register_suggestion(cand)
+        self.suggestions_by_id[cand.suggestion_id] = cand
+        if self.store is not None:
+            self.store.record_suggestion(
+                session_id=self.brief.session_id,
+                run_id=self.run_id,
+                suggestion=cand,
+                current_state="ready",
+                terminal_reason=None,
+                transitions=(),
+                retention=self.brief.retention,
+            )
+        self.upsert_decision(
+            context=ctx,
+            terminal_state="ready",
+            terminal_reason=eff_routing.reason_codes[0] if eff_routing.reason_codes else None,
+            classifier=clf_res,
+            routing=eff_routing,
+            serialized_text=serialized_text,
+        )
+        score = 0.0
+        if clf_res.calibrated_scores is not None:
+            score = float(clf_res.calibrated_scores.categories.get(cand.category.value, 0.0))
+        anchor_segs = [
+            snap.segments_by_id[r.segment_id]
+            for r in ctx.anchor_refs
+            if r.segment_id in snap.segments_by_id
+        ]
+        last_key = (
+            max(CoverageCursor.seg_key(s) for s in anchor_segs) if anchor_segs else (0, 0, 0, "")
+        )
+        anchor_start = min((s.start_ms for s in anchor_segs), default=ctx.anchor_received_ms)
+        anchor_spk = anchor_segs[0].speaker_id if anchor_segs else "S?"
+        self.settling.append(
+            _ReplayPendingItem(
+                cand=cand,
+                context=ctx,
+                classifier=clf_res,
+                routing=eff_routing,
+                serialized_text=serialized_text,
+                score=score,
+                brief_snapshot=snap.brief,
+                anchor_text=anchor.joined_text,
+                anchor_speaker_id=anchor_spk,
+                anchor_last_key=last_key,
+                anchor_start_ms=anchor_start,
+                anchor_received_ms=ctx.anchor_received_ms,
+                settle_end_ms=ctx.anchor_received_ms + self.policy.display.settle_ms,
+            )
+        )
+
+    async def run_proactive_once(self) -> bool:
+        if self.mode not in {Mode.PROACTIVE, Mode.QUIET, Mode.SHADOW}:
+            return False
+        if self.eff_health in {
+            HealthState.NO_TRANSCRIPT,
+            HealthState.PAUSED,
+            HealthState.MANUAL_ONLY,
+        }:
+            return False
+        snap = self.state.snapshot()
+        if snap.off_record:
+            return False
+        unprocessed = self.cursor.unprocessed_segments(snap)
+        if not unprocessed:
+            return False
+        anchors = coalesce_anchors(
+            snap,
+            max_candidate_age_ms=self.policy.display.max_candidate_age_ms,
+            tokenizer=self.tok,
+            speaker_boundary_end_ms=self.speaker_boundary_end_ms,
+            segments_subset=unprocessed,
+        )
+        if anchors and self.is_open_tail_anchor(anchors[-1], snap):
+            anchors = anchors[:-1]
+        if not anchors:
+            return False
+
+        live_anchors: list[AnchorSpan] = []
+        for anchor in anchors:
+            if anchor.display_by_ms <= self.sim_now_ms:
+                self.retire_anchor(
+                    anchor, state_version=snap.state_version, reason=ReasonCode.EXPIRED_UNEVALUATED
+                )
+                self.cursor.mark_covered(anchor.segments)
+            else:
+                live_anchors.append(anchor)
+        if not live_anchors:
+            return False
+
+        max_per_job = self.policy.classifier.max_candidates_per_job
+        has_overflow = len(live_anchors) > max_per_job
+        selected = live_anchors[-max_per_job:]
+
+        surviving: list[tuple[ContextBuildResult, str]] = []
+        for anchor in selected:
+            seg_ids = {s.segment_id for s in anchor.segments}
+            same_seg_rev = bool(seg_ids & self.prev_anchor_seg_ids)
+            gap_exceeded = (
+                self.prev_anchor_rx_ms is not None
+                and (anchor.anchor_received_ms - self.prev_anchor_rx_ms) > 30_000
+            )
+            eff_prev = None if (same_seg_rev or gap_exceeded) else self.prev_anchor_norm
+            pf = run_prefilter(
+                anchor,
+                state_version=snap.state_version,
+                previous_anchor_norm_text=eff_prev,
+            )
+            self.prev_anchor_norm = pf.normalized_text
+            self.prev_anchor_seg_ids = seg_ids
+            self.prev_anchor_rx_ms = anchor.anchor_received_ms
+            if not pf.passed and pf.drop_record is not None:
+                self.decisions_count += 1
+                self.dropped_count += 1
+                drop = pf.drop_record
+                dummy_ctx = _replay_make_dummy_context(
+                    candidate_id=drop.candidate_id,
+                    session_id=drop.session_id,
+                    state_version=drop.based_on_state_version,
+                    builder_version=self.policy.classifier.version,
+                    prefilter_version=drop.prefilter_version,
+                    anchor_refs=drop.anchor_refs,
+                    anchor_received_ms=drop.anchor_received_ms,
+                    display_by_ms=drop.display_by_ms,
+                    sha="dropped",
+                )
+                self.upsert_decision(
+                    context=dummy_ctx, terminal_state="dropped", terminal_reason=drop.reason_code
+                )
+                self.cursor.mark_covered(anchor.segments)
+            else:
+                built = build_decision_context(
+                    snap,
+                    anchor,
+                    self.policy,
+                    origin=Origin.PROACTIVE,
+                    tokenizer=self.tok,
+                    suggestion_catalog=self.suggestions_by_id,
+                )
+                surviving.append((built, pf.normalized_text))
+
+        if not surviving:
+            return has_overflow
+        return await self._classify_and_route_batch(surviving, has_overflow=has_overflow)
+
+    async def _classify_and_route_batch(
+        self,
+        surviving: list[tuple[ContextBuildResult, str]],
+        *,
+        has_overflow: bool,
+    ) -> bool:
+        c_inputs = [ClassifierInput.from_build_result(b) for b, _ in surviving]
+        t0 = time.perf_counter()
+        if self.cache_classifier and self.store is not None:
+            clf_results = await classify_batch_cached(self.classifier, c_inputs, store=self.store)
+        else:
+            clf_results = await self.classifier.classify_batch(c_inputs)
+        measured_ms = max(0.0, (time.perf_counter() - t0) * 1000.0)
+        stage_ms = _sample_stage_latency_ms(
+            measured_ms, self.simulated_latency_ms, self.latency_distribution_ms, self.rng
+        )
+        all_err = all(isinstance(r, ClassifierErrorResult) for r in clf_results)
+        if all_err:
+            self.consecutive_clf_errors += 1
+            if self.consecutive_clf_errors >= self.classifier_error_threshold:
+                self.record_health(
+                    HealthState.MANUAL_ONLY, self.sim_now_ms + stage_ms, "classifier_errors"
+                )
+            elif stage_ms == 0 and any(
+                isinstance(r, ClassifierErrorResult) and r.error == "timeout" for r in clf_results
+            ):
+                stage_ms = 1
+        else:
+            self.consecutive_clf_errors = 0
+
+        self.sim_now_ms += stage_ms
+        self.latencies_ms.append(float(stage_ms))
+        while (
+            self.next_ev_idx < len(self.ordered)
+            and self.ordered[self.next_ev_idx].received_ms <= self.sim_now_ms
+        ):
+            self.ingest_event(self.ordered[self.next_ev_idx])
+            self.next_ev_idx += 1
+        self.advance_display_timers(self.sim_now_ms)
+
+        current_snap = self.state.snapshot()
+        retry_pending = False
+        for (built, _norm), clf_raw in zip(surviving, clf_results, strict=True):
+            assert built.context is not None and built.serialized_text is not None
+            ctx = built.context
+            if self.cal_obj is not None and not isinstance(clf_raw, ClassifierErrorResult):
+                if isinstance(self.cal_obj, CalibrationRegistry):
+                    cal_ver = (
+                        self.policy.classifier.calibration
+                        if self.policy.classifier.calibration
+                        and clf_raw.classifier_version == self.policy.classifier.version
+                        else None
+                    )
+                    clf_res = self.cal_obj.calibrate(
+                        ctx, clf_raw, mode=current_snap.brief.mode, calibration_version=cal_ver
+                    )
+                else:
+                    clf_res = self.cal_obj.calibrate(ctx, clf_raw, mode=current_snap.brief.mode)
+            else:
+                clf_res = clf_raw
+
+            stale = any(
+                (cur_seg := current_snap.segments_by_id.get(ref.segment_id)) is None
+                or cur_seg.revision != ref.revision
+                or cur_seg.speaker_id in self.recipient_ids
+                for ref in ctx.anchor_refs
+            )
+            if (
+                not stale
+                and isinstance(clf_raw, ClassifierErrorResult)
+                and clf_raw.error in {"timeout", "deadline_exceeded"}
+            ):
+                if (
+                    clf_raw.error == "timeout"
+                    and self.consecutive_clf_errors < self.classifier_error_threshold
+                    and self.sim_now_ms < ctx.display_by_ms
+                    and self.eff_health is not HealthState.MANUAL_ONLY
+                ):
+                    retry_pending = True
+                    continue
+                if (
+                    self.sim_now_ms >= ctx.display_by_ms
+                    or clf_raw.error == "deadline_exceeded"
+                    or self.eff_health is HealthState.MANUAL_ONLY
+                ):
+                    self.retire_anchor(
+                        built.anchor,
+                        state_version=current_snap.state_version,
+                        reason=ReasonCode.EXPIRED_UNEVALUATED,
+                    )
+                    self.cursor.mark_covered(built.anchor.segments)
+                    continue
+
+            self.decisions_count += 1
+            if stale:
+                self.withdrawn_count += 1
+                self.upsert_decision(
+                    context=ctx,
+                    terminal_state="withdrawn",
+                    terminal_reason=ReasonCode.EVIDENCE_REVISION_CHANGED,
+                    classifier=clf_res,
+                    serialized_text=built.serialized_text,
+                )
+                unchanged = [
+                    s
+                    for s in built.anchor.segments
+                    if (cur := current_snap.segments_by_id.get(s.segment_id)) is not None
+                    and cur.revision == s.revision
+                ]
+                if unchanged:
+                    self.cursor.mark_covered(unchanged)
+                continue
+
+            self.cursor.mark_covered(built.anchor.segments)
+            route_health = self.eff_health
+            if (
+                self.health_override is None
+                and self.provider is not None
+                and not self.local_blocked
+            ):
+                brk_state = self.provider.advance_clock(self.sim_now_ms)
+                if brk_state is BreakerState.HALF_OPEN and self.provider.half_open_probe_available:
+                    route_health = HealthState.OK
+                else:
+                    route_health = self.provider.health_state
+                    if route_health is not self.eff_health:
+                        self.record_health(route_health, self.sim_now_ms, "breaker")
+
+            routing = route_candidate(
+                ctx,
+                clf_res,
+                current_snap,
+                self.policy,
+                mode=self.mode,
+                health=route_health,
+                now_ms=self.sim_now_ms,
+                speaker_update_times_ms=self.speaker_update_times,
+                ledger_texts=self.ledger_texts,
+                ledger_categories=self.ledger_categories,
+                prior_anchor_texts=self.prior_anchor_texts,
+                recent_displayed_ms=self.displayed_times,
+            )
+            if routing.outcome is not Outcome.ROUTE or routing.category is None:
+                self.record_non_routed(ctx, clf_res, routing, built.serialized_text)
+                continue
+
+            await self._render_and_enqueue(
+                ctx=ctx,
+                clf_res=clf_res,
+                routing=routing,
+                snap=current_snap,
+                serialized_text=built.serialized_text,
+                anchor=built.anchor,
+            )
+        self.advance_display_timers(self.sim_now_ms)
+        return has_overflow or retry_pending
+
+    def next_wake_ms(self) -> int | None:
+        candidates: list[int] = []
+        if self.next_ev_idx < len(self.ordered):
+            candidates.append(self.ordered[self.next_ev_idx].received_ms)
+        for item in self.settling:
+            if not item.settled and item.settle_end_ms > self.sim_now_ms:
+                candidates.append(item.settle_end_ms)
+            if item.cand.display_by_ms > self.sim_now_ms:
+                candidates.append(item.cand.display_by_ms)
+        if self.deferred is not None:
+            if self.deferred.cand.display_by_ms > self.sim_now_ms:
+                candidates.append(self.deferred.cand.display_by_ms)
+            if (
+                self.deferred.cooldown_end_ms is not None
+                and self.deferred.cooldown_end_ms > self.sim_now_ms
+            ):
+                candidates.append(self.deferred.cooldown_end_ms)
+        if (
+            self.settling or self.deferred is not None
+        ) and self.recipient_speaking_until_ms > self.sim_now_ms:
+            candidates.append(self.recipient_speaking_until_ms)
+        if (
+            self.active is not None
+            and not self.active.pinned
+            and self.active.expires_at_ms > self.sim_now_ms
+        ):
+            candidates.append(self.active.expires_at_ms)
+        return min(candidates) if candidates else None
+
+    async def run(self) -> ReplayResult:
+        if self.store is not None:
+            self.store.upsert_session(
+                brief=self.brief,
+                run_id=self.run_id,
+                runtime_mode=self.mode,
+                effective_max_cards_per_10_min=effective_max_cards_per_10_min(
+                    self.brief, self.policy
+                ),
+                health_timeline=self.health_timeline,
+            )
+
+        while (
+            self.next_ev_idx < len(self.ordered)
+            or self.settling
+            or self.deferred is not None
+            or self.active is not None
+        ):
+            while (
+                self.next_ev_idx < len(self.ordered)
+                and self.ordered[self.next_ev_idx].received_ms <= self.sim_now_ms
+            ):
+                self.ingest_event(self.ordered[self.next_ev_idx])
+                self.next_ev_idx += 1
+            self.advance_display_timers(self.sim_now_ms)
+
+            while await self.run_proactive_once():
+                while (
+                    self.next_ev_idx < len(self.ordered)
+                    and self.ordered[self.next_ev_idx].received_ms <= self.sim_now_ms
+                ):
+                    self.ingest_event(self.ordered[self.next_ev_idx])
+                    self.next_ev_idx += 1
+                self.advance_display_timers(self.sim_now_ms)
+
+            wake = self.next_wake_ms()
+            if wake is None:
+                break
+            self.sim_now_ms = max(self.sim_now_ms, wake)
+
+        final_snap = self.state.snapshot()
+        if self.store is not None:
+            sorted_decs = sorted(
+                self.pending_decisions,
+                key=lambda rec: _replay_anchor_sort_key(rec["context"], final_snap),
+            )
+            for rec in sorted_decs:
+                self.store.record_decision(
+                    run_id=self.run_id,
+                    context=rec["context"],
+                    terminal_state=rec["terminal_state"],
+                    terminal_reason=rec["terminal_reason"],
+                    classifier=rec["classifier"],
+                    routing=rec["routing"],
+                    serialized_text=rec["serialized_text"],
+                    retention=self.brief.retention,
+                )
+            self.store.upsert_session(
+                brief=final_snap.brief,
+                run_id=self.run_id,
+                runtime_mode=self.mode,
+                effective_max_cards_per_10_min=effective_max_cards_per_10_min(
+                    final_snap.brief, self.policy
+                ),
+                health_timeline=self.health_timeline,
+                reducer_counters=final_snap.counters,
+                revision_history=final_snap.revision_history,
+            )
+
+        rx_times = [e.received_ms for e in self.ordered]
+        dur_ms = max(1, (max(rx_times) - min(rx_times)) if len(rx_times) >= 2 else 1)
+        return ReplayResult(
+            session_id=self.brief.session_id,
+            run_id=self.run_id,
+            duration_ms=dur_ms,
+            displayed_cards=tuple(self.displayed_cards),
+            decisions_count=self.decisions_count,
+            dropped_count=self.dropped_count,
+            routed_count=self.routed_count,
+            withdrawn_count=self.withdrawn_count,
+            expired_count=self.expired_count,
+            latencies_ms=tuple(self.latencies_ms),
+        )
+
+
+def _replay_make_dummy_context(
     *,
-    run_id: str,
-    context: DecisionContext,
-    clf_res: Any,
-    routing: Any,
-    serialized_text: str | None,
-    retention: RetentionConfig | None = None,
-) -> None:
-    if routing.outcome is Outcome.NONE:
-        t_state = "no_opportunity"
-    elif routing.outcome is Outcome.ABSTAIN:
-        t_state = "abstained"
-    elif routing.outcome is Outcome.SUPPRESS:
-        t_state = "suppressed"
-    else:
-        t_state = "ready"
-    t_reason = routing.reason_codes[0] if routing.reason_codes else None
-    store.record_decision(
-        run_id=run_id,
-        context=context,
-        terminal_state=t_state,
-        terminal_reason=t_reason,
-        classifier=clf_res,
-        routing=routing,
-        serialized_text=serialized_text,
-        retention=retention,
+    candidate_id: str,
+    session_id: str,
+    state_version: int,
+    builder_version: str,
+    prefilter_version: str,
+    anchor_refs: tuple[SegmentRef, ...],
+    anchor_received_ms: int,
+    display_by_ms: int,
+    flags: dict[str, bool] | None = None,
+    sha: str = "retired",
+) -> DecisionContext:
+    return DecisionContext(
+        schema_version=SCHEMA_VERSION,
+        candidate_id=candidate_id,
+        session_id=session_id,
+        origin=Origin.PROACTIVE,
+        based_on_state_version=state_version,
+        builder_version=builder_version,
+        prefilter_version=prefilter_version,
+        anchor_refs=anchor_refs,
+        context_refs=(),
+        anchor_received_ms=anchor_received_ms,
+        display_by_ms=display_by_ms,
+        token_counts={"total": 0},
+        omitted={"turns": 0, "suggestions": 0, "known_facts": 0, "gaps": 0},
+        flags=flags or {},
+        serialized_sha256=sha,
     )
 
 
@@ -588,748 +2000,40 @@ async def async_simulate_replay(
     cache_classifier: bool = True,
 ) -> ReplayResult:
     """Run deterministic policy-level replay simulation with honest latency accounting (§12.6)."""
-    ordered = sorted(events, key=lambda ev: (ev.received_ms, ev.source_sequence, ev.event_id))
-    state = CanonicalState(brief)
     tpl_map = dict(templates) if templates is not None else load_templates_dir()
     cal_obj: CalibrationModel | CalibrationRegistry | None = (
         calibration
         if calibration is not None
         else (default_calibration_registry() if policy.classifier.calibration else None)
     )
-    local_blocked = (
-        provider is not None and provider.config.local_only and provider.config.effective_is_hosted
-    )
-    if health is not None:
-        eff_health = health
-    elif local_blocked or provider is None:
-        eff_health = HealthState.TEMPLATE_ONLY
-    else:
-        eff_health = provider.health_state
-    health_timeline: list[dict[str, Any]] = [
-        {
-            "at_ms": ordered[0].received_ms if ordered else 0,
-            "state": eff_health.value,
-            "health": eff_health.value,
-            "reason": (
-                "local_only"
-                if local_blocked
-                else ("init" if provider is not None else "no_provider")
-            ),
-        }
-    ]
-
-    def _record_health(new_state: HealthState, at_ms: int, reason: str) -> None:
-        nonlocal eff_health
-        eff_health = new_state
-        if health_timeline[-1]["state"] != new_state.value:
-            health_timeline.append(
-                {
-                    "at_ms": at_ms,
-                    "state": new_state.value,
-                    "health": new_state.value,
-                    "reason": reason,
-                }
-            )
-
-    rng = random.Random(rng_seed)
-
-    if store is not None:
-        store.upsert_session(
-            brief=brief,
-            run_id=run_id,
-            runtime_mode=mode,
-            effective_max_cards_per_10_min=effective_max_cards_per_10_min(brief, policy),
-            health_timeline=health_timeline,
-        )
-
-    speaker_update_times: dict[str, int] = {}
-    speaker_update_keys: dict[str, tuple[int, int, str]] = {}
-    speaker_boundary_end_ms: dict[str, int] = {}
-    boundary_events: list[tuple[int, str | None]] = []
-    covered_revs: set[tuple[str, int]] = set()
-    pending_buf: list[SegmentRecord] = []
-    prev_anchor_norm: str | None = None
-    tok = classifier.tokenizer or WhitespaceTokenizer()
-    displayed_cards: list[DisplayedCardEvent] = []
-    displayed_times: list[int] = []
-    latencies_ms: list[float] = []
-    decisions_count = 0
-    dropped_count = 0
-    routed_count = 0
-    withdrawn_count = 0
-    expired_count = 0
-    ledger_texts: dict[str, str] = {}
-    ledger_categories: dict[str, Category] = {}
-    prior_anchor_texts: dict[str, str] = {}
-    last_display_ms: int | None = None
-    cap = effective_max_cards_per_10_min(brief, policy)
-    recipient_ids = {"ME", brief.recipient.participant_id}
-
-    # Pre-index future boundaries & events by received_ms for lookahead-bounded revalidation
-    for ev in ordered:
-        if ev.kind is EventKind.BOUNDARY:
-            boundary_events.append((ev.received_ms, ev.speaker_id))
-
-    for step_idx in range(len(ordered) + 1):
-        flush_batches: list[tuple[StateSnapshot, list[SegmentRecord], int]] = []
-        if step_idx == len(ordered):
-            if pending_buf:
-                flush_batches.append((state.snapshot(), list(pending_buf), len(ordered) - 1))
-                pending_buf.clear()
+    prev_rx_for_seg: dict[str, int] = {}
+    ordered_tagged: list[tuple[int, int, CanonicalEvent]] = []
+    for orig_idx, ev in enumerate(events):
+        if ev.segment_id is not None:
+            eff_rx = max(prev_rx_for_seg.get(ev.segment_id, -1), ev.received_ms)
+            prev_rx_for_seg[ev.segment_id] = eff_rx
         else:
-            ev = ordered[step_idx]
-            pre_snap = state.snapshot() if pending_buf else None
-            apply_res = state.apply(ev)
-            prefix_snap = state.snapshot()
-            if store is not None and apply_res.accepted:
-                can_rev: int | None = None
-                if ev.segment_id and ev.segment_id in prefix_snap.segments_by_id:
-                    can_rev = prefix_snap.segments_by_id[ev.segment_id].revision
-                store.record_canonical_event(
-                    run_id=run_id,
-                    event=ev,
-                    retention=brief.retention,
-                    canonical_revision=can_rev,
-                )
-            if apply_res.accepted and ev.kind is EventKind.BOUNDARY:
-                if ev.speaker_id and ev.end_ms is not None:
-                    prev_b = speaker_boundary_end_ms.get(ev.speaker_id)
-                    if prev_b is None or ev.end_ms > prev_b:
-                        speaker_boundary_end_ms[ev.speaker_id] = ev.end_ms
-                if pending_buf and (
-                    ev.speaker_id is None or pending_buf[0].speaker_id == ev.speaker_id
-                ):
-                    flush_batches.append((prefix_snap, list(pending_buf), step_idx))
-                    pending_buf.clear()
-            elif apply_res.accepted and ev.kind is EventKind.SPEAKER_UPDATE and ev.segment_id:
-                speaker_update_times[ev.segment_id] = ev.received_ms
-                speaker_update_keys[ev.segment_id] = (
-                    ev.source_revision if ev.source_revision is not None else 0,
-                    ev.source_sequence,
-                    ev.event_id,
-                )
-                upd_seg = prefix_snap.segments_by_id.get(ev.segment_id)
-                if upd_seg is not None and upd_seg.committed:
-                    in_buf = [
-                        i for i, s in enumerate(pending_buf) if s.segment_id == upd_seg.segment_id
-                    ]
-                    if in_buf:
-                        if upd_seg.speaker_id in recipient_ids:
-                            pending_buf = [
-                                s for s in pending_buf if s.segment_id != upd_seg.segment_id
-                            ]
-                        else:
-                            for idx_b in in_buf:
-                                pending_buf[idx_b] = upd_seg
-                    elif (
-                        upd_seg.speaker_id not in recipient_ids
-                        and (upd_seg.segment_id, upd_seg.revision) not in covered_revs
-                    ):
-                        flush_batches.append((prefix_snap, [upd_seg], step_idx))
-            elif (
-                ev.kind is EventKind.SEGMENT
-                and ev.stability is Stability.COMMITTED
-                and ev.segment_id
-            ):
-                seg = prefix_snap.segments_by_id.get(ev.segment_id)
-                if seg is not None and (seg.segment_id, seg.revision) not in covered_revs:
-                    if seg.speaker_id in recipient_ids:
-                        if pending_buf and pre_snap is not None:
-                            flush_batches.append(
-                                (pre_snap, list(pending_buf), max(0, step_idx - 1))
-                            )
-                            pending_buf.clear()
-                    elif seg.revision > 1 and any(rid == seg.segment_id for rid, _ in covered_revs):
-                        if pending_buf and pre_snap is not None:
-                            flush_batches.append(
-                                (pre_snap, list(pending_buf), max(0, step_idx - 1))
-                            )
-                            pending_buf.clear()
-                        flush_batches.append((prefix_snap, [seg], step_idx))
-                    else:
-                        if pending_buf:
-                            prev_s = pending_buf[-1]
-                            spk_chg = prev_s.speaker_id != seg.speaker_id
-                            ovlp_chg = (
-                                prev_s.overlap or seg.overlap
-                            ) and prev_s.channel != seg.channel
-                            gap_chg = (seg.start_ms - prev_s.end_ms) >= 2000
-                            joined_txt = " ".join(
-                                s.text.strip() for s in [*pending_buf, seg] if s.text.strip()
-                            )
-                            if (
-                                spk_chg
-                                or ovlp_chg
-                                or gap_chg
-                                or tok.count_tokens(joined_txt) > DEFAULT_ANCHOR_MAX_TOKENS
-                            ) and pre_snap is not None:
-                                flush_batches.append(
-                                    (pre_snap, list(pending_buf), max(0, step_idx - 1))
-                                )
-                                pending_buf.clear()
-                        pending_buf.append(seg)
-                        cur_txt = " ".join(s.text.strip() for s in pending_buf if s.text.strip())
-                        has_punct = _SENTENCE_FINAL_RE.search(seg.text) is not None
-                        has_bnd = seg.boundary is not None and seg.boundary != "segment"
-                        if (
-                            has_punct
-                            or has_bnd
-                            or tok.count_tokens(cur_txt) >= DEFAULT_ANCHOR_MAX_TOKENS
-                        ):
-                            flush_batches.append((prefix_snap, list(pending_buf), step_idx))
-                            pending_buf.clear()
-
-        if not flush_batches:
-            continue
-
-        eval_built: list[tuple[StateSnapshot, SegmentRecord, int, ContextBuildResult]] = []
-        for f_snap, f_segs, f_idx in flush_batches:
-            for fs in f_segs:
-                covered_revs.add((fs.segment_id, fs.revision))
-            b_items = build_decision_contexts(
-                f_snap,
-                anchor_segments=f_segs,
-                policy=policy,
-                tokenizer=classifier.tokenizer,
-                speaker_boundary_end_ms=speaker_boundary_end_ms,
-                initial_previous_anchor_norm_text=prev_anchor_norm,
-            )
-            for b_res in b_items:
-                prev_anchor_norm = normalize_for_matching(b_res.anchor.joined_text)
-                eval_built.append((f_snap, b_res.anchor.segments[0], f_idx, b_res))
-
-        for prefix_snap, seg, ev_idx, built in eval_built:
-            decisions_count += 1
-            if built.dropped:
-                dropped_count += 1
-                if store is not None and built.drop_record is not None:
-                    drop = built.drop_record
-                    dummy_ctx = DecisionContext(
-                        schema_version=SCHEMA_VERSION,
-                        candidate_id=drop.candidate_id,
-                        session_id=drop.session_id,
-                        origin=Origin.PROACTIVE,
-                        based_on_state_version=drop.based_on_state_version,
-                        builder_version=policy.classifier.version,
-                        prefilter_version=drop.prefilter_version,
-                        anchor_refs=drop.anchor_refs,
-                        context_refs=(),
-                        anchor_received_ms=drop.anchor_received_ms,
-                        display_by_ms=drop.display_by_ms,
-                        token_counts={"total": 0},
-                        omitted={"turns": 0, "suggestions": 0, "known_facts": 0, "gaps": 0},
-                        flags={},
-                        serialized_sha256="dropped",
-                    )
-                    store.record_decision(
-                        run_id=run_id,
-                        context=dummy_ctx,
-                        terminal_state="dropped",
-                        terminal_reason=drop.reason_code,
-                        retention=brief.retention,
-                    )
-                continue
-
-            assert built.context is not None and built.serialized_text is not None
-            ctx = built.context
-            c_in = ClassifierInput(context=ctx, serialized_text=built.serialized_text)
-            t0 = time.perf_counter()
-            if cache_classifier and store is not None:
-                clf_list = await classify_batch_cached(classifier, [c_in], store=store)
-            else:
-                clf_list = await classifier.classify_batch([c_in])
-            measured_ms = max(0.0, (time.perf_counter() - t0) * 1000.0)
-            clf_raw = clf_list[0]
-            if cal_obj is not None and not isinstance(clf_raw, ClassifierErrorResult):
-                if isinstance(cal_obj, CalibrationRegistry):
-                    cal_ver = (
-                        policy.classifier.calibration
-                        if policy.classifier.calibration
-                        and clf_raw.classifier_version == policy.classifier.version
-                        else None
-                    )
-                    clf_res = cal_obj.calibrate(
-                        ctx,
-                        clf_raw,
-                        mode=prefix_snap.brief.mode,
-                        calibration_version=cal_ver,
-                    )
-                else:
-                    clf_res = cal_obj.calibrate(ctx, clf_raw, mode=prefix_snap.brief.mode)
-            else:
-                clf_res = clf_raw
-            stage_ms = _sample_stage_latency_ms(
-                measured_ms, simulated_latency_ms, latency_distribution_ms, rng
-            )
-            latencies_ms.append(float(stage_ms))
-
-            route_health = eff_health
-            if health is None and provider is not None and not local_blocked:
-                brk_state = provider.advance_clock(ctx.anchor_received_ms + stage_ms)
-                if brk_state is BreakerState.HALF_OPEN and provider.half_open_probe_available:
-                    route_health = HealthState.OK
-                else:
-                    route_health = provider.health_state
-                    if route_health is not eff_health:
-                        _record_health(route_health, ctx.anchor_received_ms + stage_ms, "breaker")
-
-            routing = route_candidate(
-                ctx,
-                clf_res,
-                prefix_snap,
-                policy,
-                mode=mode,
-                health=route_health,
-                now_ms=ctx.anchor_received_ms + stage_ms,
-                speaker_update_times_ms=speaker_update_times,
-                ledger_texts=ledger_texts,
-                ledger_categories=ledger_categories,
-                prior_anchor_texts=prior_anchor_texts,
-                recent_displayed_ms=displayed_times,
-            )
-            if routing.outcome is not Outcome.ROUTE or routing.category is None:
-                if store is not None:
-                    _store_decision_from_routing(
-                        store,
-                        run_id=run_id,
-                        context=ctx,
-                        clf_res=clf_res,
-                        routing=routing,
-                        serialized_text=built.serialized_text,
-                        retention=brief.retention,
-                    )
-                continue
-
-            routed_count += 1
-            effective_routing = routing
-            cpol = policy.categories[routing.category]
-            tpl = tpl_map.get(cpol.template) if cpol.template else None
-            ready_ms = ctx.anchor_received_ms + stage_ms
-            cand: SuggestionCandidate
-            is_generic_cand = False
-            is_fallback_cand = False
-            if routing.route is Route.GENERATOR:
-                if provider is not None:
-                    orig_sink = provider.egress_sink
-                    orig_clock = provider.clock_ms
-                    egress_recorded = False
-
-                    def _replay_clock_ms(_ready_ms: int = ready_ms) -> int:
-                        return _ready_ms
-
-                    def _on_egress(
-                        rec: EgressRecord,
-                        _cand_id: str = ctx.candidate_id,
-                        _orig_sink: Callable[[EgressRecord], None] | None = orig_sink,
-                    ) -> None:
-                        nonlocal egress_recorded
-                        if rec.candidate_id == _cand_id:
-                            egress_recorded = True
-                        if store is not None:
-                            store.record_egress(run_id=run_id, record=rec)
-                        if _orig_sink is not None:
-                            _orig_sink(rec)
-
-                    provider.egress_sink = _on_egress
-                    provider.clock_ms = _replay_clock_ms
-                    try:
-                        gen_out = await generate_question(
-                            ctx,
-                            routing.category,
-                            prefix_snap,
-                            policy,
-                            provider,
-                            clock_ms=_replay_clock_ms,
-                            store=store,
-                            templates=tpl_map,
-                            ledger_texts=ledger_texts,
-                            ledger_categories=ledger_categories,
-                        )
-                    finally:
-                        provider.egress_sink = orig_sink
-                        provider.clock_ms = orig_clock
-                        if health is None and not local_blocked:
-                            new_p_health = provider.health_state
-                            if new_p_health is not eff_health:
-                                _record_health(new_p_health, ready_ms, "generator_breaker")
-
-                    if gen_out.candidate is None:
-                        if store is not None:
-                            store.record_decision(
-                                run_id=run_id,
-                                context=ctx,
-                                terminal_state="unrendered",
-                                terminal_reason=(
-                                    gen_out.terminal_reason or ReasonCode.GENERATOR_INVALID_OUTPUT
-                                ),
-                                classifier=clf_res,
-                                routing=effective_routing,
-                                serialized_text=built.serialized_text,
-                                retention=brief.retention,
-                            )
-                        continue
-                    cand = gen_out.candidate
-                    is_fallback_cand = bool(gen_out.fallback_used)
-                    is_generic_cand = bool(gen_out.fallback_used and not cand.grounded_slots)
-                    if gen_out.fallback_used and not egress_recorded:
-                        effective_routing = replace(routing, route=cand.route)
-                elif tpl is not None:
-                    effective_routing = replace(routing, route=Route.TEMPLATE)
-                    rendered = render_template(
-                        ctx,
-                        routing.category,
-                        prefix_snap,
-                        tpl,
-                        now_ms=ready_ms,
-                        ready_ms=ready_ms,
-                        display_ttl_ms=policy.display.display_ttl_ms,
-                    )
-                    if rendered.candidate is None:
-                        if store is not None:
-                            store.record_decision(
-                                run_id=run_id,
-                                context=ctx,
-                                terminal_state="unrendered",
-                                terminal_reason=(
-                                    rendered.unrendered_reason or ReasonCode.SLOT_UNAVAILABLE
-                                ),
-                                classifier=clf_res,
-                                routing=effective_routing,
-                                serialized_text=built.serialized_text,
-                                retention=brief.retention,
-                            )
-                        continue
-                    cand = rendered.candidate
-                    is_generic_cand = bool(rendered.is_generic)
-                else:
-                    if store is not None:
-                        store.record_decision(
-                            run_id=run_id,
-                            context=ctx,
-                            terminal_state="unrendered",
-                            terminal_reason=ReasonCode.INSUFFICIENT_BUDGET,
-                            classifier=clf_res,
-                            routing=effective_routing,
-                            serialized_text=built.serialized_text,
-                            retention=brief.retention,
-                        )
-                    continue
-            else:
-                if tpl is None:
-                    if store is not None:
-                        store.record_decision(
-                            run_id=run_id,
-                            context=ctx,
-                            terminal_state="unrendered",
-                            terminal_reason=ReasonCode.SLOT_UNAVAILABLE,
-                            classifier=clf_res,
-                            routing=effective_routing,
-                            serialized_text=built.serialized_text,
-                            retention=brief.retention,
-                        )
-                    continue
-
-                rendered = render_template(
-                    ctx,
-                    routing.category,
-                    prefix_snap,
-                    tpl,
-                    now_ms=ready_ms,
-                    ready_ms=ready_ms,
-                    display_ttl_ms=policy.display.display_ttl_ms,
-                )
-                if rendered.candidate is None:
-                    if store is not None:
-                        store.record_decision(
-                            run_id=run_id,
-                            context=ctx,
-                            terminal_state="unrendered",
-                            terminal_reason=(
-                                rendered.unrendered_reason or ReasonCode.SLOT_UNAVAILABLE
-                            ),
-                            classifier=clf_res,
-                            routing=effective_routing,
-                            serialized_text=built.serialized_text,
-                            retention=brief.retention,
-                        )
-                    continue
-                cand = rendered.candidate
-                is_generic_cand = bool(rendered.is_generic)
-            settle_end = ctx.anchor_received_ms + policy.display.settle_ms
-            bnd_hits = [
-                ts
-                for ts, b_spk in boundary_events
-                if ctx.anchor_received_ms < ts <= settle_end
-                and (b_spk is None or b_spk == seg.speaker_id)
-            ]
-            if bnd_hits:
-                target_ms = max(ready_ms, min(bnd_hits))
-                disp_cause = ReasonCode.BOUNDARY_AFTER_SETTLE
-            else:
-                target_ms = max(ready_ms, settle_end)
-                disp_cause = ReasonCode.SETTLE_TIMEOUT
-
-            if (
-                last_display_ms is not None
-                and target_ms < last_display_ms + policy.display.cooldown_ms
-            ):
-                target_ms = last_display_ms + policy.display.cooldown_ms
-
-            if target_ms > ctx.display_by_ms:
-                expired_count += 1
-                if store is not None:
-                    store.record_decision(
-                        run_id=run_id,
-                        context=ctx,
-                        terminal_state="expired",
-                        terminal_reason=ReasonCode.DISPLAY_BY_PASSED,
-                        classifier=clf_res,
-                        routing=effective_routing,
-                        serialized_text=built.serialized_text,
-                        retention=brief.retention,
-                    )
-                continue
-
-            if is_fallback_cand:
-                norm_cand_q = normalize_for_matching(cand.text)
-                cand_q_toks = set(norm_cand_q.split())
-                dup_reason: ReasonCode | None = None
-                for prev_q in ledger_texts.values():
-                    norm_prev_q = normalize_for_matching(prev_q)
-                    if norm_prev_q == norm_cand_q:
-                        dup_reason = ReasonCode.DUPLICATE
-                        break
-                    p_toks = set(norm_prev_q.split())
-                    if (
-                        cand_q_toks
-                        and p_toks
-                        and (len(cand_q_toks & p_toks) / len(cand_q_toks | p_toks)) >= 0.75
-                    ):
-                        dup_reason = ReasonCode.NEAR_DUPLICATE
-                        break
-                if dup_reason is not None:
-                    if store is not None:
-                        sup_rt = replace(
-                            effective_routing,
-                            outcome=Outcome.SUPPRESS,
-                            route=None,
-                            reason_codes=(dup_reason,),
-                        )
-                        store.record_decision(
-                            run_id=run_id,
-                            context=ctx,
-                            terminal_state="suppressed",
-                            terminal_reason=dup_reason,
-                            classifier=clf_res,
-                            routing=sup_rt,
-                            serialized_text=built.serialized_text,
-                            retention=brief.retention,
-                        )
-                    continue
-
-            in_win = [t for t in displayed_times if (target_ms - 600_000) <= t <= target_ms]
-            if cap <= 0 or len(in_win) >= cap:
-                if store is not None:
-                    sup_rt = replace(
-                        effective_routing,
-                        outcome=Outcome.SUPPRESS,
-                        route=None,
-                        reason_codes=(ReasonCode.PROACTIVE_DISABLED,),
-                    )
-                    store.record_decision(
-                        run_id=run_id,
-                        context=ctx,
-                        terminal_state="suppressed",
-                        terminal_reason=ReasonCode.PROACTIVE_DISABLED,
-                        classifier=clf_res,
-                        routing=sup_rt,
-                        serialized_text=built.serialized_text,
-                        retention=brief.retention,
-                    )
-                continue
-
-            # 7-step revalidation against events occurring in (anchor_received_ms, target_ms]
-            ev_seg_ids = {r.segment_id for r in cand.evidence_refs}
-            anchor_seg_ids = {r.segment_id for r in ctx.anchor_refs}
-            withdraw_reason: ReasonCode | None = None
-            for fut_ev in ordered[ev_idx + 1 :]:
-                if fut_ev.received_ms > target_ms:
-                    break
-                if (
-                    is_generic_cand
-                    and fut_ev.kind is EventKind.SEGMENT
-                    and fut_ev.stability is Stability.COMMITTED
-                    and fut_ev.segment_id not in anchor_seg_ids
-                    and fut_ev.speaker_id not in recipient_ids
-                ):
-                    withdraw_reason = ReasonCode.GENERIC_REFERENT_UNCLEAR
-                    break
-                if (
-                    fut_ev.kind is EventKind.SEGMENT
-                    and fut_ev.stability is Stability.COMMITTED
-                    and fut_ev.segment_id in ev_seg_ids
-                    and fut_ev.source_revision is not None
-                ):
-                    ref_seg = prefix_snap.segments_by_id.get(fut_ev.segment_id)
-                    if ref_seg is not None and fut_ev.source_revision > ref_seg.source_revision:
-                        withdraw_reason = ReasonCode.EVIDENCE_REVISION_CHANGED
-                        break
-                if fut_ev.kind is EventKind.SPEAKER_UPDATE and fut_ev.segment_id in ev_seg_ids:
-                    fut_key = (
-                        fut_ev.source_revision if fut_ev.source_revision is not None else 0,
-                        fut_ev.source_sequence,
-                        fut_ev.event_id,
-                    )
-                    prev_key = speaker_update_keys.get(fut_ev.segment_id)
-                    ref_seg = prefix_snap.segments_by_id.get(fut_ev.segment_id)
-                    if (
-                        (prev_key is None or fut_key > prev_key)
-                        and ref_seg is not None
-                        and (
-                            (
-                                fut_ev.speaker_id is not None
-                                and fut_ev.speaker_id != ref_seg.speaker_id
-                            )
-                            or fut_ev.speaker_uncertain != ref_seg.speaker_uncertain
-                        )
-                    ):
-                        withdraw_reason = ReasonCode.EVIDENCE_REVISION_CHANGED
-                        break
-                if (
-                    fut_ev.kind is EventKind.BRIEF_UPDATE
-                    and fut_ev.brief_patch is not None
-                    and "objective" in fut_ev.brief_patch
-                    and str(fut_ev.brief_patch["objective"]) != prefix_snap.brief.objective
-                ):
-                    withdraw_reason = ReasonCode.OBJECTIVE_CHANGED
-                    break
-                if (
-                    fut_ev.kind is EventKind.SEGMENT
-                    and fut_ev.stability is Stability.COMMITTED
-                    and fut_ev.text
-                    and _has_resolution_cue(fut_ev.text, tpl)
-                ):
-                    withdraw_reason = ReasonCode.POSSIBLY_RESOLVED
-                    break
-
-            if withdraw_reason is not None:
-                is_unrendered = withdraw_reason is ReasonCode.GENERIC_REFERENT_UNCLEAR
-                if not is_unrendered:
-                    withdrawn_count += 1
-                if store is not None:
-                    store.record_decision(
-                        run_id=run_id,
-                        context=ctx,
-                        terminal_state="unrendered" if is_unrendered else "withdrawn",
-                        terminal_reason=withdraw_reason,
-                        classifier=clf_res,
-                        routing=effective_routing,
-                        serialized_text=built.serialized_text,
-                        retention=brief.retention,
-                    )
-                continue
-
-            displayed_times.append(target_ms)
-            last_display_ms = target_ms
-            ledger_texts[cand.suggestion_id] = cand.text
-            ledger_categories[cand.suggestion_id] = cand.category
-            anchor_parts: list[str] = []
-            for a_ref in ctx.anchor_refs:
-                a_seg = prefix_snap.segments_by_id.get(a_ref.segment_id)
-                if a_seg is not None and a_seg.text.strip():
-                    anchor_parts.append(a_seg.text.strip())
-            if anchor_parts:
-                prior_anchor_texts[cand.candidate_id] = " ".join(anchor_parts)
-            state.register_suggestion(cand)
-            state.apply(
-                LedgerEvent(
-                    schema_version=SCHEMA_VERSION,
-                    event_id=f"ev-disp-{cand.suggestion_id}",
-                    suggestion_id=cand.suggestion_id,
-                    transition=LedgerState.DISPLAYED,
-                    cause=disp_cause,
-                    at_ms=target_ms,
-                    evidence_refs=cand.evidence_refs,
-                ).to_canonical_event(brief.session_id, received_ms=target_ms)
-            )
-            displayed_cards.append(
-                DisplayedCardEvent(
-                    suggestion_id=cand.suggestion_id,
-                    candidate_id=cand.candidate_id,
-                    session_id=brief.session_id,
-                    category=cand.category,
-                    display_ms=target_ms,
-                    evidence_refs=cand.evidence_refs,
-                    text=cand.text,
-                    route=cand.route,
-                    origin=cand.origin,
-                )
-            )
-            if store is not None:
-                store.record_decision(
-                    run_id=run_id,
-                    context=ctx,
-                    terminal_state="expired",
-                    terminal_reason=ReasonCode.DISPLAY_TTL_PASSED,
-                    classifier=clf_res,
-                    routing=effective_routing,
-                    serialized_text=built.serialized_text,
-                    retention=brief.retention,
-                )
-                tr_disp = LedgerEvent(
-                    schema_version=SCHEMA_VERSION,
-                    event_id=f"ev-disp-{cand.suggestion_id}",
-                    suggestion_id=cand.suggestion_id,
-                    transition=LedgerState.DISPLAYED,
-                    cause=disp_cause,
-                    at_ms=target_ms,
-                    evidence_refs=cand.evidence_refs,
-                )
-                tr_exp = LedgerEvent(
-                    schema_version=SCHEMA_VERSION,
-                    event_id=f"ev-exp-{cand.suggestion_id}",
-                    suggestion_id=cand.suggestion_id,
-                    transition=LedgerState.EXPIRED,
-                    cause=ReasonCode.DISPLAY_TTL_PASSED,
-                    at_ms=target_ms + policy.display.display_ttl_ms,
-                    evidence_refs=cand.evidence_refs,
-                )
-                store.record_suggestion(
-                    session_id=brief.session_id,
-                    run_id=run_id,
-                    suggestion=cand,
-                    current_state="expired",
-                    terminal_reason=ReasonCode.DISPLAY_TTL_PASSED,
-                    transitions=[tr_disp.to_dict(), tr_exp.to_dict()],
-                    retention=brief.retention,
-                )
-
-    final_snap = state.snapshot()
-    if store is not None:
-        store.upsert_session(
-            brief=final_snap.brief,
-            run_id=run_id,
-            runtime_mode=mode,
-            effective_max_cards_per_10_min=effective_max_cards_per_10_min(final_snap.brief, policy),
-            health_timeline=health_timeline,
-            reducer_counters=final_snap.counters,
-            revision_history=final_snap.revision_history,
-        )
-
-    rx_times = [e.received_ms for e in ordered]
-    dur_ms = max(1, (max(rx_times) - min(rx_times)) if len(rx_times) >= 2 else 1)
-    return ReplayResult(
-        session_id=brief.session_id,
+            eff_rx = ev.received_ms
+        ordered_tagged.append((eff_rx, orig_idx, ev))
+    ordered_tagged.sort(key=lambda item: (item[0], item[1]))
+    sim = _ReplaySim(
+        brief=brief,
+        ordered=[item[2] for item in ordered_tagged],
+        policy=policy,
+        classifier=classifier,
+        cal_obj=cal_obj,
+        tpl_map=tpl_map,
+        store=store,
         run_id=run_id,
-        duration_ms=dur_ms,
-        displayed_cards=tuple(displayed_cards),
-        decisions_count=decisions_count,
-        dropped_count=dropped_count,
-        routed_count=routed_count,
-        withdrawn_count=withdrawn_count,
-        expired_count=expired_count,
-        latencies_ms=tuple(latencies_ms),
+        mode=mode,
+        provider=provider,
+        health=health,
+        simulated_latency_ms=simulated_latency_ms,
+        latency_distribution_ms=latency_distribution_ms,
+        rng=random.Random(rng_seed),
+        cache_classifier=cache_classifier,
     )
+    return await sim.run()
 
 
 def simulate_replay(

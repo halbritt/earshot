@@ -888,7 +888,10 @@ def test_candidate_validator_rejects_all_6_deterministic_failure_modes(
             cooldown_ms=50,
             max_cards_per_10_min=10,
         ),
-        {"categories": {"CONFIRM_OWNER": {"route": "generator", "t_display": 0.50}}},
+        {
+            "categories": {"CONFIRM_OWNER": {"route": "generator", "t_display": 0.50}},
+            "display": {"display_ttl_ms": 30000},
+        },
     )
     brief = build_session_brief(session_id=sid, do_not_suggest=["budget"])
     prompts = [

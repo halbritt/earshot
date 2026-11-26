@@ -915,7 +915,12 @@ class SQLiteStore:
             raw_cur = self._conn.execute(
                 "DELETE FROM raw_events WHERE session_id = ?", (session_id,)
             )
-            ev_cur = self._conn.execute(
+            ev_count_row = self._conn.execute(
+                "SELECT COUNT(*) AS cnt FROM events WHERE session_id = ? AND (text IS NOT NULL OR (kind IN ('segment', 'brief_update') AND payload_json IS NOT NULL))",
+                (session_id,),
+            ).fetchone()
+            events_redacted_count = int(ev_count_row["cnt"]) if ev_count_row is not None else 0
+            self._conn.execute(
                 "UPDATE events SET text = NULL, payload_json = NULL WHERE session_id = ? AND (text IS NOT NULL OR payload_json IS NOT NULL)",
                 (session_id,),
             )
@@ -994,7 +999,7 @@ class SQLiteStore:
         return DeletionSummary(
             session_id=session_id,
             raw_events_deleted=raw_cur.rowcount,
-            events_redacted=ev_cur.rowcount,
+            events_redacted=events_redacted_count,
             decisions_redacted=dec_cur.rowcount,
             suggestions_redacted=sug_cur.rowcount,
             feedback_redacted=fb_del_cur.rowcount + fb_upd_cur.rowcount,

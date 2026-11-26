@@ -642,7 +642,14 @@ def test_boundary_b3_sortformer_999ms_vs_1000ms_short_turn_speaker_uncertain(
         ready_url=f"http://127.0.0.1:{port}/",
         startup_timeout=10.0,
     ):
-        time.sleep(1.5)
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            with open_db(e2e_workspace["db_path"], readonly=True) as conn:
+                cur_decs = fetch_normalized_rows(conn, "decisions", session_id)
+            joined = " ".join(str(d.get("serialized_text") or "") for d in cur_decs)
+            if "short turn" in joined and "full second turn" in joined:
+                break
+            time.sleep(0.05)
     with open_db(e2e_workspace["db_path"]) as conn:
         decisions = fetch_normalized_rows(conn, "decisions", session_id)
     short_dec = [d for d in decisions if "short turn" in str(d.get("serialized_text") or "")]
@@ -865,7 +872,8 @@ def test_boundary_c3_token_budget_exact_fit_vs_input_overflow(
     assert res_probe.returncode == 0
     with open_db(e2e_workspace["db_path"]) as conn:
         probe_dec = fetch_normalized_rows(conn, "decisions", probe_sid)[0]
-    exact_tokens = int(probe_dec["token_counts"]["total"])
+    tc = probe_dec["token_counts"]
+    exact_tokens = int(tc["objective"]) + int(tc["role"]) + int(tc["anchor"])
 
     fit_sid = "session-c3-fit"
     res_fit = _replay_session(
@@ -1156,9 +1164,12 @@ def test_boundary_d1_threshold_exact_equality_t_low_and_t_display(
                         "t_low": t_low,
                         "t_compute": t_compute,
                         "t_display": t_display,
-                    }
+                    },
+                    "CONFIRM_TIME": {"t_low": t_low},
+                    "SUCCESS_CRITERION": {"t_low": t_low},
                 },
             },
+            extra_args=("--no-cache",),
             env=build_coach_test_env(openai_base_url=mock_openai.base_url),
         )
         assert res.returncode == 0
@@ -1194,9 +1205,21 @@ def test_boundary_d2_speaker_settle_ms_2000ms_boundary(
                 segment_id=f"seg-d2-{label}",
                 speaker_id="participant-b",
                 source_revision=2,
-                received_ms=500 + delta_ms,
+                received_ms=600,
                 source_sequence=2,
                 speaker_confidence=0.95,
+            ),
+            build_segment_event(
+                session_id=sid,
+                event_id=f"ev-d2-rev-{label}",
+                segment_id=f"seg-d2-{label}",
+                text="Someone should own the cutover plan.",
+                speaker_id="participant-b",
+                source_revision=3,
+                start_ms=100,
+                end_ms=400,
+                received_ms=600 + delta_ms,
+                source_sequence=3,
             ),
         ]
         res = _replay_session(
@@ -1544,7 +1567,12 @@ def test_boundary_e3_matcher_multiple_cards_same_validity_interval(
         events,
         filename="e3.jsonl",
         policy_overrides={
-            "display": {"settle_ms": 100, "cooldown_ms": 100, "max_cards_per_10_min": 10}
+            "display": {
+                "settle_ms": 100,
+                "cooldown_ms": 100,
+                "display_ttl_ms": 500,
+                "max_cards_per_10_min": 10,
+            }
         },
         extra_args=("--labels", str(labels_path)),
     )
@@ -1863,17 +1891,21 @@ def test_boundary_f4_manual_lookback_exact_30s_and_score_floor_0_30(
             "generator": {"enabled": True},
         },
     )
-    mock_openai.enqueue(
+    mock_openai.add_matcher(
+        lambda req: "low score task" in json.dumps(req).split("[ANCHOR]")[-1],
         MockCompletionSpec(
             status_code=200,
             content=json.dumps({"opportunity": 0.29, "categories": {"CONFIRM_OWNER": 0.29}}),
         ),
+    )
+    mock_openai.add_matcher(
+        lambda req: "exact floor task" in json.dumps(req).split("[ANCHOR]")[-1],
         MockCompletionSpec(
             status_code=200,
             content=json.dumps({"opportunity": 0.30, "categories": {"CONFIRM_OWNER": 0.30}}),
         ),
-        MockCompletionSpec.decline("nothing useful to add"),
     )
+    mock_openai.set_default(MockCompletionSpec.decline("nothing useful to add"))
     events = [
         build_segment_event(
             session_id=session_id,
@@ -1975,7 +2007,7 @@ def test_boundary_f5_word_count_boundary_12_vs_20_vs_21_card_ui(
     """20-word generated card is accepted; 21-word generated card is rejected (§9.2, §3.4)."""
     alpha_19 = (
         "alpha bravo charlie delta echo foxtrot golf hotel india juliet "
-        "kilo lima mike november oscar papa quebec romeo sierra"
+        "kilo lima mike nectar oscar papa quebec romeo sierra"
     )
     q20 = f"{alpha_19} ready?"
     q21 = f"{alpha_19} tango ready?"
@@ -2066,8 +2098,8 @@ def test_boundary_f5_word_count_boundary_12_vs_20_vs_21_card_ui(
         assert card["question"].strip() == q20
 
     with open_db(e2e_workspace["db_path"]) as conn:
-        sugs = fetch_normalized_rows(conn, "suggestions", session_id)
-    rejected = [s for s in sugs if s.get("terminal_reason") == "generator_invalid_output"]
+        decs = fetch_normalized_rows(conn, "decisions", session_id)
+    rejected = [d for d in decs if d.get("terminal_reason") == "generator_invalid_output"]
     assert len(rejected) == 1
     assert_six_conservation_invariants(e2e_workspace["db_path"], session_id)
 

@@ -611,6 +611,7 @@ class Pass2Session:
             "suggested_question": item.suggested_question,
             "suggested_category": item.suggested_category,
             "state": item.state,
+            "worthwhile": item.worthwhile,
             "step1_locked": item.step1_locked,
             "step1": {
                 "worthwhile": item.worthwhile,
@@ -668,6 +669,8 @@ class Pass2Session:
                 raise AnnotationValidationError(f"Invalid none_reason: {none_reason!r}") from exc
         if not worthwhile and parsed_cats:
             raise AnnotationValidationError("categories must be empty when worthwhile=False")
+        if not worthwhile and parsed_nr is None:
+            raise AnnotationValidationError("none_reason is required when worthwhile=False")
         if worthwhile and parsed_nr is not None:
             raise AnnotationValidationError("none_reason must be null when worthwhile=True")
         if not isinstance(confidence, str) or not confidence.strip():
@@ -896,11 +899,14 @@ def _binary_kappa(
     p_e = (p1 * p2) + ((1.0 - p1) * (1.0 - p2))
     denom = 1.0 - p_e
     degenerate = denom <= 1e-12
-    kappa: float | None = None if degenerate else (p_o - p_e) / denom
+    if degenerate:
+        kappa: float | None = 1.0 if p_o >= 1.0 - 1e-12 else 0.0
+    else:
+        kappa = (p_o - p_e) / denom
     low_n = n < min_n or min(n_pos_1, n_pos_2) < min_positives or degenerate
     caveat: str | None = None
     if degenerate:
-        caveat = "Degenerate marginals (single-class agreement); kappa is undefined."
+        caveat = "Degenerate marginals (single-class agreement); kappa defaulted due to zero expected disagreement."
     elif low_n:
         caveat = (
             f"Low sample count (n_paired={n} < {min_n} or "
@@ -1044,6 +1050,8 @@ class BlindRetestSession:
                 parsed_nr = NoneReason(str(none_reason))
             if not worthwhile and parsed_cats:
                 raise AnnotationValidationError("categories must be empty when worthwhile=False")
+            if not worthwhile and parsed_nr is None:
+                raise AnnotationValidationError("none_reason is required when worthwhile=False")
             if worthwhile and parsed_nr is not None:
                 raise AnnotationValidationError("none_reason must be null when worthwhile=True")
             lbl = LabelRecord(

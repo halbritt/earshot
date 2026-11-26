@@ -65,7 +65,9 @@ __all__ = [
     "PolicyConfigError",
     "compute_policy_sha256",
     "effective_max_cards_per_10_min",
+    "is_equivalent_question",
     "load_policy",
+    "matches_resolution_cue",
     "route_candidate",
     "validate_thresholds",
 ]
@@ -809,4 +811,164 @@ def route_candidate(
         category=chosen_cat,
         reason_codes=(ReasonCode.MANUAL_REQUEST if is_manual else ReasonCode.ABOVE_T_DISPLAY,),
         thresholds=chosen_thresh,
+    )
+
+
+_EQ_STOPWORDS: frozenset[str] = _CONTENT_STOPWORDS | {"i", "need", "needs"}
+
+_INTERROGATIVE_LEAD_RE = re.compile(
+    r"^\s*(?:who|what|when|where|why|how|which|is|are|do|does|did|can|could|will|would|should)\b",
+    re.IGNORECASE,
+)
+
+_WH_QUESTION_RE = re.compile(
+    r"^\s*(?:who|what|when|where|why|how|which)\b",
+    re.IGNORECASE,
+)
+
+_OWNER_NAMED_ASSIGN_RE = re.compile(
+    r"\b(?:[A-Z][a-z]+\s+(?:will|can|is going to)\s+(?:own|take|handle)"
+    r"|(?:owner|lead)\s+(?:is|will be)\s+[A-Z][a-z]+)\b"
+)
+
+_TIME_COMMIT_RE = re.compile(
+    r"\b(?:by|before|on|until|due|scheduled for|let's do|finish by)\s+"
+    r"(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
+    r"sat(?:urday)?|sun(?:day)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|"
+    r"apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|tomorrow|today|next week|eod|end of|"
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|\d{1,2}\s*(?:am|pm))\b",
+    re.IGNORECASE,
+)
+
+_GENERAL_RESOLUTION_CUES = ("already decided",)
+_CATEGORY_RESOLUTION_CUES: dict[Category, tuple[str, ...]] = {
+    Category.CONFIRM_OWNER: (
+        "i'll own",
+        "i will own",
+        "i'll handle",
+        "i will handle",
+        "i'll take",
+        "i will take",
+        "i'm on it",
+        "i am on it",
+        "put me down",
+        "assigned to",
+        "will own",
+        "will handle",
+        "is taking",
+        "can you take",
+        "can you take that",
+        "can you own",
+        "can you handle",
+        "can take that",
+    ),
+    Category.CONFIRM_TIME: (
+        "deadline is",
+        "due date is",
+        "ship on",
+        "let's do friday",
+        "let's do monday",
+        "let's do tuesday",
+        "let's do wednesday",
+        "let's do thursday",
+    ),
+    Category.SUCCESS_CRITERION: (
+        "success criterion",
+        "count as success",
+        "measured by",
+        "passes when",
+        "slo is",
+        "target is",
+    ),
+    Category.CLARIFY_SCOPE: (
+        "in scope",
+        "out of scope",
+        "only includes",
+        "does not include",
+        "excludes ",
+        "scoped to",
+    ),
+    Category.REQUEST_EVIDENCE: (
+        "evidence is",
+        "benchmark shows",
+        "benchmarks show",
+        "log shows",
+        "logs show",
+        "data shows",
+        "verified by",
+        "measured at",
+    ),
+}
+
+
+def _eq_content_tokens(text: str) -> set[str]:
+    return {t for t in normalize_for_matching(text).split() if t and t not in _EQ_STOPWORDS}
+
+
+def matches_resolution_cue(
+    text: str,
+    category: Category,
+    template: Any | None = None,
+    *,
+    resolution_cues: Sequence[str] = (),
+) -> bool:
+    """Return True when text contains a resolution cue for category (§8.4)."""
+    stripped = text.strip()
+    low = stripped.lower()
+    if any(cue in low for cue in _GENERAL_RESOLUTION_CUES):
+        return True
+    exempt_q = any(
+        phrase in low
+        for phrase in (
+            "can you take",
+            "will you take",
+            "can you own",
+            "will you own",
+            "can you handle",
+            "will you handle",
+        )
+    )
+    if _WH_QUESTION_RE.search(stripped) or (stripped.endswith("?") and not exempt_q):
+        return False
+    if any(cue in low for cue in _CATEGORY_RESOLUTION_CUES.get(category, ())):
+        return True
+    if category is Category.CONFIRM_OWNER and _OWNER_NAMED_ASSIGN_RE.search(text):
+        return True
+    if category is Category.CONFIRM_TIME and _TIME_COMMIT_RE.search(text):
+        return True
+    cues = resolution_cues or (
+        getattr(template, "resolution_cues", ()) if template is not None else ()
+    )
+    for rc in cues:
+        rc_low = str(rc).lower().replace("_", " ")
+        if rc_low in low:
+            return True
+    return False
+
+
+def is_equivalent_question(seg_text: str, cand_text: str, category: Category) -> bool:
+    """Return True when recipient utterance asks an equivalent question (§8.4, B12)."""
+    stripped = seg_text.strip()
+    if not stripped:
+        return False
+    is_q = ("?" in stripped) or (_INTERROGATIVE_LEAD_RE.search(stripped) is not None)
+    if not is_q:
+        return False
+    seg_toks = _eq_content_tokens(stripped)
+    cand_toks = _eq_content_tokens(cand_text)
+    if not seg_toks or not cand_toks:
+        return False
+    shared = seg_toks & cand_toks
+    union = seg_toks | cand_toks
+    jaccard = len(shared) / len(union) if union else 0.0
+    if jaccard >= 0.40 or len(shared) >= 2:
+        return True
+    low = stripped.lower()
+    if category is Category.CONFIRM_OWNER and "who" in low and len(shared) >= 1:
+        return True
+    return bool(
+        category is Category.CONFIRM_TIME
+        and ("when" in low or "deadline" in low)
+        and len(shared) >= 1
     )

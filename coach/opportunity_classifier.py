@@ -537,7 +537,8 @@ def _owner_topic_words(text: str) -> set[str]:
 
 
 _OWNER_MED_RE = re.compile(
-    r"\b(?:own\s+the|own\s+this|take\s+care\s+of|follow\s+up\s+on|handle\s+the|pick\s+up\s+the)\b",
+    r"\b(?:own\s+the|own\s+this|take\s+care\s+of|follow\s+up\s+on|handle\s+the|pick\s+up\s+the)\b|"
+    r"\b(?:double[\s-]+check|make\s+sure|confirm)\s+(?:that\s+)?.{1,60}\bis\s+covered\b",
     re.IGNORECASE,
 )
 _OWNER_RESOLVED_RE = re.compile(

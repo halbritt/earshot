@@ -721,7 +721,10 @@ def test_area_e_validity_interval_matcher_and_unlabeled_review_queue(
     brief = build_session_brief(
         session_id=sid, attention={"max_cards_per_10_min": 20, "proactive": True}
     )
-    pol = build_policy_dict(settle_ms=100, cooldown_ms=50, max_cards_per_10_min=20)
+    pol = deep_merge_dict(
+        build_policy_dict(settle_ms=100, cooldown_ms=50, max_cards_per_10_min=20),
+        {"display": {"display_ttl_ms": 1500}},
+    )
     # 6 anchors: (1) useful, (2) repetition, (3) late, (4) premature, (5) distracting, (6) unlabeled
     events = [
         build_segment_event(
@@ -739,7 +742,7 @@ def test_area_e_validity_interval_matcher_and_unlabeled_review_queue(
             session_id=sid,
             event_id="ev-em-2",
             segment_id="seg-em-2",
-            text="We still need someone to own the rollback plan.",
+            text="We still need someone to own the backup runbook.",
             speaker_id="participant-c",
             start_ms=3000,
             end_ms=4000,

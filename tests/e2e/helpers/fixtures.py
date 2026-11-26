@@ -1416,19 +1416,25 @@ def _b12() -> AppendixBFixture:
 
 
 def _b13() -> AppendixBFixture:
+    texts = (
+        "Legacy billing tables remain out of scope during database migration.",
+        "Regional read replicas are excluded from the automatic failover boundary.",
+        "Staging telemetry collectors include synthetic canary traffic except alerts.",
+        "We should verify scope boundary for schema rollbacks.",
+    )
     events = [
         build_segment_event(
             session_id="b13",
             event_id=f"b13-e{i}",
             segment_id=f"seg-b13-{i}",
-            text=f"We should verify scope boundary item {i} before launch.",
+            text=text,
             speaker_id="participant-b",
             start_ms=i * 10000,
             end_ms=i * 10000 + 3000,
             received_ms=i * 10000 + 3200,
             source_sequence=i,
         )
-        for i in range(1, 5)
+        for i, text in enumerate(texts, start=1)
     ]
     return AppendixBFixture(
         fixture_id="B13",
@@ -1844,7 +1850,7 @@ def _b23() -> AppendixBFixture:
         events=events,
         expected_reason_codes=("interim_resolution_hint", "possibly_resolved"),
         expected_terminal_states=("withdrawn",),
-        policy_overrides={"settle_ms": 500},
+        policy_overrides={"settle_ms": 1000},
     )
 
 
@@ -1898,7 +1904,7 @@ def _b24() -> AppendixBFixture:
         events=events,
         expected_reason_codes=("interim_resolution_hint", "deferred_released"),
         expected_terminal_states=("used", "dismissed", "resolved", "expired", "withdrawn"),
-        policy_overrides={"settle_ms": 500},
+        policy_overrides={"settle_ms": 1000},
         notes={"expected_observed_states": ("deferred", "displayed")},
     )
 

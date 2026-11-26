@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 import threading
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from coach.calibration import CalibrationModel, CalibrationRegistry, default_calibration_registry
@@ -17,6 +16,7 @@ from coach.candidate_validator import check_do_not_suggest, validate_template_ca
 from coach.canonical_state import ApplyResult, CanonicalState, SegmentRecord, StateSnapshot
 from coach.context_builder import (
     ContextBuildResult,
+    CoverageCursor,
     PolicyConfig,
     assign_speaker_roles,
     bucket_age_ms,
@@ -60,7 +60,7 @@ from coach.opportunity_classifier import (
 )
 from coach.provider_adapter import BreakerState, ProviderAdapter
 from coach.question_generator import GenerationOutcome, generate_question
-from coach.routing_policy import route_candidate
+from coach.routing_policy import is_equivalent_question, matches_resolution_cue, route_candidate
 from coach.storage import SQLiteStore
 from coach.template_renderer import (
     TemplateSpec,
@@ -130,44 +130,6 @@ class _BoundedFallbackBuffer:
         if drops:
             store.record_drops(session_id=session_id, run_id=run_id, drops_by_level=drops)
         return len(records)
-
-
-@dataclass(slots=True)
-class CoverageCursor:
-    """High-water + exception-set cursor over committed non-recipient segments (§8.3)."""
-
-    high_water_key: tuple[int, int, int, str] | None = None
-    covered_revisions: dict[str, int] = field(default_factory=dict)
-    pending_exceptions: set[str] = field(default_factory=set)
-
-    @staticmethod
-    def seg_key(seg: SegmentRecord) -> tuple[int, int, int, str]:
-        return (seg.start_ms, seg.channel, seg.source_sequence, seg.segment_id)
-
-    def note_material_segment(self, seg_id: str | None) -> None:
-        if seg_id is not None:
-            self.pending_exceptions.add(seg_id)
-
-    def unprocessed_segments(self, snapshot: StateSnapshot) -> list[SegmentRecord]:
-        recipient_ids = {"ME", snapshot.brief.recipient.participant_id}
-        out: list[SegmentRecord] = []
-        for seg in snapshot.segments:
-            if not seg.committed or seg.speaker_id in recipient_ids:
-                continue
-            prev_rev = self.covered_revisions.get(seg.segment_id, 0)
-            if prev_rev < seg.revision or seg.segment_id in self.pending_exceptions:
-                out.append(seg)
-        return out
-
-    def mark_covered(self, segments: Iterable[SegmentRecord]) -> None:
-        for seg in segments:
-            prev = self.covered_revisions.get(seg.segment_id, 0)
-            if seg.revision > prev:
-                self.covered_revisions[seg.segment_id] = seg.revision
-            self.pending_exceptions.discard(seg.segment_id)
-            key = self.seg_key(seg)
-            if self.high_water_key is None or key > self.high_water_key:
-                self.high_water_key = key
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,140 +245,13 @@ _SHOWN_OR_ACTED_STATES: frozenset[LedgerState] = frozenset(
     }
 )
 
-_INTERROGATIVE_LEAD_RE = re.compile(
-    r"^\s*(?:who|what|when|where|why|how|which|is|are|do|does|did|can|could|will|would|should)\b",
-    re.IGNORECASE,
-)
-
-_OWNER_NAMED_ASSIGN_RE = re.compile(
-    r"\b(?:[A-Z][a-z]+\s+(?:will|can|is going to)\s+(?:own|take|handle)"
-    r"|(?:owner|lead)\s+(?:is|will be)\s+[A-Z][a-z]+)\b"
-)
-_TIME_COMMIT_RE = re.compile(
-    r"\b(?:by|before|on|until|due|scheduled for|let's do|finish by)\s+"
-    r"(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
-    r"sat(?:urday)?|sun(?:day)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|"
-    r"apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
-    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|tomorrow|today|next week|eod|end of|"
-    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|\d{1,2}\s*(?:am|pm))\b",
-    re.IGNORECASE,
-)
-
-_GENERAL_CUES = ("already decided", "never mind")
-_CATEGORY_CUES: dict[Category, tuple[str, ...]] = {
-    Category.CONFIRM_OWNER: (
-        "i'll own",
-        "i will own",
-        "i'll handle",
-        "i will handle",
-        "i'll take",
-        "i will take",
-        "i'm on it",
-        "i am on it",
-        "put me down",
-        "assigned to",
-        "will own",
-        "will handle",
-        "is taking",
-        "can you take that",
-        "can take that",
-    ),
-    Category.CONFIRM_TIME: (
-        "deadline is",
-        "due date is",
-        "ship on",
-        "let's do friday",
-        "let's do monday",
-        "let's do tuesday",
-        "let's do wednesday",
-        "let's do thursday",
-    ),
-    Category.SUCCESS_CRITERION: (
-        "success criterion",
-        "count as success",
-        "measured by",
-        "passes when",
-        "slo is",
-        "target is",
-    ),
-    Category.CLARIFY_SCOPE: (
-        "in scope",
-        "out of scope",
-        "only includes",
-        "does not include",
-        "excludes ",
-        "scoped to",
-    ),
-    Category.REQUEST_EVIDENCE: (
-        "evidence is",
-        "benchmark shows",
-        "benchmarks show",
-        "log shows",
-        "logs show",
-        "data shows",
-        "verified by",
-        "measured at",
-    ),
-}
-
 
 def _content_tokens(text: str) -> set[str]:
     return {t for t in normalize_for_matching(text).split() if t and t not in _STOPWORDS}
 
 
-_WH_QUESTION_RE = re.compile(
-    r"^\s*(?:who|what|when|where|why|how|which)\b",
-    re.IGNORECASE,
-)
-
-
-def _matches_resolution_cue(text: str, category: Category, template: TemplateSpec | None) -> bool:
-    stripped = text.strip()
-    low = stripped.lower()
-    if any(cue in low for cue in _GENERAL_CUES):
-        return True
-    if _WH_QUESTION_RE.search(stripped) or (
-        stripped.endswith("?") and "can you take" not in low and "will you take" not in low
-    ):
-        return False
-    if any(cue in low for cue in _CATEGORY_CUES.get(category, ())):
-        return True
-    if category is Category.CONFIRM_OWNER and _OWNER_NAMED_ASSIGN_RE.search(text):
-        return True
-    if category is Category.CONFIRM_TIME and _TIME_COMMIT_RE.search(text):
-        return True
-    if template is not None:
-        for rc in template.resolution_cues:
-            rc_low = rc.lower().replace("_", " ")
-            if rc_low in low:
-                return True
-    return False
-
-
-def _is_equivalent_question(seg_text: str, cand_text: str, category: Category) -> bool:
-    stripped = seg_text.strip()
-    if not stripped:
-        return False
-    is_q = ("?" in stripped) or (_INTERROGATIVE_LEAD_RE.search(stripped) is not None)
-    if not is_q:
-        return False
-    seg_toks = _content_tokens(stripped)
-    cand_toks = _content_tokens(cand_text)
-    if not seg_toks or not cand_toks:
-        return False
-    shared = seg_toks & cand_toks
-    union = seg_toks | cand_toks
-    jaccard = len(shared) / len(union) if union else 0.0
-    if jaccard >= 0.40 or len(shared) >= 2:
-        return True
-    low = stripped.lower()
-    if category is Category.CONFIRM_OWNER and "who" in low and len(shared) >= 1:
-        return True
-    return bool(
-        category is Category.CONFIRM_TIME
-        and ("when" in low or "deadline" in low)
-        and len(shared) >= 1
-    )
+_matches_resolution_cue = matches_resolution_cue
+_is_equivalent_question = is_equivalent_question
 
 
 def _brief_material_key(brief: SessionBrief) -> tuple[Any, ...]:
@@ -2007,10 +1842,6 @@ class SuggestionController:
                 for s in snap.segments
                 if s.committed and s.speaker_id not in recipient_ids and s.received_ms >= cutoff
             ]
-            if not lookback_segs:
-                lookback_segs = [
-                    s for s in snap.segments if s.committed and s.speaker_id not in recipient_ids
-                ][-2:]
 
         if not lookback_segs:
             return self._manual_empty_result()
@@ -3143,6 +2974,20 @@ class SuggestionController:
             ):
                 return (ReasonCode.EQUIVALENT_QUESTION_ASKED, None)
 
+        # 8. Display-time generic referent age cap check (§9.1, c6)
+        if (
+            not is_active
+            and cand.template_id is not None
+            and not cand.grounded_slots
+            and tpl is not None
+            and cand.text == tpl.generic.text
+            and (
+                now_ms < item.anchor_received_ms
+                or (now_ms - item.anchor_received_ms) > tpl.generic.allowed_when.max_anchor_age_ms
+            )
+        ):
+            return (ReasonCode.GENERIC_REFERENT_UNCLEAR, None)
+
         return (None, None)
 
     async def _offer_deferred(self, item: _PendingItem, reason: ReasonCode, *, at_ms: int) -> None:
@@ -3248,6 +3093,35 @@ class SuggestionController:
         *,
         at_ms: int,
     ) -> None:
+        if reason is ReasonCode.GENERIC_REFERENT_UNCLEAR:
+            self._enqueue_recorder(
+                "suggestion",
+                suggestion=item.cand,
+                current_state="unrendered",
+                terminal_reason=ReasonCode.GENERIC_REFERENT_UNCLEAR,
+                transitions=(),
+                retention=self._brief.retention,
+            )
+            self._enqueue_recorder(
+                "decision",
+                context=item.context,
+                terminal_state="unrendered",
+                terminal_reason=ReasonCode.GENERIC_REFERENT_UNCLEAR,
+                classifier=item.classifier,
+                routing=item.routing,
+                serialized_text=item.serialized_text,
+                retention=self._brief.retention,
+            )
+            self._emit_tel(
+                level=TelemetryLevel.LIFECYCLE,
+                kind="suggestion_unrendered",
+                stage="display",
+                candidate_id=item.cand.candidate_id,
+                suggestion_id=item.cand.suggestion_id,
+                reason_code=ReasonCode.GENERIC_REFERENT_UNCLEAR,
+            )
+            return
+
         if reason in {ReasonCode.DISPLAY_BY_PASSED, ReasonCode.DISPLAY_TTL_PASSED}:
             t_state_enum = LedgerState.EXPIRED
             t_reason = ReasonCode.DISPLAY_BY_PASSED

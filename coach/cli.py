@@ -500,7 +500,7 @@ async def _stream_wav_to_peecee(
     with wave.open(str(wav_path), "rb") as wf:
         pcm = wf.readframes(wf.getnframes())
     if pcm:
-        await adapter.send_audio_pcm16(pcm, pace_realtime=True)
+        await adapter.send_audio_pcm16(pcm, pace_realtime=True, pad_last=True)
     await adapter.commit_audio()
 
 
@@ -1283,6 +1283,25 @@ def _load_training_rows(
     return train_examples, cal_rows, brief
 
 
+def _extract_row_series_ids(data_path: str | Path) -> list[str | None]:
+    out: list[str | None] = []
+    with Path(data_path).open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            obj = json.loads(stripped)
+            if isinstance(obj, Mapping):
+                raw_ser = obj.get("series_id")
+                if raw_ser is None and isinstance(obj.get("label"), Mapping):
+                    raw_ser = obj["label"].get("series_id")
+                if raw_ser is None and isinstance(obj.get("context"), Mapping):
+                    raw_ser = obj["context"].get("series_id")
+                ser_str = str(raw_ser).strip() if raw_ser is not None else ""
+                out.append(ser_str or None)
+    return out
+
+
 def _cmd_train(args: argparse.Namespace) -> int:
     examples, _, _ = _load_training_rows(
         args.data,
@@ -1292,6 +1311,34 @@ def _cmd_train(args: argparse.Namespace) -> int:
     )
     if not examples:
         raise SystemExit(f"No training examples found in {args.data}")
+
+    series_ids = _extract_row_series_ids(args.data)
+    row_meta: list[tuple[str, str]] = []
+    for idx, (cin, lbl) in enumerate(examples):
+        sess_id = lbl.session_id or cin.context.session_id
+        raw_ser = series_ids[idx] if idx < len(series_ids) else None
+        ser_id = raw_ser if raw_ser is not None else sess_id
+        row_meta.append((sess_id, ser_id))
+    splits = split_by_series(
+        list(range(len(examples))),
+        series_id_fn=lambda i: row_meta[i][1],
+        session_id_fn=lambda i: row_meta[i][0],
+    )
+    splits_payload: dict[str, Any] = {
+        "train": list(splits.train_conversations),
+        "cal": list(splits.cal_conversations),
+        "eval": list(splits.eval_conversations),
+        "series": {
+            "train": list(splits.train_series),
+            "cal": list(splits.cal_series),
+            "eval": list(splits.eval_series),
+        },
+        "counts": {
+            "train": len(splits.train),
+            "cal": len(splits.cal),
+            "eval": len(splits.eval),
+        },
+    }
 
     if args.categories:
         cats = tuple(Category(c.strip()) for c in args.categories.split(",") if c.strip())
@@ -1343,6 +1390,11 @@ def _cmd_train(args: argparse.Namespace) -> int:
             "categories": [c.value for c in cats],
         }
 
+    (out_dir / "splits.json").write_text(
+        json.dumps(splits_payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    payload["splits"] = splits_payload
+
     lines = [f"Trained {payload['backend']} on {len(examples)} examples -> {saved_path}"]
     _emit_output(payload, as_json=args.json, summary_lines=lines)
     return 0
@@ -1360,7 +1412,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
             raw_src = obj.get("sample_source")
             if raw_src is None and isinstance(obj.get("label"), Mapping):
                 raw_src = obj["label"].get("sample_source")
-            if raw_src is not None and str(raw_src) != SampleSource.RANDOM.value:
+            if raw_src is None or str(raw_src) != SampleSource.RANDOM.value:
                 print(
                     f"Calibration rejected: calibration requires sample_source == 'random', "
                     f"found {raw_src!r} at line {line_no}",

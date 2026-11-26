@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,24 @@ from tests.e2e.helpers.fixtures import (
 from tests.e2e.helpers.mock_nemo_ws import MockNemoConfig, MockNemoServer, MockWord, ScriptedTurn
 from tests.e2e.helpers.mock_openai import MockCompletionSpec, MockOpenAIServer
 from tests.e2e.helpers.ui_client import CardUIClient
+
+
+def _make_words(
+    text: str, *, start_s: float, duration_s: float = 1.1, speaker: int = 2
+) -> list[MockWord]:
+    tokens = text.split()
+    if len(tokens) <= 1:
+        return [MockWord(text, round(start_s, 3), round(start_s + duration_s, 3), speaker=speaker)]
+    step = duration_s / len(tokens)
+    return [
+        MockWord(
+            tok,
+            round(start_s + idx * step, 3),
+            round(start_s + (idx + 0.85) * step, 3),
+            speaker=speaker,
+        )
+        for idx, tok in enumerate(tokens)
+    ]
 
 
 def _run_report(db_path: Path, session_id: str) -> dict[str, Any]:
@@ -433,8 +452,17 @@ def test_b10_owner_named_two_minutes_earlier_truncated_abstains(tmp_path: Path) 
 
 def test_b11_dismissed_card_restated_suppressed_as_duplicate(tmp_path: Path) -> None:
     fx = build_appendix_b_fixture("B11")
-    ws, _res, _report = _replay_fixture(fx, tmp_path)
     sid = str(fx.brief["session_id"])
+    probe_fx = replace(fx, events=list(fx.events[:1]))
+    probe_ws, _, _ = _replay_fixture(probe_fx, tmp_path / "probe")
+    probe_sugs = _fetch_table(probe_ws["db_path"], "suggestions", sid)
+    assert probe_sugs, "Expected first event to produce a suggestion"
+    real_sug_id = str(probe_sugs[0]["suggestion_id"])
+    updated_events = [
+        {**ev, "suggestion_id": real_sug_id} if ev.get("kind") == "ledger" else ev
+        for ev in fx.events
+    ]
+    ws, _res, _report = _replay_fixture(replace(fx, events=updated_events), tmp_path / "run")
     decisions = _fetch_table(ws["db_path"], "decisions", sid)
     restate = [
         d
@@ -480,7 +508,7 @@ def test_b13_generator_three_timeouts_opens_circuit_breaker(
                 "t_compute": 0.50,
                 "t_display": 0.75,
                 "route": "generator",
-                "template": "clarify_scope_v1",
+                "template": None,
                 "required_lookback_s": 120,
             },
             "SUCCESS_CRITERION": {"route": "generator"},
@@ -534,12 +562,16 @@ def test_b14_deferred_for_cooldown_then_silence_timer_wakes(
                 ScriptedTurn(
                     trigger_after_frames=2,
                     transcript="Someone should own the rollback plan.",
-                    words=[MockWord("Someone", 0.1, 0.4, speaker=2)],
+                    words=_make_words(
+                        "Someone should own the rollback plan.", start_s=0.0, speaker=2
+                    ),
                 ),
                 ScriptedTurn(
                     trigger_after_frames=4,
-                    transcript="We also need a finish date for canary verification.",
-                    words=[MockWord("We", 0.5, 0.8, speaker=2)],
+                    transcript="When is the deadline for the canary migration?",
+                    words=_make_words(
+                        "When is the deadline for the canary migration?", start_s=1.2, speaker=2
+                    ),
                 ),
             ]
         )
@@ -909,12 +941,16 @@ def test_b20_manual_request_during_slow_proactive_job(
                 ScriptedTurn(
                     trigger_after_frames=2,
                     transcript="Someone should own the rollback plan.",
-                    words=[MockWord("Someone", 0.1, 0.4, speaker=2)],
+                    words=_make_words(
+                        "Someone should own the rollback plan.", start_s=0.0, speaker=2
+                    ),
                 ),
                 ScriptedTurn(
                     trigger_after_frames=4,
                     transcript="We should verify scope boundary before launch.",
-                    words=[MockWord("We", 0.5, 0.8, speaker=2)],
+                    words=_make_words(
+                        "We should verify scope boundary before launch.", start_s=1.2, speaker=2
+                    ),
                 ),
             ]
         )

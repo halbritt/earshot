@@ -1929,6 +1929,7 @@ class PeeceeRealtimeAdapter:
         *,
         gate: EarshotGateSample | None = None,
         pace_realtime: bool = False,
+        pad_last: bool = False,
     ) -> int:
         """Stream 160 ms PCM16 frames (5120 bytes @ 16 kHz). Halts if paused/off-record."""
         if self._off_record or self._paused:
@@ -1946,6 +1947,8 @@ class PeeceeRealtimeAdapter:
         idx = 0
         while idx < usable:
             chunk = pcm16_even[idx : idx + frame_bytes]
+            if pad_last and len(chunk) < frame_bytes:
+                chunk = chunk + (b"\x00" * (frame_bytes - len(chunk)))
             await self._ws.send(chunk)
             sent += len(chunk)
             self._utterance_audio.extend(chunk)

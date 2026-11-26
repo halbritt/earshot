@@ -6,8 +6,8 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -958,6 +958,7 @@ def build_decision_context(
         "context_truncated_material": False,
         "speaker_uncertain": speaker_uncertain,
         "asr_low_confidence": asr_low_confidence,
+        "overlap": any(s.overlap for s in anchor_span.segments),
         "has_gap": has_gap,
         "has_off_record_gap": has_off_record_gap,
     }
@@ -1515,3 +1516,41 @@ def check_generic_referent(
         if seg_key > anchor_last_key:
             return (False, ReasonCode.GENERIC_REFERENT_UNCLEAR)
     return (True, None)
+
+
+@dataclass(slots=True)
+class CoverageCursor:
+    """High-water + exception-set cursor over committed non-recipient segments (§8.3)."""
+
+    high_water_key: tuple[int, int, int, str] | None = None
+    covered_revisions: dict[str, int] = field(default_factory=dict)
+    pending_exceptions: set[str] = field(default_factory=set)
+
+    @staticmethod
+    def seg_key(seg: SegmentRecord) -> tuple[int, int, int, str]:
+        return (seg.start_ms, seg.channel, seg.source_sequence, seg.segment_id)
+
+    def note_material_segment(self, seg_id: str | None) -> None:
+        if seg_id is not None:
+            self.pending_exceptions.add(seg_id)
+
+    def unprocessed_segments(self, snapshot: StateSnapshot) -> list[SegmentRecord]:
+        recipient_ids = {"ME", snapshot.brief.recipient.participant_id}
+        out: list[SegmentRecord] = []
+        for seg in snapshot.segments:
+            if not seg.committed or seg.speaker_id in recipient_ids:
+                continue
+            prev_rev = self.covered_revisions.get(seg.segment_id, 0)
+            if prev_rev < seg.revision or seg.segment_id in self.pending_exceptions:
+                out.append(seg)
+        return out
+
+    def mark_covered(self, segments: Iterable[SegmentRecord]) -> None:
+        for seg in segments:
+            prev = self.covered_revisions.get(seg.segment_id, 0)
+            if seg.revision > prev:
+                self.covered_revisions[seg.segment_id] = seg.revision
+            self.pending_exceptions.discard(seg.segment_id)
+            key = self.seg_key(seg)
+            if self.high_water_key is None or key > self.high_water_key:
+                self.high_water_key = key
