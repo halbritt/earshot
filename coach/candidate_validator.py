@@ -41,20 +41,21 @@ _BENIGN_DOT_RE = re.compile(
     r"(?:\d+\.\d+|v\d+(?:\.\d+)*|(?<![^\W_])(?:e\.g\.|i\.e\.|U\.S\.))",
     re.I,
 )
-_HTML_TAG_RE = re.compile(r"<\s*/?\s*[a-zA-Z][a-zA-Z0-9-]*(?:[\s/][^<>]*)?>|<!--[\s\S]*?-->")
+_HTML_TAG_RE = re.compile(
+    r"</[a-zA-Z][a-zA-Z0-9-]*\s*>"
+    r"|<[a-zA-Z][a-zA-Z0-9-]*(?:\s*/\s*>|\s*>|/[^<>]*>|\s+[^<>=]*=[^<>]*>|\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*\s*/?>)"
+    r"|<!--[\s\S]*?-->"
+)
 _MARKDOWN_LINK_RE = re.compile(
-    r"!?\[[^\]]+\]\([^)]+\)|<(?:[a-zA-Z][a-zA-Z0-9+.-]*://|mailto:)[^>\s]+>|\bhttps?://\S+",
+    r"!?\[[^\]]+\]\([^)]+\)|<[a-zA-Z][a-zA-Z0-9+.-]*:[^>\s]*>|\bhttps?://\S+",
     re.IGNORECASE,
 )
 _PROMPT_INJECTION_RE = re.compile(
-    r"\b(?:"
-    r"(?:ignore|disregard|forget|bypass)\s+"
+    r"\b(?:ignore|disregard|forget|bypass|override|reveal)\s+"
     r"(?:(?:all|any|your|the|of)\s+)*"
-    r"(?:(?:previous|prior|above|earlier|preceding|system|policy)\s+)*"
-    r"instructions"
-    r"|(?:override|bypass|ignore|reveal)\s+"
-    r"(?:(?:all|any|the|your)\s+)*"
-    r"(?:system|policy|developer|hidden)\s+(?:prompt|instructions|rules)"
+    r"(?:"
+    r"(?:(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden)\s+)*instructions"
+    r"|(?:(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden)\s+)+(?:prompt|rules|constraints)"
     r")\b",
     re.IGNORECASE,
 )

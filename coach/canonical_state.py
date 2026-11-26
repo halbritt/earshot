@@ -239,6 +239,10 @@ class CanonicalState:
     def off_record(self) -> bool:
         return self._off_record
 
+    def has_applied_event(self, source_id: str, event_id: str) -> bool:
+        """Return True if (source_id, event_id) has already been seen by apply()."""
+        return (source_id, event_id) in self._applied_events
+
     def register_dependent(
         self, dependent_kind: str, dependent_id: str, segment_ids: Iterable[str]
     ) -> None:

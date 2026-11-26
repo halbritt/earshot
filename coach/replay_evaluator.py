@@ -758,6 +758,7 @@ class _ReplaySim:
         self.prev_anchor_norm: str | None = None
         self.prev_anchor_seg_ids: set[str] = set()
         self.prev_anchor_rx_ms: int | None = None
+        self.prev_anchor_order_key: tuple[int, tuple[int, int, int, str]] | None = None
         self.settling: list[_ReplayPendingItem] = []
         self.deferred: _ReplayPendingItem | None = None
         self.active: _ReplayActiveItem | None = None
@@ -877,16 +878,21 @@ class _ReplaySim:
 
     def close_open_items_for_halt(self, *, at_ms: int) -> None:
         if self.active is not None:
-            self.transition_active(LedgerState.WITHDRAWN, ReasonCode.OBJECTIVE_CHANGED, at_ms=at_ms)
+            if self.active.pinned:
+                self.transition_active(LedgerState.OUTDATED, ReasonCode.RESOLUTION_CUE, at_ms=at_ms)
+            else:
+                self.transition_active(
+                    LedgerState.EXPIRED, ReasonCode.DISPLAY_TTL_PASSED, at_ms=at_ms
+                )
         if self.deferred is not None:
             d = self.deferred
             self.deferred = None
-            self.close_pending(d, ReasonCode.EVIDENCE_REVISION_CHANGED, at_ms=at_ms)
+            self.close_pending(d, ReasonCode.DISPLAY_BY_PASSED, at_ms=at_ms)
         if self.settling:
             items = list(self.settling)
             self.settling.clear()
             for item in items:
-                self.close_pending(item, ReasonCode.EVIDENCE_REVISION_CHANGED, at_ms=at_ms)
+                self.close_pending(item, ReasonCode.DISPLAY_BY_PASSED, at_ms=at_ms)
 
     def _apply_external_ledger(self, ev: CanonicalEvent) -> None:
         assert ev.suggestion_id is not None and ev.transition is not None and ev.cause is not None
@@ -952,6 +958,20 @@ class _ReplaySim:
                 break
 
     def ingest_event(self, ev: CanonicalEvent) -> None:
+        if (
+            ev.kind is EventKind.CONTROL
+            and ev.subtype is ControlSubtype.OFF_RECORD_START
+            and not self.state.off_record
+            and not self.state.has_applied_event(ev.source_id, ev.event_id)
+        ):
+            pre_snap = self.state.snapshot()
+            self.retire_uncovered_segments(pre_snap, ReasonCode.OFF_RECORD)
+            self.close_open_items_for_halt(at_ms=ev.received_ms)
+            self.prev_anchor_norm = None
+            self.prev_anchor_seg_ids.clear()
+            self.prev_anchor_rx_ms = None
+            self.prev_anchor_order_key = None
+
         apply_res = self.state.apply(ev)
         snap = self.state.snapshot()
         if not apply_res.accepted:
@@ -993,11 +1013,10 @@ class _ReplaySim:
                 self.recipient_speaking = False
                 self.prev_anchor_norm = None
             elif ev.subtype is ControlSubtype.OFF_RECORD_START:
-                self.close_open_items_for_halt(at_ms=ev.received_ms)
-                self.retire_uncovered_segments(snap, ReasonCode.OFF_RECORD)
                 self.prev_anchor_norm = None
                 self.prev_anchor_seg_ids.clear()
                 self.prev_anchor_rx_ms = None
+                self.prev_anchor_order_key = None
         elif ev.kind is EventKind.BOUNDARY:
             if ev.speaker_id is not None and ev.end_ms is not None:
                 prev_b = self.speaker_boundary_end_ms.get(ev.speaker_id)
@@ -1668,12 +1687,17 @@ class _ReplaySim:
         batch_prev_norm = self.prev_anchor_norm
         batch_prev_seg_ids = set(self.prev_anchor_seg_ids)
         batch_prev_rx_ms = self.prev_anchor_rx_ms
+        batch_prev_order_key = self.prev_anchor_order_key
         surviving: list[tuple[ContextBuildResult, str]] = []
         for anchor in selected:
             seg_ids = {s.segment_id for s in anchor.segments}
+            anchor_order_key = (
+                anchor.anchor_received_ms,
+                max(CoverageCursor.seg_key(s) for s in anchor.segments),
+            )
             same_seg_rev = bool(seg_ids & batch_prev_seg_ids)
             out_of_order = (
-                batch_prev_rx_ms is not None and anchor.anchor_received_ms < batch_prev_rx_ms
+                batch_prev_order_key is not None and anchor_order_key <= batch_prev_order_key
             )
             gap_exceeded = (
                 batch_prev_rx_ms is not None
@@ -1688,13 +1712,12 @@ class _ReplaySim:
             batch_prev_norm = pf.normalized_text
             batch_prev_seg_ids = seg_ids
             batch_prev_rx_ms = anchor.anchor_received_ms
-            if (
-                self.prev_anchor_rx_ms is None
-                or anchor.anchor_received_ms >= self.prev_anchor_rx_ms
-            ):
+            batch_prev_order_key = anchor_order_key
+            if self.prev_anchor_order_key is None or anchor_order_key >= self.prev_anchor_order_key:
                 self.prev_anchor_norm = pf.normalized_text
                 self.prev_anchor_seg_ids = seg_ids
                 self.prev_anchor_rx_ms = anchor.anchor_received_ms
+                self.prev_anchor_order_key = anchor_order_key
             if not pf.passed and pf.drop_record is not None:
                 self.decisions_count += 1
                 self.dropped_count += 1

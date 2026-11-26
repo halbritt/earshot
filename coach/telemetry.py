@@ -9,6 +9,7 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any
 
+from coach.canonical_state import ALLOWED_LEDGER_TRANSITIONS
 from coach.contracts import (
     ABSTAIN_REASON_CODES,
     CLOSING_CAUSE_CODES,
@@ -19,6 +20,7 @@ from coach.contracts import (
     SUPPRESS_REASON_CODES,
     TERMINAL_REASON_CODES,
     WITHDRAW_REASON_CODES,
+    LedgerState,
     ReasonCode,
     SessionBrief,
     TelemetryLevel,
@@ -548,10 +550,57 @@ def check_conservation_invariants(
                 )
             )
 
-    # Invariant 4: Every displayed card has exactly one closing transition (allowing used -> resolved).
+    # Invariant 4: Every displayed card has exactly one closing transition (allowing used -> resolved),
+    # and all recorded ledger transitions obey ALLOWED_LEDGER_TRANSITIONS (§7.5, §13.2).
     for sug in suggestions:
         transitions = _safe_json_loads(sug["transitions_json"], [])
         states = [t.get("transition") for t in transitions if isinstance(t, dict)]
+        cur_ledger_state = LedgerState.READY
+        transition_invalid = False
+        for tr_str in states:
+            if not isinstance(tr_str, str):
+                transition_invalid = True
+                violations.append(
+                    InvariantViolation(
+                        invariant_id=4,
+                        name="inv_4_displayed_has_closing",
+                        detail=f"Suggestion {sug['suggestion_id']!r} has non-string ledger transition {tr_str!r}",
+                    )
+                )
+                break
+            try:
+                next_state = LedgerState(tr_str)
+            except ValueError:
+                transition_invalid = True
+                violations.append(
+                    InvariantViolation(
+                        invariant_id=4,
+                        name="inv_4_displayed_has_closing",
+                        detail=f"Suggestion {sug['suggestion_id']!r} has unknown ledger transition {tr_str!r}",
+                    )
+                )
+                break
+            if next_state not in ALLOWED_LEDGER_TRANSITIONS.get(cur_ledger_state, frozenset()):
+                transition_invalid = True
+                violations.append(
+                    InvariantViolation(
+                        invariant_id=4,
+                        name="inv_4_displayed_has_closing",
+                        detail=f"Suggestion {sug['suggestion_id']!r} has illegal ledger transition "
+                        f"{cur_ledger_state.value!r} -> {next_state.value!r}",
+                    )
+                )
+                break
+            cur_ledger_state = next_state
+        if not transition_invalid and states and cur_ledger_state.value != sug["current_state"]:
+            violations.append(
+                InvariantViolation(
+                    invariant_id=4,
+                    name="inv_4_displayed_has_closing",
+                    detail=f"Suggestion {sug['suggestion_id']!r} current_state={sug['current_state']!r} "
+                    f"does not match final ledger transition {cur_ledger_state.value!r}",
+                )
+            )
         if "displayed" in states:
             disp_idx = states.index("displayed")
             closing = [st for st in states[disp_idx + 1 :] if st in _CLOSING_TRANSITION_STATES]

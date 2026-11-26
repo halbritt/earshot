@@ -15,6 +15,7 @@ from coach.calibration import CalibrationModel, CalibrationRegistry, default_cal
 from coach.candidate_validator import check_do_not_suggest, validate_template_candidate
 from coach.canonical_state import ApplyResult, CanonicalState, SegmentRecord, StateSnapshot
 from coach.context_builder import (
+    AnchorSpan,
     ContextBuildResult,
     CoverageCursor,
     PolicyConfig,
@@ -360,6 +361,7 @@ class SuggestionController:
         self._prev_anchor_norm_text: str | None = None
         self._prev_anchor_seg_revs: dict[str, int] = {}
         self._prev_anchor_rx_ms: int | None = None
+        self._prev_anchor_order_key: tuple[int, tuple[int, int, int, str]] | None = None
         self._consecutive_clf_errors = 0
         self._gen_latencies_ms: deque[int] = deque(maxlen=64)
         self._gen_p95_ms: int | None = None
@@ -979,11 +981,25 @@ class SuggestionController:
             reason_code=reason,
         )
 
-    def _update_prev_anchor(self, norm_text: str, seg_revs: dict[str, int], rx_ms: int) -> None:
-        if self._prev_anchor_rx_ms is None or rx_ms >= self._prev_anchor_rx_ms:
+    @staticmethod
+    def _anchor_order_key(anchor: AnchorSpan) -> tuple[int, tuple[int, int, int, str]]:
+        return (
+            anchor.anchor_received_ms,
+            max(CoverageCursor.seg_key(s) for s in anchor.segments),
+        )
+
+    def _update_prev_anchor(
+        self,
+        norm_text: str,
+        seg_revs: dict[str, int],
+        rx_ms: int,
+        order_key: tuple[int, tuple[int, int, int, str]],
+    ) -> None:
+        if self._prev_anchor_order_key is None or order_key >= self._prev_anchor_order_key:
             self._prev_anchor_norm_text = norm_text
             self._prev_anchor_seg_revs = seg_revs
             self._prev_anchor_rx_ms = rx_ms
+            self._prev_anchor_order_key = order_key
 
     async def _run_proactive_once(self) -> bool:
         if self._mode not in {Mode.PROACTIVE, Mode.QUIET, Mode.SHADOW}:
@@ -1030,14 +1046,18 @@ class SuggestionController:
             batch_prev_norm = self._prev_anchor_norm_text
             batch_prev_seg_ids = set(self._prev_anchor_seg_revs)
             batch_prev_rx_ms = self._prev_anchor_rx_ms
-            norm_by_cand: dict[str, tuple[str, dict[str, int], int]] = {}
+            batch_prev_order_key = self._prev_anchor_order_key
+            norm_by_cand: dict[
+                str, tuple[str, dict[str, int], int, tuple[int, tuple[int, int, int, str]]]
+            ] = {}
             surviving: list[ContextBuildResult] = []
             for anchor in selected:
                 seg_ids = {s.segment_id for s in anchor.segments}
                 seg_revs = {s.segment_id: s.revision for s in anchor.segments}
+                anchor_order_key = self._anchor_order_key(anchor)
                 same_seg_rev = bool(seg_ids & batch_prev_seg_ids)
                 out_of_order = (
-                    batch_prev_rx_ms is not None and anchor.anchor_received_ms < batch_prev_rx_ms
+                    batch_prev_order_key is not None and anchor_order_key <= batch_prev_order_key
                 )
                 gap_exceeded = (
                     batch_prev_rx_ms is not None
@@ -1054,9 +1074,10 @@ class SuggestionController:
                 batch_prev_norm = pf.normalized_text
                 batch_prev_seg_ids = seg_ids
                 batch_prev_rx_ms = anchor.anchor_received_ms
+                batch_prev_order_key = anchor_order_key
                 if not pf.passed and pf.drop_record is not None:
                     self._update_prev_anchor(
-                        pf.normalized_text, seg_revs, anchor.anchor_received_ms
+                        pf.normalized_text, seg_revs, anchor.anchor_received_ms, anchor_order_key
                     )
                     drop = pf.drop_record
                     dummy_ctx = DecisionContext(
@@ -1098,6 +1119,7 @@ class SuggestionController:
                             pf.normalized_text,
                             seg_revs,
                             anchor.anchor_received_ms,
+                            anchor_order_key,
                         )
                     surviving.append(built)
 
@@ -1191,12 +1213,12 @@ class SuggestionController:
                         )
                         self._cursor.mark_covered(built.anchor.segments)
                         if ctx.candidate_id in norm_by_cand:
-                            p_norm, p_revs, p_rx = norm_by_cand[ctx.candidate_id]
-                            self._update_prev_anchor(p_norm, p_revs, p_rx)
+                            p_norm, p_revs, p_rx, p_key = norm_by_cand[ctx.candidate_id]
+                            self._update_prev_anchor(p_norm, p_revs, p_rx, p_key)
                         continue
                 if ctx.candidate_id in norm_by_cand:
-                    p_norm, p_revs, p_rx = norm_by_cand[ctx.candidate_id]
-                    self._update_prev_anchor(p_norm, p_revs, p_rx)
+                    p_norm, p_revs, p_rx, p_key = norm_by_cand[ctx.candidate_id]
+                    self._update_prev_anchor(p_norm, p_revs, p_rx, p_key)
                 eff_health = (
                     HealthState.OK if (probe_ready and not probe_reserved) else self._health
                 )
@@ -1948,6 +1970,7 @@ class SuggestionController:
         brief_invalidated = False
         rejected_cand_ids: set[str] = set()
         recorded_manual_decision = False
+        first_fail_reason: ReasonCode | None = None
         non_routed_manual: list[tuple[ContextBuildResult, ClassifierResult, RoutingDecision]] = []
 
         if built_pairs and self._health is not HealthState.MANUAL_ONLY:
@@ -2151,6 +2174,7 @@ class SuggestionController:
                                 retention=fresh_snap.brief.retention,
                             )
                             recorded_manual_decision = True
+                            rejected_cand_ids.add(built.context.candidate_id)
                         continue
                     async with self._state_lock:
                         if (
@@ -2275,6 +2299,12 @@ class SuggestionController:
                                 serialized_text=built.serialized_text,
                                 retention=fresh_snap.brief.retention,
                             )
+                            recorded_manual_decision = True
+                            rejected_cand_ids.add(built.context.candidate_id)
+                            if first_fail_reason is None:
+                                first_fail_reason = t_reason
+                            if self._clock.now_ms() >= deadline_ms:
+                                break
                             continue
                         eff_rt = replace(routing, route=cand.route)
                         cand = replace(cand, origin=Origin.MANUAL, display_by_ms=deadline_ms)
@@ -2369,7 +2399,7 @@ class SuggestionController:
         fb_ledger_texts: dict[str, str] = {}
         fb_ledger_cats: dict[str, Category] = {}
         fb_empty_reason: ReasonCode | None = (
-            ReasonCode.OBJECTIVE_CHANGED if brief_invalidated else None
+            ReasonCode.OBJECTIVE_CHANGED if brief_invalidated else first_fail_reason
         )
         if (
             not brief_invalidated
