@@ -85,6 +85,7 @@ from coach.replay_evaluator import (
     simulate_replay,
     split_by_conversation,
     split_by_series,
+    sweep_dataset_t_display,
     sweep_t_display,
 )
 from coach.routing_policy import load_policy
@@ -982,6 +983,8 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         clf = _create_classifier_from_args(clf_name, model_dir, local_only=bool(args.local_only))
         provider = _make_provider_from_args(args, policy)
         mode = Mode(args.mode)
+        ds_labels: list[LabelRecord] = []
+        sweep_res: list[dict[str, Any]] | None = None
         try:
             with SQLiteStore(args.db) as store:
                 session_results = simulate_dataset_replay(
@@ -992,6 +995,23 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                     calibration=cal_obj,
                     store=store,
                     run_id=run_id,
+                    mode=mode,
+                    provider=provider,
+                    simulated_latency_ms=args.simulated_latency_ms,
+                    cache_classifier=not args.no_cache,
+                )
+            if args.labels:
+                ds_labels = load_labels_jsonl(args.labels)
+            if args.sweep_t_display:
+                t_vals = [float(x.strip()) for x in args.sweep_t_display.split(",") if x.strip()]
+                sweep_res = sweep_dataset_t_display(
+                    dataset_rows,
+                    ds_labels,
+                    policy,
+                    clf,
+                    t_vals,
+                    brief=brief_opt,
+                    calibration=cal_obj,
                     mode=mode,
                     provider=provider,
                     simulated_latency_ms=args.simulated_latency_ms,
@@ -1027,7 +1047,6 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             ],
         }
         if args.labels:
-            ds_labels = load_labels_jsonl(args.labels)
             payload["evaluation"] = match_opportunities(
                 all_cards,
                 ds_labels,
@@ -1040,6 +1059,9 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             )
             payload["look_count"] = looks
             payload["eval_look_count"] = looks
+        if sweep_res is not None:
+            payload["sweep"] = sweep_res
+            payload["sweep_curve"] = sweep_res
         _emit_output(
             payload,
             as_json=args.json,

@@ -2897,6 +2897,100 @@ def sweep_t_display(
     )
 
 
+async def async_sweep_dataset_t_display(
+    dataset_rows: Sequence[Mapping[str, Any]],
+    labels: Sequence[LabelRecord],
+    policy: PolicyConfig,
+    classifier: OpportunityClassifier,
+    t_display_values: Sequence[float],
+    *,
+    brief: SessionBrief | None = None,
+    calibration: CalibrationModel | CalibrationRegistry | None = None,
+    templates: Mapping[str, TemplateSpec] | None = None,
+    mode: Mode = Mode.PROACTIVE,
+    provider: ProviderAdapter | None = None,
+    health: HealthState | None = None,
+    simulated_latency_ms: float | None = None,
+    cache_classifier: bool = True,
+) -> list[dict[str, Any]]:
+    """Sweep `t_display` through policy-level dataset replay using an isolated store (§12.8)."""
+    if not t_display_values:
+        raise ValueError("t_display_values must be non-empty")
+    curve: list[dict[str, Any]] = []
+    with SQLiteStore(":memory:") as sweep_store:
+        for idx, t_disp in enumerate(sorted(float(v) for v in t_display_values)):
+            swept_policy = _policy_with_t_display(policy, t_disp)
+            session_results = await async_simulate_dataset_replay(
+                dataset_rows,
+                swept_policy,
+                classifier,
+                brief=brief,
+                calibration=calibration,
+                templates=templates,
+                store=sweep_store if cache_classifier else None,
+                run_id=f"sweep-{idx}-{t_disp:.4f}",
+                mode=mode,
+                provider=provider,
+                health=health,
+                simulated_latency_ms=simulated_latency_ms,
+                cache_classifier=cache_classifier,
+            )
+            all_cards = [c for res in session_results for c in res.displayed_cards]
+            total_dur_ms = sum(max(600_000, res.duration_ms) for res in session_results)
+            max_cap_10m = 0
+            if session_results:
+                eff_brief = (
+                    brief
+                    if brief is not None
+                    else SessionBrief(
+                        schema_version=SCHEMA_VERSION,
+                        session_id="sweep-default",
+                        objective="Evaluate dataset replay candidates.",
+                        recipient=RecipientConfig(participant_id="ME", role="participant"),
+                        mode=swept_policy.mode,
+                        retention=RetentionConfig(),
+                        attention=AttentionConfig(max_cards_per_10_min=3, proactive=True),
+                    )
+                )
+                max_cap_10m = effective_max_cards_per_10_min(eff_brief, swept_policy)
+
+            summary = match_opportunities(
+                all_cards,
+                labels,
+                settle_ms=swept_policy.display.settle_ms,
+                duration_ms=total_dur_ms if session_results else None,
+            )
+            curve.append(
+                {
+                    "t_display": t_disp,
+                    "useful_count": summary["useful_count"],
+                    "distracting_count": summary["distracting_count"],
+                    "displayed_count": summary["displayed_count"],
+                    "useful_per_10_min": summary["useful_per_10_min"],
+                    "distracting_per_10_min": summary["distracting_per_10_min"],
+                    "cards_per_10_min": summary["cards_per_10_min"],
+                    "effective_max_cards_per_10_min": max_cap_10m,
+                }
+            )
+    return curve
+
+
+def sweep_dataset_t_display(
+    dataset_rows: Sequence[Mapping[str, Any]],
+    labels: Sequence[LabelRecord],
+    policy: PolicyConfig,
+    classifier: OpportunityClassifier,
+    t_display_values: Sequence[float],
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Synchronous wrapper for async_sweep_dataset_t_display."""
+    return asyncio.run(
+        async_sweep_dataset_t_display(
+            dataset_rows, labels, policy, classifier, t_display_values, **kwargs
+        )
+    )
+
+
 def paired_conversation_bootstrap(
     cards_a: Sequence[DisplayedCardEvent | Mapping[str, Any]],
     cards_b: Sequence[DisplayedCardEvent | Mapping[str, Any]],

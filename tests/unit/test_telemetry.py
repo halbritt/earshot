@@ -1012,3 +1012,213 @@ def test_cli_replay_subprocess_nested_context_jsonl_and_pretty_json(tmp_path: Pa
         assert rpt_proc.returncode == 0, rpt_proc.stderr
         rpt_out = json.loads(rpt_proc.stdout)
         assert rpt_out["invariants"]["passed"] is True
+
+
+def test_cli_replay_subprocess_nested_context_sweep_t_display_and_invariants(
+    tmp_path: Path,
+) -> None:
+    from coach.annotation_tool import save_labels_jsonl
+    from coach.contracts import (
+        AnnotationPass,
+        LabelRecord,
+        Participant,
+        SampleSource,
+        ValidityInterval,
+    )
+    from coach.routing_policy import load_policy
+
+    repo_root = Path(__file__).resolve().parents[2]
+    policy_path = repo_root / "policies" / "policy-v0-a.yaml"
+    policy = load_policy(policy_path, calibration_metadata=default_calibration_metadata())
+    sid = "s-nested-sweep"
+    brief = SessionBrief(
+        schema_version=1,
+        session_id=sid,
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="ME", role="reviewer"),
+        objective="Confirm rollback owner.",
+        participants=(
+            Participant(participant_id="S1", label="S1", role="eng"),
+            Participant(participant_id="S2", label="S2", role="ops"),
+        ),
+    )
+    state = CanonicalState(brief)
+    for seg_id, spk, ch, start_ms, seq, txt in (
+        ("me1", "ME", 0, 100, 1, "Let us confirm rollback readiness."),
+        ("s_short", "S1", 1, 300, 2, "Okay."),
+        ("s_ctx", "S2", 1, 500, 3, "Staging checks passed."),
+        ("s_anchor", "S1", 1, 700, 4, "Someone should own the rollback plan."),
+    ):
+        state.apply(
+            CanonicalEvent(
+                schema_version=1,
+                session_id=sid,
+                event_id=f"ev-{seg_id}",
+                kind=EventKind.SEGMENT,
+                segment_id=seg_id,
+                source_revision=1,
+                channel=ch,
+                speaker_id=spk,
+                start_ms=start_ms,
+                end_ms=start_ms + 90,
+                received_ms=start_ms + 100,
+                text=txt,
+                stability=Stability.COMMITTED,
+                source_sequence=seq,
+                boundary="utterance_end",
+            )
+        )
+    built = [
+        b
+        for b in build_decision_contexts(state.snapshot(), policy=policy)
+        if not b.dropped and b.context is not None and b.serialized_text is not None
+    ]
+    assert len(built) == 1
+    ctx = built[0].context
+    assert ctx is not None
+    nested_row = {
+        "context": ctx.to_dict(),
+        "serialized_text": built[0].serialized_text,
+    }
+    ds_path = tmp_path / "nested_sweep.jsonl"
+    ds_path.write_text(json.dumps(nested_row) + "\n", encoding="utf-8")
+
+    labels_path = tmp_path / "labels.jsonl"
+    save_labels_jsonl(
+        [
+            LabelRecord(
+                schema_version=1,
+                label_id="lbl-sweep-1",
+                session_id=sid,
+                annotator="reviewer",
+                sample_source=SampleSource.RANDOM,
+                annotation_pass=AnnotationPass.OFFLINE,
+                candidate_id=ctx.candidate_id,
+                state_version_at_decision=ctx.based_on_state_version,
+                worthwhile=True,
+                categories=(Category.CONFIRM_OWNER,),
+                example_questions=("Who will own the rollback plan?",),
+                evidence_refs=ctx.anchor_refs,
+                validity=ValidityInterval(open_ms=800, close_ms=10_000),
+            )
+        ],
+        labels_path,
+    )
+
+    db_path = tmp_path / "sweep.db"
+    eval_log_path = tmp_path / "eval.jsonl"
+    rep_proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "coach.cli",
+            "replay",
+            "--session",
+            str(ds_path),
+            "--policy",
+            str(policy_path),
+            "--db",
+            str(db_path),
+            "--run-id",
+            "r-sweep",
+            "--labels",
+            str(labels_path),
+            "--sweep-t-display",
+            "0.3,0.6,0.9",
+            "--eval-log",
+            str(eval_log_path),
+            "--json",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rep_proc.returncode == 0, rep_proc.stderr
+    rep_out = json.loads(rep_proc.stdout)
+    assert "sweep" in rep_out and "sweep_curve" in rep_out
+    assert rep_out["sweep"] == rep_out["sweep_curve"]
+    curve = rep_out["sweep_curve"]
+    assert [pt["t_display"] for pt in curve] == [0.3, 0.6, 0.9]
+    assert [pt["useful_count"] for pt in curve] == [1, 1, 0]
+    assert [pt["displayed_count"] for pt in curve] == [1, 1, 0]
+    assert rep_out["eval_look_count"] == 1
+    assert rep_out["look_count"] == 1
+    eval_state = json.loads(eval_log_path.read_text(encoding="utf-8"))
+    assert eval_state["look_count"] == 1
+
+    rpt_proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "coach.cli",
+            "report",
+            "--db",
+            str(db_path),
+            "--session",
+            sid,
+            "--run-id",
+            "r-sweep",
+            "--json",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rpt_proc.returncode == 0, rpt_proc.stderr
+    rpt_out = json.loads(rpt_proc.stdout)
+    assert rpt_out["invariants"]["passed"] is True
+
+    # Parity when --labels is omitted: evaluation omitted, sweep/sweep_curve populated, DB clean
+    db_nolbl = tmp_path / "sweep_nolbl.db"
+    rep_nolbl = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "coach.cli",
+            "replay",
+            "--session",
+            str(ds_path),
+            "--policy",
+            str(policy_path),
+            "--db",
+            str(db_nolbl),
+            "--run-id",
+            "r-sweep-nolbl",
+            "--sweep-t-display",
+            "0.3,0.6,0.9",
+            "--json",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rep_nolbl.returncode == 0, rep_nolbl.stderr
+    nolbl_out = json.loads(rep_nolbl.stdout)
+    assert "evaluation" not in nolbl_out
+    assert "sweep" in nolbl_out and "sweep_curve" in nolbl_out
+    assert [pt["displayed_count"] for pt in nolbl_out["sweep_curve"]] == [1, 1, 0]
+    assert [pt["useful_count"] for pt in nolbl_out["sweep_curve"]] == [0, 0, 0]
+
+    rpt_nolbl = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "coach.cli",
+            "report",
+            "--db",
+            str(db_nolbl),
+            "--session",
+            sid,
+            "--json",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rpt_nolbl.returncode == 0, rpt_nolbl.stderr
+    assert json.loads(rpt_nolbl.stdout)["run_id"] == "r-sweep-nolbl"
+    assert json.loads(rpt_nolbl.stdout)["invariants"]["passed"] is True
