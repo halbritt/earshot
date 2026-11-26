@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -17,6 +18,7 @@ from coach.contracts import (
     CanonicalEvent,
     Category,
     ClosedBy,
+    ControlSubtype,
     EventKind,
     LabelRecord,
     NoneReason,
@@ -540,3 +542,158 @@ def test_simulate_replay_generator_route_conservation_and_speaker_update_withdra
         decs_spk = store.get_decisions(brief_spk.session_id, "r-spk")
         assert decs_spk[0]["terminal_state"] == "withdrawn"
         assert decs_spk[0]["terminal_reason"] == "evidence_revision_changed"
+
+
+def test_simulate_replay_drains_segment_ingested_during_classify_latency(tmp_path: Path) -> None:
+    base_policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    policy = replace(
+        base_policy,
+        display=replace(
+            base_policy.display,
+            settle_ms=0,
+            cooldown_ms=1002,
+            max_candidate_age_ms=1000,
+            max_cards_per_10_min=5,
+        ),
+    )
+    clf = create_classifier("opportunity-baseline-v0")
+    brief = _brief(session_id="sess-f2-lat", max_cards=5)
+    events = [
+        _seg(
+            "seg-f2-1",
+            "Someone should own the first task.",
+            session_id="sess-f2-lat",
+            start_ms=100,
+            end_ms=180,
+            received_ms=200,
+            seq=1,
+            boundary="utterance_end",
+        ),
+        _seg(
+            "seg-f2-2",
+            "Someone should own the second deadline task.",
+            session_id="sess-f2-lat",
+            start_ms=110,
+            end_ms=190,
+            received_ms=201,
+            seq=2,
+            boundary="utterance_end",
+        ),
+        CanonicalEvent(
+            schema_version=1,
+            session_id="sess-f2-lat",
+            event_id="ev-f2-end",
+            kind=EventKind.CONTROL,
+            subtype=ControlSubtype.SESSION_END,
+            received_ms=3000,
+            source_sequence=3,
+        ),
+    ]
+    for lat_ms in (0.0, 1.0, 5.0):
+        run_id = f"r-lat-{int(lat_ms)}"
+        with SQLiteStore(tmp_path / f"lat_{int(lat_ms)}.db") as store:
+            res = simulate_replay(
+                brief,
+                events,
+                policy,
+                clf,
+                store=store,
+                run_id=run_id,
+                simulated_latency_ms=lat_ms,
+            )
+            inv = check_conservation_invariants(store, brief.session_id, run_id)
+            assert inv.passed, f"Conservation violations at {lat_ms}ms: {inv.violations}"
+            assert len(res.displayed_cards) == 1
+            sugs = store.get_suggestions(brief.session_id, run_id)
+            second = [s for s in sugs if "seg-f2-2" in str(s.get("evidence_refs_json"))]
+            assert len(second) == 1
+            assert second[0]["current_state"] == "expired"
+            assert second[0]["terminal_reason"] == "display_by_passed"
+
+
+def test_simulate_replay_evaluates_trailing_segment_ingested_during_final_classify(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    clf = create_classifier("opportunity-baseline-v0")
+    brief = _brief(session_id="sess-tail-ingest", max_cards=2)
+    events = [
+        _seg(
+            "s-first",
+            "We reviewed the metrics from last Tuesday afternoon.",
+            session_id="sess-tail-ingest",
+            start_ms=100,
+            end_ms=180,
+            received_ms=200,
+            seq=1,
+            boundary="utterance_end",
+        ),
+        _seg(
+            "s-last",
+            "Someone should own the rollback plan.",
+            session_id="sess-tail-ingest",
+            start_ms=190,
+            end_ms=200,
+            received_ms=201,
+            seq=2,
+            boundary="utterance_end",
+        ),
+    ]
+    with SQLiteStore(tmp_path / "tail_ingest.db") as store:
+        res = simulate_replay(
+            brief,
+            events,
+            policy,
+            clf,
+            store=store,
+            run_id="r-tail-ingest",
+            simulated_latency_ms=1.0,
+        )
+        inv = check_conservation_invariants(store, brief.session_id, "r-tail-ingest")
+        assert inv.passed, f"Conservation violations: {inv.violations}"
+        assert res.decisions_count == 2
+        assert len(res.displayed_cards) == 1
+        assert res.displayed_cards[0].evidence_refs[0].segment_id == "s-last"
+
+
+def test_simulate_replay_wakes_for_open_tail_anchor_display_by_before_far_future_event(
+    tmp_path: Path,
+) -> None:
+    base_policy = load_policy(POLICY_PATH, calibration_metadata=default_calibration_metadata())
+    policy = replace(
+        base_policy,
+        display=replace(base_policy.display, max_candidate_age_ms=1000),
+    )
+    clf = create_classifier("opportunity-baseline-v0")
+    brief = _brief(session_id="sess-open-tail", max_cards=2)
+    events = [
+        _seg(
+            "s-open",
+            "Someone should own the rollback plan without punctuation",
+            session_id="sess-open-tail",
+            start_ms=100,
+            end_ms=180,
+            received_ms=200,
+            seq=1,
+            boundary=None,
+        ),
+        CanonicalEvent(
+            schema_version=1,
+            session_id="sess-open-tail",
+            event_id="ev-open-end",
+            kind=EventKind.CONTROL,
+            subtype=ControlSubtype.SESSION_END,
+            received_ms=3000,
+            source_sequence=2,
+        ),
+    ]
+    with SQLiteStore(tmp_path / "open_tail.db") as store:
+        res = simulate_replay(brief, events, policy, clf, store=store, run_id="r-open")
+        inv = check_conservation_invariants(store, brief.session_id, "r-open")
+        assert inv.passed, f"Conservation violations: {inv.violations}"
+        assert res.decisions_count == 1
+        decs = store.get_decisions(brief.session_id, "r-open")
+        assert len(decs) == 1
+        assert decs[0]["terminal_state"] == "retired"
+        assert decs[0]["terminal_reason"] == "expired_unevaluated"
+        assert decs[0]["based_on_state_version"] == 1

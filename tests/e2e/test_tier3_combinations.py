@@ -355,7 +355,7 @@ def test_t3_02_manual_request_during_active_proactive_job_and_cooldown_bypass(
     mock_openai.set_default(
         MockCompletionSpec.valid_question(
             "What scope boundary needs verification?",
-            ["segment-0003"],
+            ["seg-ch0-00002000"],
             delay_s=1.2,
         )
     )
@@ -478,7 +478,7 @@ def test_t3_03_circuit_breaker_template_fallback_recovery_and_ui_health(
     mock_openai.set_default(
         MockCompletionSpec.valid_question(
             "What scope boundary needs verification?",
-            ["segment-0005"],
+            ["seg-ch0-00004000"],
         )
     )
     mock_nemo_ws.set_config(
@@ -567,6 +567,7 @@ def test_t3_03_circuit_breaker_template_fallback_recovery_and_ui_health(
                 health_seq.append(str(h2.get("health") or h2.get("state")))
                 c_generic = await ws.wait_for_card(timeout=5.0)
                 cards.append(c_generic)
+                await ws.send_dismiss(str(c_generic["suggestion_id"]), key="d")
                 h3 = await ws.wait_for_health("ok", timeout=6.0)
                 health_seq.append(str(h3.get("health") or h3.get("state")))
                 c_gen = await ws.wait_for_card(timeout=5.0)
@@ -1258,7 +1259,6 @@ def test_t3_09_quiet_shadow_logging_review_queue_and_pass2_shadow_review(
                 ),
                 ScriptedTurn(
                     trigger_after_frames=14,
-                    trigger_on_commit=True,
                     transcript="Someone should own the cutover checklist.",
                     words=_make_words(
                         "Someone should own the cutover checklist.",
@@ -1324,14 +1324,24 @@ def test_t3_09_quiet_shadow_logging_review_queue_and_pass2_shadow_review(
     with open_db(live_db) as conn:
         live_sugs = fetch_normalized_rows(conn, "suggestions", sid)
         live_evs = fetch_normalized_rows(conn, "events", sid)
+        live_tel = fetch_normalized_rows(conn, "telemetry_records", sid)
 
-    shadow_transitions = {
-        str(tr.get("transition") or "")
+    proactive_shadow_sugs = [
+        s
         for s in live_sugs
-        for tr in (_json_field(s, "transitions") or [])
-        if isinstance(tr, dict)
-    }
-    assert "shadow_displayed" in shadow_transitions
+        if str(s.get("origin") or "proactive") == "proactive"
+        and any(
+            isinstance(tr, dict) and str(tr.get("transition") or "") == "displayed"
+            for tr in (_json_field(s, "transitions") or [])
+        )
+    ]
+    assert proactive_shadow_sugs
+    proactive_shadow_ids = {str(s.get("suggestion_id") or "") for s in proactive_shadow_sugs}
+    assert any(
+        str(t.get("kind") or "") == "shadow_displayed"
+        and str(t.get("suggestion_id") or "") in proactive_shadow_ids
+        for t in live_tel
+    )
 
     committed_segs = [
         {

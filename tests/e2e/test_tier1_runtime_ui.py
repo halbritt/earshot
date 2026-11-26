@@ -132,7 +132,7 @@ def test_five_task_runtime_nonblocking_ingest_under_slow_inference(
     mock_openai.set_default(
         MockCompletionSpec.valid_question(
             "Has failover testing covered multi-region cutover?",
-            ["segment-0001"],
+            ["seg-ch0-00000100"],
             delay_s=1.2,
         )
     )

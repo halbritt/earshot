@@ -1584,30 +1584,38 @@ class _ReplaySim:
             )
         )
 
-    async def run_proactive_once(self) -> bool:
+    def _ready_proactive_anchors(
+        self, snap: StateSnapshot | None = None
+    ) -> tuple[StateSnapshot, list[AnchorSpan], int | None]:
+        eff_snap = snap if snap is not None else self.state.snapshot()
         if self.mode not in {Mode.PROACTIVE, Mode.QUIET, Mode.SHADOW}:
-            return False
+            return (eff_snap, [], None)
         if self.eff_health in {
             HealthState.NO_TRANSCRIPT,
             HealthState.PAUSED,
             HealthState.MANUAL_ONLY,
         }:
-            return False
-        snap = self.state.snapshot()
-        if snap.off_record:
-            return False
-        unprocessed = self.cursor.unprocessed_segments(snap)
+            return (eff_snap, [], None)
+        if eff_snap.off_record:
+            return (eff_snap, [], None)
+        unprocessed = self.cursor.unprocessed_segments(eff_snap)
         if not unprocessed:
-            return False
+            return (eff_snap, [], None)
         anchors = coalesce_anchors(
-            snap,
+            eff_snap,
             max_candidate_age_ms=self.policy.display.max_candidate_age_ms,
             tokenizer=self.tok,
             speaker_boundary_end_ms=self.speaker_boundary_end_ms,
             segments_subset=unprocessed,
         )
-        if anchors and self.is_open_tail_anchor(anchors[-1], snap):
+        open_tail_wake_ms: int | None = None
+        if anchors and self.is_open_tail_anchor(anchors[-1], eff_snap):
+            open_tail_wake_ms = anchors[-1].display_by_ms
             anchors = anchors[:-1]
+        return (eff_snap, anchors, open_tail_wake_ms)
+
+    async def run_proactive_once(self) -> bool:
+        snap, anchors, _open_tail_wake_ms = self._ready_proactive_anchors()
         if not anchors:
             return False
 
@@ -1675,7 +1683,8 @@ class _ReplaySim:
                 surviving.append((built, pf.normalized_text))
 
         if not surviving:
-            return has_overflow
+            _, ready_anchors, _ = self._ready_proactive_anchors()
+            return has_overflow or bool(ready_anchors)
         return await self._classify_and_route_batch(surviving, has_overflow=has_overflow)
 
     async def _classify_and_route_batch(
@@ -1833,12 +1842,18 @@ class _ReplaySim:
                 anchor=built.anchor,
             )
         self.advance_display_timers(self.sim_now_ms)
-        return has_overflow or retry_pending
+        _, ready_anchors, _ = self._ready_proactive_anchors()
+        return has_overflow or retry_pending or bool(ready_anchors)
 
     def next_wake_ms(self) -> int | None:
         candidates: list[int] = []
         if self.next_ev_idx < len(self.ordered):
             candidates.append(self.ordered[self.next_ev_idx].received_ms)
+        _, ready_anchors, open_tail_wake_ms = self._ready_proactive_anchors()
+        if ready_anchors:
+            candidates.append(self.sim_now_ms)
+        elif open_tail_wake_ms is not None and open_tail_wake_ms > self.sim_now_ms:
+            candidates.append(open_tail_wake_ms)
         for item in self.settling:
             if not item.settled and item.settle_end_ms > self.sim_now_ms:
                 candidates.append(item.settle_end_ms)
@@ -1881,6 +1896,7 @@ class _ReplaySim:
             or self.settling
             or self.deferred is not None
             or self.active is not None
+            or bool(self._ready_proactive_anchors()[1])
         ):
             while (
                 self.next_ev_idx < len(self.ordered)

@@ -1469,8 +1469,13 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         (cal_model.calibrate(ctx, res, mode=session_mode), lbl) for ctx, res, lbl in fit_rows
     ]
     eval_rep = evaluate_calibration(calibrated_pairs)
+    eval_dict = eval_rep.to_dict()
+    opp_eval = eval_rep.heads.get("opportunity")
     out_data = cal_model.to_dict()
-    out_data["evaluation"] = eval_rep.to_dict()
+    if opp_eval is not None:
+        out_data["brier_score"] = opp_eval.brier_score
+        out_data["reliability_bins"] = [b.to_dict() for b in opp_eval.bins]
+    out_data["evaluation"] = eval_dict
     saved_path = Path(args.out)
     saved_path.parent.mkdir(parents=True, exist_ok=True)
     saved_path.write_text(json.dumps(out_data, indent=2, sort_keys=True), encoding="utf-8")
@@ -1480,8 +1485,11 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         "mode": str(cal_model.mode),
         "out": str(saved_path),
         "n_samples": len(fit_rows),
-        "evaluation": eval_rep.to_dict(),
+        "evaluation": eval_dict,
     }
+    if opp_eval is not None:
+        payload["brier_score"] = opp_eval.brier_score
+        payload["reliability_bins"] = [b.to_dict() for b in opp_eval.bins]
     lines = [
         f"Saved calibration {cal_model.calibration_version} ({cal_model.classifier_version}) -> {saved_path}"
     ]

@@ -690,7 +690,7 @@ def test_scenario_3_noisy_room_earshot_outage_recovery(
     mock_openai.set_default(
         MockCompletionSpec.valid_question(
             "What noisy room scope boundary needs clarification?",
-            ["segment-0001", "segment-0002", "segment-0003"],
+            ["seg-ch0-00000100", "seg-ch0-00001800", "seg-ch0-00003500"],
             delay_s=1.5,
         )
     )
