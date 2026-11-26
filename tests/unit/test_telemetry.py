@@ -1222,3 +1222,85 @@ def test_cli_replay_subprocess_nested_context_sweep_t_display_and_invariants(
     assert rpt_nolbl.returncode == 0, rpt_nolbl.stderr
     assert json.loads(rpt_nolbl.stdout)["run_id"] == "r-sweep-nolbl"
     assert json.loads(rpt_nolbl.stdout)["invariants"]["passed"] is True
+
+
+def test_cli_replay_rejects_invalid_sweep_t_display_cleanly(tmp_path: Path) -> None:
+    from coach.routing_policy import load_policy
+
+    repo_root = Path(__file__).resolve().parents[2]
+    policy_path = repo_root / "policies" / "policy-v0-a.yaml"
+    policy = load_policy(policy_path, calibration_metadata=default_calibration_metadata())
+    sid = "s-bad-sweep"
+    brief = SessionBrief(
+        schema_version=1,
+        session_id=sid,
+        mode=SessionMode.TECHNICAL_WORKING_DISCUSSION,
+        recipient=RecipientConfig(participant_id="ME", role="reviewer"),
+        objective="Confirm rollback owner.",
+    )
+    state = CanonicalState(brief)
+    state.apply(
+        CanonicalEvent(
+            schema_version=1,
+            session_id=sid,
+            event_id="ev-s1",
+            kind=EventKind.SEGMENT,
+            segment_id="s1",
+            source_revision=1,
+            channel=1,
+            speaker_id="S1",
+            start_ms=100,
+            end_ms=200,
+            received_ms=250,
+            text="Someone should own the rollback plan.",
+            stability=Stability.COMMITTED,
+            source_sequence=1,
+            boundary="utterance_end",
+        )
+    )
+    built = [
+        b
+        for b in build_decision_contexts(state.snapshot(), policy=policy)
+        if not b.dropped and b.context is not None and b.serialized_text is not None
+    ]
+    assert len(built) == 1
+    assert built[0].context is not None
+    ds_path = tmp_path / "bad_sweep.jsonl"
+    ds_path.write_text(
+        json.dumps(
+            {
+                "context": built[0].context.to_dict(),
+                "serialized_text": built[0].serialized_text,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    for bad_val in ("", ",", "abc", "1.5", "-0.1", "nan"):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "coach.cli",
+                "replay",
+                "--session",
+                str(ds_path),
+                "--policy",
+                str(policy_path),
+                "--sweep-t-display",
+                bad_val,
+                "--json",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode != 0, f"Expected failure for {bad_val!r}, got rc=0"
+        assert "Traceback" not in proc.stderr, (
+            f"Unexpected traceback for {bad_val!r}: {proc.stderr}"
+        )
+        assert "--sweep-t-display" in proc.stderr, (
+            f"Expected clean --sweep-t-display error for {bad_val!r}, got: {proc.stderr}"
+        )

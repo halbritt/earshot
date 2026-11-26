@@ -2920,21 +2920,26 @@ async def async_sweep_dataset_t_display(
     with SQLiteStore(":memory:") as sweep_store:
         for idx, t_disp in enumerate(sorted(float(v) for v in t_display_values)):
             swept_policy = _policy_with_t_display(policy, t_disp)
-            session_results = await async_simulate_dataset_replay(
-                dataset_rows,
-                swept_policy,
-                classifier,
-                brief=brief,
-                calibration=calibration,
-                templates=templates,
-                store=sweep_store if cache_classifier else None,
-                run_id=f"sweep-{idx}-{t_disp:.4f}",
-                mode=mode,
-                provider=provider,
-                health=health,
-                simulated_latency_ms=simulated_latency_ms,
-                cache_classifier=cache_classifier,
-            )
+            iter_provider = provider.clone_isolated() if provider is not None else None
+            try:
+                session_results = await async_simulate_dataset_replay(
+                    dataset_rows,
+                    swept_policy,
+                    classifier,
+                    brief=brief,
+                    calibration=calibration,
+                    templates=templates,
+                    store=sweep_store if cache_classifier else None,
+                    run_id=f"sweep-{idx}-{t_disp:.4f}",
+                    mode=mode,
+                    provider=iter_provider,
+                    health=health,
+                    simulated_latency_ms=simulated_latency_ms,
+                    cache_classifier=cache_classifier,
+                )
+            finally:
+                if iter_provider is not None:
+                    await iter_provider.cancel_recovery()
             all_cards = [c for res in session_results for c in res.displayed_cards]
             total_dur_ms = sum(max(600_000, res.duration_ms) for res in session_results)
             max_cap_10m = 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -439,10 +440,40 @@ class ProviderAdapter:
             if self.on_health_change is not None:
                 self.on_health_change(state)
 
+    def clone_isolated(self) -> ProviderAdapter:
+        """Return a fresh adapter sharing config/transport/client/callbacks without mutable state."""
+        clone = ProviderAdapter(
+            config=self.config,
+            transport=self.transport,
+            client=self.client,
+            egress_sink=self.egress_sink,
+            on_health_change=self.on_health_change,
+            clock_ms=self.clock_ms,
+            extra_capabilities=self.extra_capabilities,
+            validate_on_init=False,
+        )
+        clone._caps = self._caps
+        return clone
+
     def _cancel_recovery_task(self) -> None:
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
         self._recovery_task = None
+
+    async def cancel_recovery(self) -> None:
+        """Cancel and await any pending recovery task without closing caller-owned client."""
+        task = self._recovery_task
+        self._recovery_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if task.get_loop() is running_loop:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     def schedule_recovery(self) -> None:
         """Schedule an asyncio timer to move OPEN -> HALF_OPEN after breaker_open_ms."""
@@ -720,6 +751,6 @@ class ProviderAdapter:
                 await client.aclose()
 
     async def aclose(self) -> None:
-        self._cancel_recovery_task()
+        await self.cancel_recovery()
         if self.client is not None:
             await self.client.aclose()

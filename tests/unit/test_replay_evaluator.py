@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from dataclasses import replace
@@ -22,6 +23,7 @@ from coach.contracts import (
     ClosedBy,
     ControlSubtype,
     EventKind,
+    HealthState,
     LabelRecord,
     NoneReason,
     Participant,
@@ -35,10 +37,12 @@ from coach.contracts import (
     ValidityInterval,
 )
 from coach.opportunity_classifier import ClassifierInput, create_classifier
-from coach.provider_adapter import ProviderAdapter, ProviderConfig
+from coach.provider_adapter import BreakerState, ProviderAdapter, ProviderConfig
 from coach.replay_evaluator import (
     DisplayedCardEvent,
     EvalLookCounter,
+    async_simulate_dataset_replay,
+    async_sweep_dataset_t_display,
     match_opportunities,
     paired_conversation_bootstrap,
     run_latency_benchmark,
@@ -1043,3 +1047,126 @@ def test_splitters_support_nested_context_rows_and_objects() -> None:
         split_by_conversation([{"context": {"candidate_id": "c1"}, "serialized_text": "x"}])
     with pytest.raises(ValueError, match="session_id/conversation_id"):
         split_by_conversation([{"context": None, "serialized_text": "x"}])
+
+
+def test_async_sweep_dataset_t_display_isolates_provider_breaker_state(tmp_path: Path) -> None:
+    gen_policy_txt = (
+        POLICY_PATH.read_text(encoding="utf-8")
+        .replace("enabled: false", "enabled: true")
+        .replace("route: template", "route: generator", 1)
+        .replace("template: confirm_owner_v1", "template: null", 1)
+    )
+    gen_policy_path = tmp_path / "gen_sweep_isolation.yaml"
+    gen_policy_path.write_text(gen_policy_txt, encoding="utf-8")
+    base_policy = load_policy(gen_policy_path, calibration_metadata=default_calibration_metadata())
+    gen_policy = replace(
+        base_policy,
+        display=replace(base_policy.display, settle_ms=100, cooldown_ms=100),
+    )
+    clf = create_classifier("rules_v0")
+
+    dataset_rows: list[dict[str, object]] = []
+    for idx in range(3):
+        sid = f"sess-sweep-iso-{idx}"
+        state = CanonicalState(_brief(sid, max_cards=3))
+        state.apply(
+            _seg(
+                f"s-{idx}",
+                "Someone should own the rollback plan.",
+                session_id=sid,
+                speaker_id="S1",
+                start_ms=100 + idx * 1000,
+                end_ms=400 + idx * 1000,
+                received_ms=500 + idx * 1000,
+                seq=1,
+                boundary="utterance_end",
+            )
+        )
+        built = [
+            b for b in build_decision_contexts(state.snapshot(), policy=gen_policy) if not b.dropped
+        ]
+        assert len(built) == 1
+        assert built[0].context is not None and built[0].serialized_text is not None
+        dataset_rows.append(
+            {
+                "context": built[0].context.to_dict(),
+                "serialized_text": built[0].serialized_text,
+            }
+        )
+
+    http_calls = 0
+
+    def _failing_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        return httpx.Response(500, json={"error": "upstream failure"})
+
+    transport = httpx.MockTransport(_failing_handler)
+
+    async def _run() -> None:
+        nonlocal http_calls
+        async with httpx.AsyncClient(transport=transport) as shared_client:
+            provider = ProviderAdapter(
+                config=ProviderConfig(
+                    provider="local",
+                    base_url="http://127.0.0.1:8080/v1",
+                    model_id="qwen3:14b",
+                    use_streaming=False,
+                    breaker_consecutive_failures=2,
+                ),
+                transport=transport,
+                client=shared_client,
+                validate_on_init=False,
+            )
+
+            curve = await async_sweep_dataset_t_display(
+                dataset_rows,
+                [],
+                gen_policy,
+                clf,
+                [0.3, 0.6],
+                provider=provider,
+            )
+            assert [pt["t_display"] for pt in curve] == [0.3, 0.6]
+            # 2 failing calls per sweep iteration (breaker_consecutive_failures=2 trips on row 2)
+            assert http_calls == 4
+            assert provider.breaker_state is BreakerState.CLOSED
+            assert provider.health_state is HealthState.OK
+            assert not shared_client.is_closed
+
+            # Even when caller's provider is already OPEN / TEMPLATE_ONLY from a prior replay,
+            # async_sweep_dataset_t_display runs isolated and makes fresh HTTP calls.
+            open_provider = ProviderAdapter(
+                config=provider.config,
+                transport=transport,
+                client=shared_client,
+                validate_on_init=False,
+            )
+            http_calls = 0
+            await async_simulate_dataset_replay(
+                dataset_rows,
+                gen_policy,
+                clf,
+                provider=open_provider,
+            )
+            assert http_calls == 2
+            assert open_provider.breaker_state is BreakerState.OPEN
+            assert open_provider.health_state is HealthState.TEMPLATE_ONLY
+
+            http_calls = 0
+            curve_after_open = await async_sweep_dataset_t_display(
+                dataset_rows,
+                [],
+                gen_policy,
+                clf,
+                [0.3, 0.6],
+                provider=open_provider,
+            )
+            assert [pt["t_display"] for pt in curve_after_open] == [0.3, 0.6]
+            assert http_calls == 4
+            assert open_provider.breaker_state is BreakerState.OPEN
+            assert open_provider.health_state is HealthState.TEMPLATE_ONLY
+            assert not shared_client.is_closed
+            await open_provider.cancel_recovery()
+
+    asyncio.run(_run())

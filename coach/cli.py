@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import sys
@@ -914,6 +915,33 @@ def _try_load_dataset_rows(session_path: str | Path) -> list[dict[str, Any]] | N
     return rows if rows else None
 
 
+def _parse_sweep_t_display(raw: str | None) -> list[float] | None:
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        raise SystemExit(
+            f"--sweep-t-display must be a non-empty CSV of values in [0.0, 1.0], got {raw!r}"
+        )
+    parts = [part.strip() for part in stripped.split(",")]
+    if any(not part for part in parts):
+        raise SystemExit(f"--sweep-t-display contains an empty threshold token: {raw!r}")
+    values: list[float] = []
+    for part in parts:
+        try:
+            val = float(part)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--sweep-t-display requires numeric thresholds in [0.0, 1.0], got {part!r}"
+            ) from exc
+        if not math.isfinite(val) or not 0.0 <= val <= 1.0:
+            raise SystemExit(
+                f"--sweep-t-display thresholds must be finite floats in [0.0, 1.0], got {part!r}"
+            )
+        values.append(val)
+    return values
+
+
 def _pace_replay_events(events: Sequence[CanonicalEvent], speed_arg: str | None) -> None:
     if speed_arg is None or str(speed_arg).strip().lower() == "stepped":
         return
@@ -964,6 +992,7 @@ def _load_replay_events(
 
 def _cmd_replay(args: argparse.Namespace) -> int:
     policy, cal_obj = _load_policy_and_cal(args.policy, calibration_path=args.calibration)
+    t_vals = _parse_sweep_t_display(args.sweep_t_display)
     run_id = args.run_id or f"replay-{uuid.uuid4().hex[:10]}"
     dataset_rows = (
         _try_load_dataset_rows(args.session)
@@ -1002,21 +1031,27 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                 )
             if args.labels:
                 ds_labels = load_labels_jsonl(args.labels)
-            if args.sweep_t_display:
-                t_vals = [float(x.strip()) for x in args.sweep_t_display.split(",") if x.strip()]
-                sweep_res = sweep_dataset_t_display(
-                    dataset_rows,
-                    ds_labels,
-                    policy,
-                    clf,
-                    t_vals,
-                    brief=brief_opt,
-                    calibration=cal_obj,
-                    mode=mode,
-                    provider=provider,
-                    simulated_latency_ms=args.simulated_latency_ms,
-                    cache_classifier=not args.no_cache,
-                )
+            if t_vals is not None:
+                if provider is not None:
+                    provider._cancel_recovery_task()
+                sweep_provider = provider.clone_isolated() if provider is not None else None
+                try:
+                    sweep_res = sweep_dataset_t_display(
+                        dataset_rows,
+                        ds_labels,
+                        policy,
+                        clf,
+                        t_vals,
+                        brief=brief_opt,
+                        calibration=cal_obj,
+                        mode=mode,
+                        provider=sweep_provider,
+                        simulated_latency_ms=args.simulated_latency_ms,
+                        cache_classifier=not args.no_cache,
+                    )
+                finally:
+                    if sweep_provider is not None:
+                        sweep_provider._cancel_recovery_task()
         finally:
             if provider is not None:
                 asyncio.run(provider.aclose())
@@ -1174,8 +1209,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                 )
                 payload["eval_look_count"] = looks
                 payload["look_count"] = looks
-            if args.sweep_t_display:
-                t_vals = [float(x.strip()) for x in args.sweep_t_display.split(",") if x.strip()]
+            if t_vals is not None:
                 sweep_res = sweep_t_display(
                     session_briefs,
                     labels,
