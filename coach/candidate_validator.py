@@ -57,6 +57,22 @@ _PROMPT_INJECTION_RE = re.compile(
     r"(?:instructions|(?:system[-_\s]?)?prompt(?:\s+(?:rules|constraints))?|rules|constraints)\b",
     re.IGNORECASE,
 )
+_PROMPT_EXFILTRATION_RE = re.compile(
+    r"\b(?:print|output|show|repeat|disclose|dump|leak|echo)\s+"
+    r"(?:(?:all|any|the|of)\s+)*"
+    r"(?:"
+    r"(?:your|our|my|its)\s+"
+    r"(?:(?:all|any|previous|prior|above|earlier|preceding|system|policy|developer|hidden|internal|exact|full|raw)\s+)*"
+    r"(?:instructions|(?:system[-_\s]?)?prompt(?:\s+(?:rules|constraints))?)"
+    r"|"
+    r"(?:(?:the|all|any)\s+)*"
+    r"(?:previous|prior|above|earlier|preceding|system|policy|developer|hidden|internal)\s+"
+    r"(?:instructions|(?:system[-_\s]?)?prompt(?:\s+(?:rules|constraints))?)"
+    r"|"
+    r"(?:the\s+)?system[-_\s]prompt(?:\s+(?:rules|constraints))?"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _NUMBER_TOKEN_RE = re.compile(
     r"(?<![^\W_])[$€£]?(?:[a-zA-Z]+\d+|\d+)(?:[.,]\d+)*[a-zA-Z0-9%]*(?![^\W_])"
@@ -355,7 +371,7 @@ def _check_generated_safety(question: str) -> str | None:
         return "Question must not contain HTML tags"
     if _MARKDOWN_LINK_RE.search(question):
         return "Question must not contain markdown links"
-    if _PROMPT_INJECTION_RE.search(question):
+    if _PROMPT_INJECTION_RE.search(question) or _PROMPT_EXFILTRATION_RE.search(question):
         return "Question must not contain prompt-injection phrases"
     return None
 

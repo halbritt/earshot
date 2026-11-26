@@ -1170,17 +1170,6 @@ class SuggestionController:
         retry_pending = False
         async with self._state_lock:
             all_err = all(isinstance(r, ClassifierErrorResult) for r in clf_results)
-            if all_err:
-                self._consecutive_clf_errors += 1
-                if (
-                    self._consecutive_clf_errors >= self._classifier_error_threshold
-                    and self._health not in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED}
-                    and self._mode not in {Mode.PAUSED, Mode.OFF_THE_RECORD}
-                ):
-                    self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
-            else:
-                self._consecutive_clf_errors = 0
-
             current_snap = self._state.snapshot()
             cur_health = self.health
             if (
@@ -1194,6 +1183,12 @@ class SuggestionController:
                 or len(current_snap.gaps) > start_gaps_len
             ):
                 return False
+            if all_err:
+                self._consecutive_clf_errors += 1
+                if self._consecutive_clf_errors >= self._classifier_error_threshold:
+                    self._set_health(HealthState.MANUAL_ONLY, "classifier_errors")
+            else:
+                self._consecutive_clf_errors = 0
             recipient_ids = {"ME", current_snap.brief.recipient.participant_id}
             probe_ready = self._half_open_probe_ready()
             probe_reserved = False

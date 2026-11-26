@@ -753,6 +753,7 @@ class _ReplaySim:
         self.speaker_boundary_rx_ms: dict[str, int] = {}
         self.global_boundary_rx_ms: int = -1
         self.last_gap_ms: int | None = None
+        self.recovery_epoch: int = 0
         self.recipient_speaking = False
         self.recipient_speaking_until_ms = 0
         self.prev_anchor_norm: str | None = None
@@ -1046,13 +1047,19 @@ class _ReplaySim:
         if ev.kind is EventKind.CONTROL:
             if ev.subtype in {ControlSubtype.GAP, ControlSubtype.RECONNECT}:
                 self.last_gap_ms = ev.received_ms
+                self.recovery_epoch += 1
                 self.recipient_speaking = False
                 self.prev_anchor_norm = None
             elif ev.subtype is ControlSubtype.OFF_RECORD_START:
+                self.recovery_epoch += 1
                 self.prev_anchor_norm = None
                 self.prev_anchor_seg_ids.clear()
                 self.prev_anchor_rx_ms = None
                 self.prev_anchor_order_key = None
+            elif ev.subtype is ControlSubtype.OFF_RECORD_END:
+                self.last_gap_ms = ev.received_ms
+                self.recovery_epoch += 1
+                self.recipient_speaking = False
         elif ev.kind is EventKind.BOUNDARY:
             if ev.speaker_id is not None and ev.end_ms is not None:
                 prev_b = self.speaker_boundary_end_ms.get(ev.speaker_id)
@@ -1503,6 +1510,53 @@ class _ReplaySim:
             self.display_pending(item, cause=item.settle_cause, at_ms=now_ms)
         self.settling = still_settling
 
+    def _render_abort_state(
+        self,
+        *,
+        ctx: DecisionContext,
+        snap_at_route: StateSnapshot,
+        start_epoch: int,
+        start_gap_ms: int | None,
+        start_gaps_len: int,
+        cand: SuggestionCandidate | None = None,
+    ) -> tuple[str, ReasonCode] | None:
+        fresh_snap = self.state.snapshot()
+        stale_rev = any(
+            (cur_seg := fresh_snap.segments_by_id.get(ref.segment_id)) is None
+            or cur_seg.revision != ref.revision
+            or cur_seg.speaker_id in self.recipient_ids
+            for ref in ctx.anchor_refs
+        )
+        if not stale_rev and cand is not None:
+            stale_rev = any(
+                (cur_seg := fresh_snap.segments_by_id.get(ref.segment_id)) is None
+                or cur_seg.revision != ref.revision
+                for ref in cand.evidence_refs
+            )
+        if stale_rev:
+            return ("withdrawn", ReasonCode.EVIDENCE_REVISION_CHANGED)
+        if _replay_brief_material_key(fresh_snap.brief) != _replay_brief_material_key(
+            snap_at_route.brief
+        ):
+            return ("withdrawn", ReasonCode.OBJECTIVE_CHANGED)
+        if (
+            self.mode not in {Mode.PROACTIVE, Mode.SHADOW}
+            or fresh_snap.off_record
+            or not fresh_snap.brief.attention.proactive
+        ):
+            return ("suppressed", ReasonCode.PROACTIVE_DISABLED)
+        if (
+            self.recovery_epoch != start_epoch
+            or self.last_gap_ms != start_gap_ms
+            or len(fresh_snap.gaps) > start_gaps_len
+            or (self.last_gap_ms is not None and ctx.anchor_received_ms < self.last_gap_ms)
+            or self.sim_now_ms >= ctx.display_by_ms
+            or self.eff_health
+            in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED, HealthState.MANUAL_ONLY}
+        ):
+            return ("expired", ReasonCode.DISPLAY_BY_PASSED)
+        return None
+
     async def _render_and_enqueue(
         self,
         *,
@@ -1514,18 +1568,52 @@ class _ReplaySim:
         anchor: AnchorSpan,
     ) -> None:
         assert routing.category is not None
+        start_epoch = self.recovery_epoch
+        start_gap_ms = self.last_gap_ms
+        start_gaps_len = len(snap.gaps)
         eff_routing = routing
         cpol = self.policy.categories[routing.category]
         tpl = self.tpl_map.get(cpol.template) if cpol.template else None
         ready_ms = self.sim_now_ms
         cand: SuggestionCandidate | None = None
         fail_reason: ReasonCode | None = None
+        egress_recorded = False
+
+        pre_abort = self._render_abort_state(
+            ctx=ctx,
+            snap_at_route=snap,
+            start_epoch=start_epoch,
+            start_gap_ms=start_gap_ms,
+            start_gaps_len=start_gaps_len,
+        )
+        if pre_abort is not None:
+            t_state, t_reason = pre_abort
+            if t_state == "suppressed":
+                eff_rt = replace(
+                    eff_routing, outcome=Outcome.SUPPRESS, route=None, reason_codes=(t_reason,)
+                )
+            elif eff_routing.route is Route.GENERATOR:
+                eff_rt = replace(eff_routing, route=Route.TEMPLATE)
+            else:
+                eff_rt = eff_routing
+            if t_state == "withdrawn":
+                self.withdrawn_count += 1
+            elif t_state == "expired":
+                self.expired_count += 1
+            self.upsert_decision(
+                context=ctx,
+                terminal_state=t_state,
+                terminal_reason=t_reason,
+                classifier=clf_res,
+                routing=eff_rt,
+                serialized_text=serialized_text,
+            )
+            return
 
         if routing.route is Route.GENERATOR:
             if self.provider is not None:
                 orig_sink = self.provider.egress_sink
                 orig_clock = self.provider.clock_ms
-                egress_recorded = False
 
                 def _replay_clock_ms(_r: int = ready_ms) -> int:
                     return _r
@@ -1613,6 +1701,38 @@ class _ReplaySim:
                         cand = rendered.candidate
                     else:
                         fail_reason = val.reason_code or ReasonCode.SLOT_UNAVAILABLE
+
+        post_abort = self._render_abort_state(
+            ctx=ctx,
+            snap_at_route=snap,
+            start_epoch=start_epoch,
+            start_gap_ms=start_gap_ms,
+            start_gaps_len=start_gaps_len,
+            cand=cand,
+        )
+        if post_abort is not None:
+            t_state, t_reason = post_abort
+            if t_state == "suppressed" and not egress_recorded:
+                eff_rt = replace(
+                    eff_routing, outcome=Outcome.SUPPRESS, route=None, reason_codes=(t_reason,)
+                )
+            elif not egress_recorded and eff_routing.route is Route.GENERATOR:
+                eff_rt = replace(eff_routing, route=Route.TEMPLATE)
+            else:
+                eff_rt = eff_routing
+            if t_state == "withdrawn":
+                self.withdrawn_count += 1
+            elif t_state == "expired":
+                self.expired_count += 1
+            self.upsert_decision(
+                context=ctx,
+                terminal_state=t_state,
+                terminal_reason=t_reason,
+                classifier=clf_res,
+                routing=eff_rt,
+                serialized_text=serialized_text,
+            )
+            return
 
         if cand is None:
             t_reason = fail_reason or ReasonCode.SLOT_UNAVAILABLE
@@ -1812,6 +1932,11 @@ class _ReplaySim:
         *,
         has_overflow: bool,
     ) -> bool:
+        start_snap = self.state.snapshot()
+        start_recovery_epoch = self.recovery_epoch
+        start_gap_ms = self.last_gap_ms
+        start_gaps_len = len(start_snap.gaps)
+
         c_inputs = [ClassifierInput.from_build_result(b) for b, _ in surviving]
         t0 = time.perf_counter()
         if self.cache_classifier and self.store is not None:
@@ -1823,18 +1948,15 @@ class _ReplaySim:
             measured_ms, self.simulated_latency_ms, self.latency_distribution_ms, self.rng
         )
         all_err = all(isinstance(r, ClassifierErrorResult) for r in clf_results)
-        if all_err:
-            self.consecutive_clf_errors += 1
-            if self.consecutive_clf_errors >= self.classifier_error_threshold:
-                self.record_health(
-                    HealthState.MANUAL_ONLY, self.sim_now_ms + stage_ms, "classifier_errors"
-                )
-            elif stage_ms == 0 and any(
+        if (
+            all_err
+            and stage_ms == 0
+            and (self.consecutive_clf_errors + 1) < self.classifier_error_threshold
+            and any(
                 isinstance(r, ClassifierErrorResult) and r.error == "timeout" for r in clf_results
-            ):
-                stage_ms = 1
-        else:
-            self.consecutive_clf_errors = 0
+            )
+        ):
+            stage_ms = 1
 
         self.sim_now_ms += stage_ms
         self.latencies_ms.append(float(stage_ms))
@@ -1847,9 +1969,29 @@ class _ReplaySim:
         self.advance_display_timers(self.sim_now_ms)
 
         current_snap = self.state.snapshot()
+        if (
+            current_snap.off_record
+            or self.mode in {Mode.OFF_THE_RECORD, Mode.PAUSED}
+            or self.eff_health in {HealthState.NO_TRANSCRIPT, HealthState.PAUSED}
+            or (self.eff_health is HealthState.MANUAL_ONLY and not all_err)
+            or self.recovery_epoch != start_recovery_epoch
+            or self.last_gap_ms != start_gap_ms
+            or len(current_snap.gaps) > start_gaps_len
+        ):
+            return False
+
+        if all_err:
+            self.consecutive_clf_errors += 1
+            if self.consecutive_clf_errors >= self.classifier_error_threshold:
+                self.record_health(HealthState.MANUAL_ONLY, self.sim_now_ms, "classifier_errors")
+        else:
+            self.consecutive_clf_errors = 0
+
         retry_pending = False
         for (built, _norm), clf_raw in zip(surviving, clf_results, strict=True):
             assert built.context is not None and built.serialized_text is not None
+            if not all(self.cursor.is_uncovered(s) for s in built.anchor.segments):
+                continue
             ctx = built.context
             if self.cal_obj is not None and not isinstance(clf_raw, ClassifierErrorResult):
                 if isinstance(self.cal_obj, CalibrationRegistry):
@@ -1920,7 +2062,7 @@ class _ReplaySim:
                 continue
 
             self.cursor.mark_covered(built.anchor.segments)
-            route_health = self.eff_health
+            route_health: HealthState = self.eff_health
             if (
                 self.health_override is None
                 and self.provider is not None
