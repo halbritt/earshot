@@ -835,7 +835,15 @@ class NemotronSegmenter:
             return False
         overlapping = [g for g in self._gates if start_ms <= g.at_ms <= end_ms]
         if overlapping:
-            return any(not g.is_quality_ok for g in overlapping)
+            if any(not g.echo_residual_ok for g in overlapping):
+                return True
+            if any(g.speech_active for g in overlapping):
+                return False
+            return not any(
+                g.speech_active and g.echo_residual_ok
+                for g in self._gates
+                if start_ms <= g.at_ms <= end_ms + 300
+            )
         prior = [g for g in self._gates if g.at_ms <= start_ms]
         if prior:
             return not prior[-1].is_quality_ok
@@ -1711,6 +1719,10 @@ class PeeceeRealtimeAdapter:
     @property
     def commit_base_ms(self) -> int:
         return self._commit_base_ms
+
+    @property
+    def total_sent_ms(self) -> int:
+        return self._total_sent_ms
 
     @property
     def segmenter(self) -> NemotronSegmenter:

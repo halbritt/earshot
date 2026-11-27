@@ -27,6 +27,8 @@
   const btnEvidence = document.getElementById("btn-evidence");
 
   const btnMic = document.getElementById("btn-mic");
+  const micDeviceSelect = document.getElementById("mic-device-select");
+  const btnRespeaker = document.getElementById("btn-respeaker");
   const btnTestAudio = document.getElementById("btn-test-audio");
   const fileAudioInput = document.getElementById("file-audio-input");
   const micMeterFill = document.getElementById("mic-meter-fill");
@@ -108,7 +110,39 @@
     btnEvidence.setAttribute("aria-expanded", evidenceOpen ? "true" : "false");
   }
 
+  function renderRespeakerStatus() {
+    const rs = lastFeed.respeaker;
+    if (!rs || !rs.configured) {
+      btnRespeaker.classList.add("hidden");
+      return;
+    }
+    btnRespeaker.classList.remove("hidden");
+    const st = String(rs.status || "waiting");
+    btnRespeaker.className = "btn-respeaker " + st;
+    if (!rs.enabled) {
+      btnRespeaker.textContent = "ReSpeaker: Muted";
+    } else if (st === "streaming" || st === "paused") {
+      btnRespeaker.textContent = "ReSpeaker: " + String(rs.detail || st);
+    } else if (st === "connecting") {
+      btnRespeaker.textContent = "ReSpeaker: Connecting...";
+    } else {
+      btnRespeaker.textContent = "ReSpeaker: Waiting for device...";
+    }
+    if (activeAudioMode === "idle") {
+      if (st === "streaming" && rs.enabled) {
+        const lvl = typeof rs.level_db === "number" ? rs.level_db : -90;
+        const pct = Math.max(0, Math.min(100, Math.round(((lvl + 60) / 50) * 100)));
+        micMeterFill.style.width = pct + "%";
+        audioStatus.textContent = "ReSpeaker " + String(rs.detail || "Live") + " -> peecee-speech";
+      } else if (audioStatus.textContent.startsWith("ReSpeaker ")) {
+        micMeterFill.style.width = "0%";
+        audioStatus.textContent = "Audio idle";
+      }
+    }
+  }
+
   function renderInspector() {
+    renderRespeakerStatus();
     if (lastFeed.has_test_audio) btnTestAudio.classList.remove("hidden");
     clearChildren(inspectorList);
     if (activeTab === "asr") {
@@ -242,14 +276,46 @@
     }
   }
 
+  async function refreshMicDevices() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devs.filter((d) => d.kind === "audioinput");
+      if (!inputs.length) return;
+      const prev = micDeviceSelect.value;
+      clearChildren(micDeviceSelect);
+      const defOpt = document.createElement("option");
+      defOpt.value = "";
+      defOpt.textContent = "Default Mic";
+      micDeviceSelect.appendChild(defOpt);
+      let respeakerId = "";
+      for (const dev of inputs) {
+        const opt = document.createElement("option");
+        opt.value = dev.deviceId || "";
+        opt.textContent = dev.label || ("Mic " + micDeviceSelect.length);
+        micDeviceSelect.appendChild(opt);
+        if (!respeakerId && /respeaker/i.test(opt.textContent) && opt.value) respeakerId = opt.value;
+      }
+      if (prev && Array.from(micDeviceSelect.options).some((o) => o.value === prev)) {
+        micDeviceSelect.value = prev;
+      } else if (respeakerId) {
+        micDeviceSelect.value = respeakerId;
+      }
+      micDeviceSelect.classList.remove("hidden");
+    } catch (_e) {}
+  }
+
   async function startMicStream() {
     if (activeAudioMode === "mic") { stopMicStream(); return; }
     if (!liveAudioEl.paused) liveAudioEl.pause();
     const ctx = ensureAudioCtx();
+    const chosenId = micDeviceSelect ? micDeviceSelect.value : "";
+    const audioCfg = chosenId
+      ? { deviceId: { exact: chosenId }, echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+      : { echoCancellation: true, noiseSuppression: true, channelCount: 1 };
     try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-      });
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: audioCfg });
+      refreshMicDevices();
     } catch (err) {
       audioStatus.textContent = "Mic denied: " + String(err.message || err);
       return;
@@ -347,6 +413,14 @@
   modeSelect.addEventListener("change", () => sendAction("mode", { mode: modeSelect.value }));
 
   btnMic.addEventListener("click", () => { startMicStream(); });
+  btnRespeaker.addEventListener("click", () => {
+    const cur = !lastFeed.respeaker || lastFeed.respeaker.enabled !== false;
+    sendAction("toggle_respeaker", { enabled: !cur });
+  });
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener("devicechange", () => { refreshMicDevices(); });
+  }
+  refreshMicDevices();
   btnTestAudio.addEventListener("click", () => {
     loadMediaUrl("./test-audio?token=" + encodeURIComponent(token), "5-Min Test Conversation");
   });

@@ -9,6 +9,8 @@ import contextlib
 import json
 import math
 import os
+import shlex
+import shutil
 import signal
 import sys
 import time
@@ -107,6 +109,7 @@ from coach.transcript_adapter import (
     BinderConfig,
     Clock,
     DeepgramNormalizer,
+    DirectionSample,
     EarshotGateSample,
     ManualClock,
     MonotonicSessionClock,
@@ -593,11 +596,19 @@ def _build_live_feed_provider(
     session_id: str,
     run_id: str,
     audio_stats: dict[str, int],
+    respeaker_state: dict[str, Any] | None = None,
 ) -> Callable[[], dict[str, Any]]:
     def _provide() -> dict[str, Any]:
         snap = controller.canonical_state.snapshot()
         if controller.mode is Mode.OFF_THE_RECORD or snap.off_record:
-            return {"segments": [], "decisions": [], "audio_rx_bytes": audio_stats.get("bytes", 0)}
+            out: dict[str, Any] = {
+                "segments": [],
+                "decisions": [],
+                "audio_rx_bytes": audio_stats.get("bytes", 0),
+            }
+            if respeaker_state is not None:
+                out["respeaker"] = dict(respeaker_state)
+            return out
         roles = assign_speaker_roles(snap)
         segs: list[dict[str, Any]] = []
         for seg in snap.segments[-30:]:
@@ -635,11 +646,14 @@ def _build_live_feed_provider(
                 }
             )
         decs_out.reverse()
-        return {
+        res_out: dict[str, Any] = {
             "segments": segs,
             "decisions": decs_out,
             "audio_rx_bytes": audio_stats.get("bytes", 0),
         }
+        if respeaker_state is not None:
+            res_out["respeaker"] = dict(respeaker_state)
+        return res_out
 
     return _provide
 
@@ -669,6 +683,23 @@ async def _serve_async(args: argparse.Namespace) -> int:
     mode = Mode(args.mode)
     run_id = args.run_id or f"serve-{uuid.uuid4().hex[:10]}"
     audio_stats: dict[str, int] = {"bytes": 0}
+    respeaker_hosts_raw = (
+        getattr(args, "respeaker_host", None) or os.environ.get("COACH_RESPEAKER_HOST", "") or ""
+    ).strip()
+    capture_cmd_raw = (getattr(args, "earshot_capture_cmd", None) or "").strip()
+    respeaker_configured = bool(respeaker_hosts_raw or capture_cmd_raw)
+    respeaker_state: dict[str, Any] = {
+        "configured": respeaker_configured,
+        "enabled": True,
+        "status": "waiting" if respeaker_configured else "disabled",
+        "host": None,
+        "detail": "Waiting for ReSpeaker..." if respeaker_configured else "",
+        "steer_deg": None,
+        "azimuth_deg": None,
+        "level_db": None,
+        "speech_active": False,
+    }
+    ui_activity: dict[str, float] = {"last_mono": 0.0}
 
     with SQLiteStore(args.db) as store:
         rec_buf = BoundedRecorderBuffer(maxsize=_recorder_maxsize_from_env())
@@ -694,7 +725,9 @@ async def _serve_async(args: argparse.Namespace) -> int:
             ui_server=ui_server,
         )
         ui_server.set_feed_provider(
-            _build_live_feed_provider(controller, store, brief.session_id, run_id, audio_stats)
+            _build_live_feed_provider(
+                controller, store, brief.session_id, run_id, audio_stats, respeaker_state
+            )
         )
         await ui_server.start()
         await controller.start()
@@ -734,6 +767,8 @@ async def _serve_async(args: argparse.Namespace) -> int:
                 clock=clock,
                 ui_server=ui_server,
                 audio_stats=audio_stats,
+                respeaker_state=respeaker_state,
+                ui_activity=ui_activity,
             )
         )
         stop_task = asyncio.create_task(stop_event.wait())
@@ -794,7 +829,6 @@ def _pcm16_rms_db(pcm_bytes: bytes) -> tuple[float, float]:
 async def _pump_ui_audio_to_peecee(
     adapter: PeeceeRealtimeAdapter,
     audio_q: asyncio.Queue[bytes],
-    clock: Clock,
     stop_event: asyncio.Event,
 ) -> None:
     hangover = 0
@@ -807,7 +841,7 @@ async def _pump_ui_audio_to_peecee(
             elif hangover > 0:
                 hangover -= 1
             gate = EarshotGateSample(
-                at_ms=clock.now_ms(),
+                at_ms=adapter.total_sent_ms,
                 speech_active=rms >= 200.0 or hangover > 0,
                 level_db=level_db,
                 playback_active=False,
@@ -822,6 +856,387 @@ async def _pump_ui_audio_to_peecee(
             audio_q.task_done()
 
 
+_RESPEAKER_CAPTURE_SH = (
+    "sudo -n systemctl stop rsp-stt.service 2>/dev/null || true; "
+    "trap 'sudo -n systemctl start rsp-stt.service >/dev/null 2>&1 || true' EXIT INT TERM HUP; "
+    "if [ -x /opt/rsp-stt/rsp-aec ]; then "
+    "arecord -q -D hw:0,0 -f S32_LE -r 16000 -c 8 -t raw --buffer-time=500000 "
+    "| /opt/rsp-stt/rsp-aec --gain 10; "
+    "else "
+    "arecord -q -D hw:0,0 -f S32_LE -r 16000 -c 8 -t raw --buffer-time=500000; "
+    "fi"
+)
+
+
+def _resolve_earshot_bin(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    env_bin = os.environ.get("COACH_EARSHOT_BIN")
+    if env_bin:
+        return Path(env_bin)
+    found = shutil.which("earshot")
+    if found:
+        return Path(found)
+    return Path.home() / ".cache" / "earshot-target" / "release" / "earshot"
+
+
+def _build_ssh_cmd(host: str, via: str, remote_cmd: str) -> list[str]:
+    base = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=2",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if via:
+        inner = " ".join(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=2",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                host,
+                shlex.quote(remote_cmd),
+            ]
+        )
+        return [*base, via, inner]
+    return [*base, host, remote_cmd]
+
+
+async def _terminate_proc_group(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    with contextlib.suppress(OSError, ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.5)
+    except TimeoutError:
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+
+
+async def _probe_ssh_host(host: str, via: str) -> bool:
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_build_ssh_cmd(host, via, "true"),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        rc = await asyncio.wait_for(proc.wait(), timeout=3.5)
+        return rc == 0
+    except TimeoutError, OSError:
+        await _terminate_proc_group(proc)
+        return False
+
+
+async def _restore_respeaker_stt(host: str, via: str) -> None:
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_build_ssh_cmd(
+                host, via, "sudo -n systemctl start rsp-stt.service >/dev/null 2>&1 || true"
+            ),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=3.5)
+    except TimeoutError, OSError:
+        await _terminate_proc_group(proc)
+
+
+async def _read_earshot_stderr(
+    ear_stderr: asyncio.StreamReader,
+    adapter: PeeceeRealtimeAdapter,
+    binder: RecipientBinder,
+    respeaker_state: dict[str, Any],
+    latest_gate: dict[str, Any],
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        raw = await ear_stderr.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        az = obj.get("azimuth")
+        ct = obj.get("contrast")
+        lvl = obj.get("level_db")
+        steer = obj.get("steer_deg")
+        latest_gate["speech_active"] = bool(obj.get("speech_active", False))
+        latest_gate["echo_residual_ok"] = bool(obj.get("echo_residual_ok", True))
+        latest_gate["playback_active"] = bool(obj.get("playback_active", False))
+        latest_gate["azimuth_deg"] = float(az) if isinstance(az, (int, float)) else None
+        latest_gate["contrast"] = float(ct) if isinstance(ct, (int, float)) else None
+        latest_gate["level_db"] = float(lvl) if isinstance(lvl, (int, float)) else -90.0
+        respeaker_state["steer_deg"] = float(steer) if isinstance(steer, (int, float)) else None
+        respeaker_state["azimuth_deg"] = latest_gate["azimuth_deg"]
+        respeaker_state["level_db"] = latest_gate["level_db"]
+        respeaker_state["speech_active"] = latest_gate["speech_active"]
+        if az is not None and ct is not None:
+            binder.feed_direction(
+                DirectionSample(
+                    t_ms=adapter.total_sent_ms,
+                    azimuth_deg=float(az),
+                    contrast=float(ct),
+                    level_db=float(lvl) if isinstance(lvl, (int, float)) else -60.0,
+                )
+            )
+
+
+async def _pump_earshot_stdout(
+    ear_stdout: asyncio.StreamReader,
+    adapter: PeeceeRealtimeAdapter,
+    controller: SuggestionController,
+    respeaker_state: dict[str, Any],
+    latest_gate: dict[str, Any],
+    ui_activity: dict[str, float],
+    audio_stats: dict[str, int],
+    stop_event: asyncio.Event,
+) -> None:
+    buf = bytearray()
+    while not stop_event.is_set() and respeaker_state.get("enabled", True):
+        try:
+            chunk = await asyncio.wait_for(ear_stdout.read(5120), timeout=0.5)
+        except TimeoutError:
+            continue
+        if not chunk:
+            break
+        buf.extend(chunk)
+        while len(buf) >= 5120:
+            frame = bytes(buf[:5120])
+            del buf[:5120]
+            if time.monotonic() - ui_activity.get("last_mono", 0.0) < 1.5:
+                respeaker_state["status"] = "paused"
+                respeaker_state["detail"] = "Yielded to browser audio"
+                continue
+            if controller.mode in {Mode.PAUSED, Mode.OFF_THE_RECORD}:
+                respeaker_state["status"] = "paused"
+                respeaker_state["detail"] = f"Coach mode: {controller.mode}"
+                continue
+            audio_stats["bytes"] = audio_stats.get("bytes", 0) + len(frame)
+            steer = respeaker_state.get("steer_deg")
+            az = respeaker_state.get("azimuth_deg")
+            steer_txt = f"beam {steer:.0f}°" if isinstance(steer, (int, float)) else "beam auto"
+            az_txt = f" · az {az:.0f}°" if isinstance(az, (int, float)) else ""
+            respeaker_state["status"] = "streaming"
+            respeaker_state["detail"] = f"Live · {steer_txt}{az_txt}"
+            gate = EarshotGateSample(
+                at_ms=adapter.total_sent_ms,
+                speech_active=bool(latest_gate["speech_active"]),
+                echo_residual_ok=bool(latest_gate["echo_residual_ok"]),
+                playback_active=bool(latest_gate["playback_active"]),
+                azimuth_deg=latest_gate["azimuth_deg"],
+                contrast=latest_gate["contrast"],
+                level_db=latest_gate["level_db"],
+            )
+            await adapter.send_audio_pcm16(frame, gate=gate, pace_realtime=False, pad_last=False)
+
+
+async def _drain_stream_eof(stream: asyncio.StreamReader | None) -> None:
+    if stream is None:
+        return
+    while await stream.readline():
+        pass
+
+
+async def _pump_cap_to_earshot(
+    cap_stdout: asyncio.StreamReader,
+    ear_stdin: asyncio.StreamWriter,
+    respeaker_state: dict[str, Any],
+    stop_event: asyncio.Event,
+) -> None:
+    try:
+        while not stop_event.is_set() and respeaker_state.get("enabled", True):
+            raw = await cap_stdout.read(8192)
+            if not raw:
+                break
+            ear_stdin.write(raw)
+            await ear_stdin.drain()
+    except BrokenPipeError, OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            ear_stdin.close()
+
+
+async def _run_respeaker_earshot_session(
+    *,
+    cap_cmd: Sequence[str],
+    earshot_bin: Path,
+    array_path: str,
+    adapter: PeeceeRealtimeAdapter,
+    binder: RecipientBinder,
+    controller: SuggestionController,
+    respeaker_state: dict[str, Any],
+    ui_activity: dict[str, float],
+    audio_stats: dict[str, int],
+    stop_event: asyncio.Event,
+) -> None:
+    cap_proc = await asyncio.create_subprocess_exec(
+        *cap_cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    ear_proc = await asyncio.create_subprocess_exec(
+        str(earshot_bin),
+        "stream",
+        "--array",
+        array_path,
+        "--steer",
+        "auto",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert cap_proc.stdout is not None and ear_proc.stdin is not None
+    assert ear_proc.stdout is not None and ear_proc.stderr is not None
+    latest_gate: dict[str, Any] = {
+        "speech_active": False,
+        "echo_residual_ok": True,
+        "playback_active": False,
+        "azimuth_deg": None,
+        "contrast": None,
+        "level_db": -90.0,
+    }
+    tasks = [
+        asyncio.create_task(
+            _pump_cap_to_earshot(cap_proc.stdout, ear_proc.stdin, respeaker_state, stop_event)
+        ),
+        asyncio.create_task(_drain_stream_eof(cap_proc.stderr)),
+        asyncio.create_task(
+            _read_earshot_stderr(
+                ear_proc.stderr, adapter, binder, respeaker_state, latest_gate, stop_event
+            )
+        ),
+        asyncio.create_task(
+            _pump_earshot_stdout(
+                ear_proc.stdout,
+                adapter,
+                controller,
+                respeaker_state,
+                latest_gate,
+                ui_activity,
+                audio_stats,
+                stop_event,
+            )
+        ),
+    ]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await _terminate_proc_group(ear_proc)
+        await _terminate_proc_group(cap_proc)
+
+
+async def _run_respeaker_earshot_loop(
+    *,
+    args: argparse.Namespace,
+    adapter: PeeceeRealtimeAdapter,
+    binder: RecipientBinder,
+    controller: SuggestionController,
+    respeaker_state: dict[str, Any],
+    ui_activity: dict[str, float],
+    audio_stats: dict[str, int],
+    stop_event: asyncio.Event,
+) -> None:
+    hosts = [
+        h.strip()
+        for h in (
+            getattr(args, "respeaker_host", None)
+            or os.environ.get("COACH_RESPEAKER_HOST", "")
+            or ""
+        ).split(",")
+        if h.strip()
+    ]
+    via = (
+        getattr(args, "respeaker_via", None) or os.environ.get("COACH_RESPEAKER_VIA", "") or ""
+    ).strip()
+    capture_cmd = (getattr(args, "earshot_capture_cmd", None) or "").strip()
+    if not hosts and not capture_cmd:
+        return
+    earshot_bin = _resolve_earshot_bin(getattr(args, "earshot_bin", None))
+    array_path = str(Path(getattr(args, "earshot_array", None) or "arrays/respeaker-core-v2.toml"))
+
+    while not stop_event.is_set():
+        if not respeaker_state.get("enabled", True):
+            respeaker_state["status"] = "disabled"
+            respeaker_state["detail"] = "ReSpeaker muted"
+            await asyncio.sleep(0.4)
+            continue
+        if not earshot_bin.exists():
+            respeaker_state["status"] = "waiting"
+            respeaker_state["detail"] = f"Missing earshot binary: {earshot_bin}"
+            await asyncio.sleep(3.0)
+            continue
+
+        chosen_host: str | None = None
+        if capture_cmd:
+            cap_argv: list[str] = ["/bin/sh", "-c", capture_cmd]
+        else:
+            respeaker_state["status"] = "waiting"
+            respeaker_state["host"] = None
+            respeaker_state["detail"] = f"Waiting for {', '.join(hosts)}..."
+            for candidate in hosts:
+                if stop_event.is_set() or not respeaker_state.get("enabled", True):
+                    break
+                if await _probe_ssh_host(candidate, via):
+                    chosen_host = candidate
+                    break
+            if chosen_host is None:
+                await asyncio.sleep(2.5)
+                continue
+            cap_argv = _build_ssh_cmd(chosen_host, via, _RESPEAKER_CAPTURE_SH)
+
+        respeaker_state["status"] = "connecting"
+        respeaker_state["host"] = chosen_host or "local"
+        respeaker_state["detail"] = f"Starting earshot on {chosen_host or 'local'}..."
+        try:
+            await _run_respeaker_earshot_session(
+                cap_cmd=cap_argv,
+                earshot_bin=earshot_bin,
+                array_path=array_path,
+                adapter=adapter,
+                binder=binder,
+                controller=controller,
+                respeaker_state=respeaker_state,
+                ui_activity=ui_activity,
+                audio_stats=audio_stats,
+                stop_event=stop_event,
+            )
+        except Exception as exc:
+            respeaker_state["status"] = "waiting"
+            respeaker_state["detail"] = f"ReSpeaker stream error: {exc}"
+        finally:
+            if chosen_host is not None:
+                await _restore_respeaker_stt(chosen_host, via)
+        await asyncio.sleep(1.0)
+
+
 async def _run_serve_source(
     args: argparse.Namespace,
     brief: SessionBrief,
@@ -834,6 +1249,8 @@ async def _run_serve_source(
     clock: Clock,
     ui_server: CardUIServer | None = None,
     audio_stats: dict[str, int] | None = None,
+    respeaker_state: dict[str, Any] | None = None,
+    ui_activity: dict[str, float] | None = None,
 ) -> None:
     binder = _make_binder_from_env(brief)
     if args.source == "replay" or (args.source == "peecee" and args.stream_file):
@@ -950,6 +1367,8 @@ async def _run_serve_source(
         def _on_ui_audio(chunk: bytes) -> None:
             if controller.mode in {Mode.OFF_THE_RECORD, Mode.PAUSED}:
                 return
+            if ui_activity is not None:
+                ui_activity["last_mono"] = time.monotonic()
             if audio_stats is not None:
                 audio_stats["bytes"] = audio_stats.get("bytes", 0) + len(chunk)
             if audio_q.full():
@@ -960,11 +1379,20 @@ async def _run_serve_source(
                 audio_q.put_nowait(chunk)
 
         async def _on_ui_action_with_commit(msg: dict[str, Any]) -> dict[str, Any] | None:
-            if str(msg.get("action") or "").strip().lower() == "commit_audio":
+            act = str(msg.get("action") or "").strip().lower()
+            if act == "commit_audio":
                 cur_ad = active_adapter[0]
                 if cur_ad is not None:
                     with contextlib.suppress(Exception):
                         await cur_ad.commit_audio()
+                return None
+            if act == "toggle_respeaker" and respeaker_state is not None:
+                enabled = bool(msg.get("enabled", not respeaker_state.get("enabled", True)))
+                respeaker_state["enabled"] = enabled
+                respeaker_state["status"] = "waiting" if enabled else "disabled"
+                respeaker_state["detail"] = (
+                    "Reconnecting ReSpeaker..." if enabled else "ReSpeaker muted"
+                )
                 return None
             return await controller.handle_ui_action(msg)
 
@@ -997,6 +1425,7 @@ async def _run_serve_source(
         active_adapter[0] = adapter
         wav_task: asyncio.Task[None] | None = None
         pump_task: asyncio.Task[None] | None = None
+        respeaker_task: asyncio.Task[None] | None = None
         try:
             try:
                 await adapter.connect()
@@ -1010,10 +1439,24 @@ async def _run_serve_source(
                 continue
             if args.audio_wav:
                 wav_task = asyncio.create_task(_stream_wav_to_peecee(adapter, args.audio_wav))
-            elif ui_server is not None:
-                pump_task = asyncio.create_task(
-                    _pump_ui_audio_to_peecee(adapter, audio_q, clock, stop_event)
-                )
+            else:
+                if ui_server is not None:
+                    pump_task = asyncio.create_task(
+                        _pump_ui_audio_to_peecee(adapter, audio_q, stop_event)
+                    )
+                if respeaker_state is not None and respeaker_state.get("configured"):
+                    respeaker_task = asyncio.create_task(
+                        _run_respeaker_earshot_loop(
+                            args=args,
+                            adapter=adapter,
+                            binder=binder,
+                            controller=controller,
+                            respeaker_state=respeaker_state,
+                            ui_activity=ui_activity or {},
+                            audio_stats=audio_stats if audio_stats is not None else {},
+                            stop_event=stop_event,
+                        )
+                    )
             async for ev in adapter.events():
                 if stop_event.is_set():
                     break
@@ -1022,7 +1465,7 @@ async def _run_serve_source(
                 await wav_task
         finally:
             active_adapter[0] = None
-            for bg_task in (wav_task, pump_task):
+            for bg_task in (wav_task, pump_task, respeaker_task):
                 if bg_task is not None and not bg_task.done():
                     bg_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -2003,6 +2446,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.add_argument("--ws-url", default=None, help="Realtime peecee-speech WebSocket URL")
     p_serve.add_argument("--peecee-cmd", default=None, help="Path to peecee-speech launcher")
+    p_serve.add_argument(
+        "--respeaker-host",
+        default="",
+        help="ReSpeaker SSH host(s), comma-separated (e.g. respeaker-next,respeaker)",
+    )
+    p_serve.add_argument(
+        "--respeaker-via",
+        default="",
+        help="Optional SSH jump host holding board key (ssh <via> ssh <host>)",
+    )
+    p_serve.add_argument(
+        "--earshot-array",
+        default="arrays/respeaker-core-v2.toml",
+        help="Path to earshot array layout TOML",
+    )
+    p_serve.add_argument("--earshot-bin", default=None, help="Path to earshot CLI binary")
+    p_serve.add_argument(
+        "--earshot-capture-cmd",
+        default=None,
+        help="Optional local shell command producing raw array frames on stdout",
+    )
     p_serve.add_argument("--ui-port", type=int, default=8765, help="Loopback UI port (0=ephemeral)")
     p_serve.add_argument("--ui-token", default=None, help="Optional fixed UI session token")
     p_serve.add_argument(

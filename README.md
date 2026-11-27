@@ -8,7 +8,7 @@ Two-layer live conversation audio front end and conversation coach:
 ## Repository Layout
 
 - `crates/earshot-core/`: `no_std` array geometry, delay-and-sum/superdirective beamforming, SRP-PHAT azimuth direction finding, and FFT transform.
-- `crates/earshot-cli/`: `earshot` CLI (`beam`, `direction`).
+- `crates/earshot-cli/`: `earshot` CLI (`beam`, `direction`, `stream`).
 - `crates/earshot-bench/`: replay benchmark scoring front-end variants by WER and CPU time.
 - `coach/`: 14 §15 modules (`transcript_adapter`, `canonical_state` + `contracts` + `storage`, `context_builder`, `opportunity_classifier`, `calibration`, `routing_policy`, `template_renderer`, `question_generator`, `provider_adapter`, `candidate_validator`, `suggestion_controller`, `replay_evaluator`, `annotation_tool`, `telemetry`), `coach/ui/`, and `coach/cli.py` (`coach`).
 - `policies/`: immutable versioned policy (`policies/policy-v0-a.yaml`) and grounded YAML templates (`policies/templates/*.yaml`).
@@ -20,7 +20,7 @@ Two-layer live conversation audio front end and conversation coach:
 
 Install/sync Python dependencies with `uv sync --frozen`, then invoke `uv run coach <subcommand>`:
 
-- `coach serve --brief <brief.json> --policy <policy.yaml> --db <coach.db> [--source peecee|deepgram|replay] [--stream-file <path>] [--ws-url <url>] [--ui-port <port>] [--local-only]`: runs the 5-task `asyncio` runtime and private `127.0.0.1` token-gated Card UI.
+- `coach serve --brief <brief.json> --policy <policy.yaml> --db <coach.db> [--source peecee|deepgram|replay] [--stream-file <path>] [--ws-url <url>] [--respeaker-host <hosts>] [--respeaker-via <ssh_host>] [--earshot-array <toml>] [--ui-port <port>] [--local-only]`: runs the 5-task `asyncio` runtime and private `127.0.0.1` token-gated Card UI.
 - `coach replay --session <jsonl|db> --policy <policy.yaml> [--db <coach.db>] [--labels <labels.jsonl>] [--split-by conversation|series] [--eval-log <path>] [--sweep-t-display <csv>] [--json]`: deterministic policy-level replay and validity-interval opportunity matching.
 - `coach diff --db <coach.db> --run-a <id> --run-b <id> [--labels <labels.jsonl>] [--bootstrap] [--json]`: compares gained/lost/changed cards across two runs, with optional paired conversation bootstrap.
 - `coach report --db <coach.db> --session <id> [--run-id <id>] [--json]`: generates per-session report and checks all 6 §13.2 conservation invariants.

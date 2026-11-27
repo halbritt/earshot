@@ -1754,3 +1754,48 @@ async def test_send_audio_pcm16_truncates_odd_trailing_byte() -> None:
     sent3 = await adapter.send_audio_pcm16(b"\xaa")
     assert sent3 == 0
     assert len(adapter._utterance_audio) == 6402
+
+
+def test_gate_quality_allows_onset_boundary_and_blocks_silence_or_echo() -> None:
+    payload = {
+        "text": "Before launch we need someone to own it",
+        "words": [
+            {"word": "Before", "start": 1.00, "end": 1.25, "confidence": 1.0, "speaker": 1},
+            {"word": "launch", "start": 1.25, "end": 1.55, "confidence": 1.0, "speaker": 1},
+        ],
+    }
+    onset_gates = [
+        EarshotGateSample(at_ms=1000, speech_active=False, echo_residual_ok=True),
+        EarshotGateSample(at_ms=1160, speech_active=True, echo_residual_ok=True),
+        EarshotGateSample(at_ms=1320, speech_active=True, echo_residual_ok=True),
+        EarshotGateSample(at_ms=1480, speech_active=True, echo_residual_ok=True),
+    ]
+    evs_ok = parse_nemo_offline_json(payload, session_id="s-onset", gates=onset_gates)
+    segs_ok = [
+        e for e in evs_ok if e.kind is EventKind.SEGMENT and e.stability is Stability.COMMITTED
+    ]
+    assert len(segs_ok) == 1
+    assert segs_ok[0].low_quality_gate is False
+
+    silent_gates = [
+        EarshotGateSample(at_ms=ms, speech_active=False, echo_residual_ok=True)
+        for ms in (1000, 1160, 1320, 1480, 1640, 1800)
+    ]
+    evs_sil = parse_nemo_offline_json(payload, session_id="s-sil", gates=silent_gates)
+    segs_sil = [
+        e for e in evs_sil if e.kind is EventKind.SEGMENT and e.stability is Stability.COMMITTED
+    ]
+    assert len(segs_sil) == 1
+    assert segs_sil[0].low_quality_gate is True
+
+    echo_gates = [
+        EarshotGateSample(at_ms=1000, speech_active=True, echo_residual_ok=True),
+        EarshotGateSample(at_ms=1160, speech_active=True, echo_residual_ok=False),
+        EarshotGateSample(at_ms=1320, speech_active=True, echo_residual_ok=True),
+    ]
+    evs_echo = parse_nemo_offline_json(payload, session_id="s-echo", gates=echo_gates)
+    segs_echo = [
+        e for e in evs_echo if e.kind is EventKind.SEGMENT and e.stability is Stability.COMMITTED
+    ]
+    assert len(segs_echo) == 1
+    assert segs_echo[0].low_quality_gate is True

@@ -30,6 +30,8 @@
     <section class="audio-input-bar" aria-label="Live Audio Input">
       <div class="audio-controls-row">
         <button id="btn-mic" type="button" class="btn-primary">Start Live Mic</button>
+        <select id="mic-device-select" class="mic-select hidden" aria-label="Browser microphone device"></select>
+        <button id="btn-respeaker" type="button" class="btn-respeaker hidden"></button>
         <button id="btn-test-audio" type="button" class="hidden">Stream 5-Min Test Audio Live</button>
         <label class="file-btn" for="file-audio-input">Load Local Audio<input id="file-audio-input" type="file" accept="audio/*" /></label>
         <div class="meter-wrap" title="Live input level"><div id="mic-meter-fill" class="meter-fill"></div></div>

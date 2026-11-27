@@ -1,6 +1,7 @@
 //! earshot: command-line front end for the microphone-array core.
 mod follow;
 mod layout;
+mod stream;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use earshot_core::beam::{Beam, Kind};
@@ -62,6 +63,30 @@ enum Command {
         #[arg(long, default_value_t = 20.0)]
         elevation: f64,
         /// Raw interleaved recording
+        input: PathBuf,
+    },
+    /// Stream continuous interleaved PCM from stdin (or file), writing 16 kHz mono PCM16 to stdout
+    /// and emitting JSONL gate/direction telemetry on stderr.
+    Stream {
+        /// Array description (TOML)
+        #[arg(long)]
+        array: PathBuf,
+        /// Beam look direction: `auto` to follow the talker or DEGREES
+        #[arg(long, default_value = "auto")]
+        steer: String,
+        /// Degrees above the plane of the array
+        #[arg(long, default_value_t = 20.0)]
+        elevation: f64,
+        #[arg(long, value_enum, default_value = "superdirective")]
+        kind: BeamKind,
+        /// Lowest white-noise gain a superdirective beam may have, dB
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        white_noise_gain: f64,
+        /// Gain applied to the output, dB
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        gain: f64,
+        /// Raw interleaved input (`-` for standard input)
+        #[arg(long, default_value = "-")]
         input: PathBuf,
     },
 }
@@ -238,6 +263,28 @@ fn main() -> ExitCode {
             elevation,
             input,
         } => direction(array, every, elevation, input),
+        Command::Stream {
+            array,
+            steer,
+            elevation,
+            kind,
+            white_noise_gain,
+            gain,
+            input,
+        } => stream::stream(stream::StreamConfig {
+            array,
+            steer,
+            elevation,
+            kind: match kind {
+                BeamKind::DelaySum => Kind::DelaySum,
+                BeamKind::Superdirective => Kind::Superdirective {
+                    min_white_noise_gain_db: white_noise_gain,
+                },
+            },
+            white_noise_gain,
+            gain,
+            input,
+        }),
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,

@@ -14,6 +14,7 @@ from typing import Any
 from tests.e2e.helpers.cli_runner import (
     build_coach_test_env,
     extract_ui_url_and_token,
+    resolve_earshot_cmd,
     run_coach,
     run_earshot_beam,
     run_earshot_direction,
@@ -980,3 +981,155 @@ def test_deterministic_replay_player_recorded_scaled_and_stepped_modes(
     with open_db(db_real, readonly=True) as conn:
         real_evs = fetch_normalized_rows(conn, "events", sid_real)
     assert [str(r["event_id"]) for r in real_evs] == ["ev-real-1", "ev-real-2"]
+
+
+def test_coach_serve_earshot_stream_bridge_and_respeaker_ui_toggle(
+    repo_root: Path,
+    e2e_workspace: dict[str, Path],
+    mock_nemo_ws: MockNemoServer,
+    mock_peecee_bin: Path,
+    free_port_factory: Callable[[], int],
+) -> None:
+    """Verify coach serve bridges raw array capture -> earshot stream -> peecee-speech -> UI /feed."""
+    import math
+    import struct
+    import sys
+
+    earshot_bin = resolve_earshot_cmd(repo_root)[0]
+    array_toml = repo_root / "arrays" / "respeaker-core-v2.toml"
+    raw_file = e2e_workspace["root"] / "respeaker_synth.raw"
+
+    # Synthesize ~1.54s (96 * 256 frames) of 8ch S32_LE @ 16kHz steered at azimuth 100 deg.
+    mic_pos = [
+        (0.0401, 0.0231, 0.0),
+        (0.0401, -0.0231, 0.0),
+        (0.0000, -0.0463, 0.0),
+        (-0.0401, -0.0231, 0.0),
+        (-0.0401, 0.0232, 0.0),
+        (0.0000, 0.0463, 0.0),
+    ]
+    az = math.radians(100.0)
+    el = math.radians(20.0)
+    direction = (math.cos(az) * math.cos(el), math.sin(az) * math.cos(el), math.sin(el))
+    total_frames = 96 * 256
+    buf = bytearray()
+    for f in range(total_frames):
+        t = f / 16000.0
+        amp = 0.002 if f < 16 * 256 else 0.25
+        ch = [0] * 8
+        for m, (px, py, pz) in enumerate(mic_pos):
+            tau = (px * direction[0] + py * direction[1] + pz * direction[2]) / 343.0
+            pt = t + tau
+            s = amp * (
+                math.sin(2.0 * math.pi * 700.0 * pt) + 0.7 * math.sin(2.0 * math.pi * 1400.0 * pt)
+            )
+            ch[m] = max(-2_147_483_648, min(2_147_483_647, int(s * 2_147_483_647.0)))
+        buf.extend(struct.pack("<8i", *ch))
+    raw_file.write_bytes(bytes(buf))
+
+    cap_script = e2e_workspace["root"] / "cap_feed.py"
+    cap_script.write_text(
+        "import sys, time\n"
+        f"data = open({str(raw_file)!r}, 'rb').read()\n"
+        "sys.stdout.buffer.write(data)\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+
+    sid = "sess-earshot-bridge"
+    brief_path = write_brief_json(e2e_workspace["brief_path"], build_session_brief(session_id=sid))
+    mock_nemo_ws.set_config(
+        MockNemoConfig(
+            sample_rate=16000,
+            script=[
+                ScriptedTurn(
+                    trigger_after_frames=3,
+                    deltas=["Someone"],
+                    transcript="Someone should own the rollback plan",
+                    words=[
+                        MockWord("Someone", 0.0, 0.25, speaker=1),
+                        MockWord("should", 0.25, 0.45, speaker=1),
+                        MockWord("own", 0.45, 0.65, speaker=1),
+                        MockWord("the", 0.65, 0.80, speaker=1),
+                        MockWord("rollback", 0.80, 1.15, speaker=1),
+                        MockWord("plan", 1.15, 1.40, speaker=1),
+                    ],
+                )
+            ],
+        )
+    )
+    port = free_port_factory()
+    env = build_coach_test_env(
+        peecee_bin=mock_peecee_bin,
+        nemo_ws_url=mock_nemo_ws.url,
+    )
+    cap_cmd = f"{sys.executable} {cap_script}"
+    with start_coach_process(
+        "serve",
+        [
+            "--brief",
+            str(brief_path),
+            "--policy",
+            str(e2e_workspace["policy_path"]),
+            "--db",
+            str(e2e_workspace["db_path"]),
+            "--source",
+            "peecee",
+            "--peecee-cmd",
+            str(mock_peecee_bin),
+            "--ws-url",
+            mock_nemo_ws.url,
+            "--earshot-array",
+            str(array_toml),
+            "--earshot-bin",
+            earshot_bin,
+            "--earshot-capture-cmd",
+            cap_cmd,
+            "--ui-port",
+            str(port),
+            "--ui-token",
+            "tok-earshot-test",
+        ],
+        env=env,
+        ready_url=f"http://127.0.0.1:{port}/health?token=tok-earshot-test",
+        startup_timeout=10.0,
+    ):
+        import httpx
+        from websockets.asyncio.client import connect as ws_connect
+
+        feed_url = f"http://127.0.0.1:{port}/feed?token=tok-earshot-test"
+
+        def _has_streaming_and_text() -> bool:
+            r = httpx.get(feed_url, timeout=2.0)
+            if r.status_code != 200:
+                return False
+            d = r.json()
+            rs = d.get("respeaker") or {}
+            segs = d.get("segments") or []
+            return (
+                rs.get("configured") is True
+                and rs.get("status") == "streaming"
+                and rs.get("steer_deg") == 100.0
+                and d.get("audio_rx_bytes", 0) > 0
+                and any("rollback" in s.get("text", "") for s in segs)
+            )
+
+        _wait_until(_has_streaming_and_text, timeout=10.0, msg="earshot bridge stream + ASR")
+
+        async def _mute_via_ws() -> None:
+            async with ws_connect(f"ws://127.0.0.1:{port}/ws?token=tok-earshot-test") as ws:
+                await ws.recv()
+                await ws.send(
+                    json.dumps({"type": "action", "action": "toggle_respeaker", "enabled": False})
+                )
+                await asyncio.sleep(0.05)
+
+        asyncio.run(_mute_via_ws())
+
+        def _is_muted() -> bool:
+            d = httpx.get(feed_url, timeout=2.0).json()
+            rs = d.get("respeaker") or {}
+            return rs.get("enabled") is False and rs.get("status") == "disabled"
+
+        _wait_until(_is_muted, timeout=5.0, msg="toggle_respeaker mute")

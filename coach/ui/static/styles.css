@@ -109,6 +109,11 @@ button, select, .file-btn {
 button:hover, .file-btn:hover { border-color: var(--accent); }
 .btn-primary { background: #1d4ed8; border-color: #2563eb; font-weight: 600; }
 .btn-active { background: #991b1b; border-color: #dc2626; font-weight: 600; }
+.btn-respeaker { font-weight: 600; }
+.btn-respeaker.waiting { background: #3b2e13; border-color: #9e6a03; color: #f2cc60; }
+.btn-respeaker.streaming { background: #173b24; border-color: #2ea043; color: #7ee787; }
+.btn-respeaker.disabled, .btn-respeaker.paused { opacity: 0.8; }
+.mic-select { max-width: 210px; }
 .tab-btn.active { background: #1d4ed8; border-color: #2563eb; font-weight: 600; }
 .file-btn input { display: none; }
 
